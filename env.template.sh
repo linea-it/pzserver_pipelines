@@ -2,7 +2,7 @@
 
 export APP_DIR="<APP_DIR>"
 export PIPELINES_DIR="<PIPELINES_DIR>"
-export DATASETS_DIR="<DATASETS_DIR>/data-example"
+export DATASETS_DIR="<DATASETS_DIR>"
 
 if [ -z "$PYTHONPATH" ]; then
     export PYTHONPATH=$APP_DIR/src
