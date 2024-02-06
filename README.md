@@ -29,12 +29,14 @@ Currently the repository has two example pipelines: cross_lsdb and hello_parsl a
 
 ```bash
 # execute cross_lsdb
-bash $PIPELINES_DIR/cross_lsdb/run.sh $PIPELINES_DIR/cross_lsdb/config.yml
+cd $PIPELINES_DIR/cross_lsdb
+bash run.sh config.yml
 ```
 
 ```bash
 # execute hello_parsl
-bash $PIPELINES_DIR/hello_parsl/run.sh $PIPELINES_DIR/hello_parsl/config.yml
+cd $PIPELINES_DIR/hello_parsl
+bash run.sh config.yml
 ```
 
 Software developed and delivered as part of the in-kind contribution program BRA-LIN, from LIneA to the Rubin Observatory's LSST. An overview of this and other contributions is available [here](https://linea-it.github.io/pz-lsst-inkind-doc/).  

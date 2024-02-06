@@ -28,4 +28,6 @@ echo "Installing pipeline..."
 set -xe
 
 # Run the Python code with the given argument
-run-hello-world $ARGS
+run-hello-world $ARGS || { echo "Failed to run-hello-world"; exit 1; }
+
+echo "Done."
