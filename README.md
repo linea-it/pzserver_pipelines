@@ -3,14 +3,19 @@
 Repository to host the PZ Server's pipelines: 
 
 ### Combine Spec-z Catalogs (to do)
-> Combine multiple spectroscopic redshift catalogs into a single sample with homogenized data formats and a unique system of quality flags translated from the survey's original files.  
+> Combines multiple spectroscopic redshift catalogs into a single sample with homogenized data formats and a unique system of quality flags translated from the survey's original files.  
 
 ### Training Set Maker (in progress)
-> Create customized training and validation/test sets using a compilation of spectroscopic redshifts and LSST photometric data.
+> Creates customized training and validation/test sets using a compilation of spectroscopic redshifts and LSST photometric data.
+
+
+## Acknowledgements
+
+Software developed and delivered as part of the in-kind contribution program BRA-LIN, from LIneA to the Rubin Observatory's LSST. An overview of this and other contributions is available [here](https://linea-it.github.io/pz-lsst-inkind-doc/). The pipelines take advantage of the software support layer developed by LINCC, available as Python libraries: [hipscat](https://github.com/astronomy-commons/hipscat), [hipscat-import](https://github.com/astronomy-commons/hipscat-import) and [lsdb](https://github.com/astronomy-commons/lsdb).    
+
+## Test data
 
 This repository currently contains a basic dataset, for testing purposes only. The ideal is to connect the pipelines to systems with access to a larger datasets.
-
-Software developed and delivered as part of the in-kind contribution program BRA-LIN, from LIneA to the Rubin Observatory's LSST. An overview of this and other contributions is available [here](https://linea-it.github.io/pz-lsst-inkind-doc/).  
 
 ## Install
 
