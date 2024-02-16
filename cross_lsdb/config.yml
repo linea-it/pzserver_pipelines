@@ -25,4 +25,4 @@ inputs:
   photo: "photo"
   specz: "specz"
 
-output_dir: /home/singulani/projects/pzserver_pipelines/cross_lsdb/output
+output_dir: "outputs"
