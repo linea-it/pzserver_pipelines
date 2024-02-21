@@ -1,0 +1,9 @@
+name: pipe_hello_world
+channels:
+  - defaults
+dependencies:
+  - python=3.8
+  - pip:
+      - pyro5
+      - PyYaml
+      - parsl

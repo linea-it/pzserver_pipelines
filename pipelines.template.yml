@@ -1,0 +1,15 @@
+hello_parsl:
+  dname: 'Hello World with Parsl'
+  dir: '<PIPELINES_DIR>/hello_parsl'
+  runner: 'bash'
+  executable: 'run.sh'
+  config: 'config.yml'
+  version: '0.1.0'
+
+cross_lsdb:
+  dname: 'LSDB Crossmatch'
+  dir: '<PIPELINES_DIR>/cross_lsdb'
+  runner: 'bash'
+  executable: 'run.sh'
+  config: 'config.yml'
+  version: '0.1.0'

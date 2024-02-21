@@ -1,0 +1,47 @@
+{
+    "catalog_name": "photo",
+    "catalog_type": "object",
+    "total_rows": 15,
+    "epoch": "J2000",
+    "ra_column": "coord_ra",
+    "dec_column": "coord_dec",
+    "version": "0.2.1",
+    "generation_date": "2024.02.01",
+    "tool_args": {
+        "tool_name": "hipscat_import",
+        "version": "0.2.1",
+        "runtime_args": {
+            "catalog_name": "photo",
+            "output_path": "/home/singulani/projects/pzserver_pipelines/data-example",
+            "output_artifact_name": "photo",
+            "tmp_dir": "",
+            "overwrite": true,
+            "dask_tmp": "/tmp",
+            "dask_n_workers": 2,
+            "dask_threads_per_worker": 1,
+            "catalog_path": "/home/singulani/projects/pzserver_pipelines/data-example/photo",
+            "tmp_path": "/tmp/photo/intermediate",
+            "epoch": "J2000",
+            "catalog_type": "object",
+            "input_path": "/home/singulani/photo",
+            "input_paths": [
+                "file:///home/singulani/photo/photo.parquet"
+            ],
+            "input_format": "parquet",
+            "input_file_list": [],
+            "ra_column": "coord_ra",
+            "dec_column": "coord_dec",
+            "use_hipscat_index": false,
+            "sort_columns": "objectId",
+            "constant_healpix_order": -1,
+            "highest_healpix_order": 7,
+            "pixel_threshold": 1000000,
+            "mapping_healpix_order": 7,
+            "debug_stats_only": false,
+            "file_reader_info": {
+                "input_reader_type": "ParquetReader",
+                "chunksize": 500000
+            }
+        }
+    }
+}
