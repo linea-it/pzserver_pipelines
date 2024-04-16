@@ -127,3 +127,12 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Parsl outputs
+*/runinfo
+*/output
+
+# config files 
+env.sh
+pipelines.yml
+data-example/datasets.yml
