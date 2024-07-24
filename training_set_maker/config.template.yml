@@ -1,0 +1,41 @@
+##################################################################
+# Parameters file. Should follow the syntax defined in:  
+# http://docs.ansible.com/ansible/latest/YAMLSyntax.html
+# More general reference: http://www.yaml.org/spec/1.2/spec.html
+
+executor:
+  local:
+    n_workers: 2
+    threads_per_worker: 2
+    memory_limit: "1GiB"
+
+  linea-slurm:
+    instance:
+      cores: 54
+      processes: 1
+      memory: "123GiB"
+      queue: "cpu"
+      job_extra_directives:
+        - "--propagate"
+        - "--time=2:00:00"
+    adapt:
+      maximum_jobs: 10
+
+inputs:
+  dataset: 
+    path: "<DATASETS_DIR>/mini_dataset"
+  specz: 
+    path: "<DATASETS_DIR>/specz.parquet"
+    columns:
+      ra: "ra"
+      dec: "dec"
+
+output_dir: "outputs"
+
+param:
+  suffixes: ["_specz", "_dataset"]
+  # algorithm: "kd_tree"
+  output_catalog_name: "tsm_cross_001"
+  radius_arcsec: 1.0
+  n_neighbors: 1
+  

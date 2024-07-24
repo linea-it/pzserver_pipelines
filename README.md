@@ -32,18 +32,11 @@ The `setup.sh` will suggest a directory where the pipelines and datasets are ins
 
 ## Run a pipeline
 
-Currently the repository has two example pipelines: cross_lsdb and hello_parsl. To execute them, simply:
+To execute, simply:
 
 ```bash
-# execute cross_lsdb
-cd $PIPELINES_DIR/cross_lsdb
-bash run.sh config.yml
+# execute training set maker
+cd $PIPELINES_DIR/training_set_maker
+mkdir process001
+./run.sh config.yml process001
 ```
-
-```bash
-# execute hello_parsl
-cd $PIPELINES_DIR/hello_parsl
-bash run.sh config.yml
-```
-
-

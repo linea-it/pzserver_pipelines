@@ -1,8 +1,0 @@
-{
-    "catalog_name": "photo",
-    "catalog_type": "object",
-    "total_rows": 15,
-    "epoch": "J2000",
-    "ra_column": "coord_ra",
-    "dec_column": "coord_dec"
-}

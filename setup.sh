@@ -11,7 +11,7 @@ if [ ! -d "$DATASETS_DIR" ]; then
 fi
 
 echo "The directory containing the pipelines is: " $PIPELINES_DIR
-read -p "Enter 'yes' to confirm the installation or 'no' to exit and reconfigure the variable PIPELINE_DIR " pinput
+read -p "Enter 'yes' to confirm the installation or 'no' to exit and reconfigure the variable PIPELINES_DIR " pinput
 
 if [ "$pinput" != "yes" ]; then
 	echo Exiting...
@@ -27,7 +27,16 @@ if [ "$dinput" != "yes" ]; then
 fi
 
 sed "s|<PIPELINES_DIR>|$PIPELINES_DIR|g" $PIPELINES_DIR/pipelines.template.yml > $PIPELINES_DIR/pipelines.yml
-sed "s|<DATASETS_DIR>|$DATASETS_DIR|g" $DATASETS_DIR/datasets.template.yml > $DATASETS_DIR/datasets.yml
+# sed "s|<DATASETS_DIR>|$DATASETS_DIR|g" $DATASETS_DIR/datasets.template.yml > $DATASETS_DIR/datasets.yml
+
+for pipe in $( ls ${PIPELINES_DIR}/*/config.template.yml)
+do
+    echo $pipe
+    # sed -i'' -e "s|<DATASETS_DIR>|$DATASETS_DIR|g" $pipe
+    DIRCONF=`dirname $pipe`
+    echo $DIRCONF
+    sed "s|<DATASETS_DIR>|$DATASETS_DIR|g" $pipe > $DIRCONF/config.yml
+done
 
 sed "s|<APP_DIR>|$APP_DIR|g" $APP_DIR/env.template.sh > $APP_DIR/env.sh
 sed -i'' -e "s|<DATASETS_DIR>|$DATASETS_DIR|g" $APP_DIR/env.sh
@@ -47,6 +56,12 @@ else
         conda env update --file environment.yml --prune
     fi
 fi
+
+for pipe in $( ls ${PIPELINES_DIR}/*/install.sh)
+do
+    echo "Installing: ${pipe}"
+    . "$pipe"
+done
 
 conda activate pz_pipelines
 echo "Conda Environment: $CONDA_DEFAULT_ENV"
