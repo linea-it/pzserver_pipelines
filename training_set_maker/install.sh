@@ -12,12 +12,12 @@ HASENV=`conda env list | grep pipe_tsm`
 
 if [ -z "$HASENV" ]; then
     echo "Create virtual environment..."
-    conda env create -f ${PIPE_BASE}/environment.yml
+    conda env create -f ${PIPE_BASE}/environment.yaml
     echo "Virtual environment created and packages installed."
 # else
 #     if [ "$CONDA_FORCE_UPDATE" == "yes" ]; then
 #         echo "Virtual environment already exists. Updating..."
-#         conda env update --file ${PIPE_BASE}/environment.yml --prune
+#         conda env update --file ${PIPE_BASE}/environment.yaml --prune
 #     fi
 fi
 

@@ -1,10 +1,10 @@
 """_summary_ """
 
-import yaml
 import logging
-import os
 import pathlib
 from typing import Any
+
+import yaml
 
 
 def setup_logger(name="tsm", logdir='.'):

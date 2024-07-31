@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 
 import argparse
-import time
 import datetime
 import os
-from pathlib import Path
-from dask.distributed import Client
-import lsdb
-import tempfile
-
-from utils import setup_logger, load_yml, dump_yml
-from executor import get_executor
 import pathlib
+import tempfile
+import time
+from pathlib import Path
+
+import lsdb
+from dask.distributed import Client
+from executor import get_executor
 from hipscat_import.catalog.arguments import ImportArguments
 from hipscat_import.pipeline import pipeline_with_client
+from utils import dump_yml, load_yml, setup_logger
 
 
 class TSMRunner:
 
-    def __init__(self, config, cwd='.') -> None:
-        self.logger = setup_logger('tsm', logdir=cwd)
+    def __init__(self, config, cwd=".") -> None:
+        self.logger = setup_logger("tsm", logdir=cwd)
         self.cwd = cwd
-        self.process_info_path = Path(self.cwd, 'process.yml')
+        self.process_info_path = Path(self.cwd, "process.yml")
         self.process_info = None
         self.start_time = None
         self.end_time = None
@@ -51,7 +51,7 @@ class TSMRunner:
         # Creating process info yaml
         if not self.process_info_path.is_file():
             self.process_info_path.touch()
-        
+
         # Loading process info yaml
         process_info = load_yml(self.process_info_path)
         if not process_info:
@@ -82,8 +82,14 @@ class TSMRunner:
         self.start_time = time.time()
         self.add_info("start_time", datetime.datetime.now())
 
+        specz = self.inputs.get("specz")
+        if len(specz) > 1:
+            self.logger.warn(f"more than one specz was selected: {specz}")
+
+        specz = specz.pop()
+        self.logger.info(f"Specz used: {specz}")
+
         with Client(self.cluster) as client:
-            specz = self.inputs.get("specz")
             specz["tmp_hips_output"] = self.specz_tmp_dir
             specz_file = self.__specz_to_hipscat(specz, client)
             specz_df = lsdb.read_hipscat(specz_file)
@@ -91,10 +97,7 @@ class TSMRunner:
             dataset = lsdb.read_hipscat(self.inputs.get("dataset").get("path"))
 
             try:
-                cross = specz_df.crossmatch(
-                    dataset,
-                    **self.param
-                )
+                cross = specz_df.crossmatch(dataset, **self.param)
                 data = cross.compute()
             except ValueError as err:
                 if "size 0 inputs" in str(err):
@@ -115,8 +118,8 @@ class TSMRunner:
         self.end_time = time.time() - self.start_time
         self.logger.info("Time elapsed: %s", str(self.end_time))
 
-    def __register_outputs(self, filepath, role='main'):
-        """ Register outputs in process.yml
+    def __register_outputs(self, filepath, role="main"):
+        """Register outputs in process.yml
 
         Args:
             filepath (str): output path
@@ -134,24 +137,21 @@ class TSMRunner:
         col_dec = specz.get("columns", {}).get("dec", "dec")
         tmp_output_dir = specz.get("tmp_hips_output")
 
-
-        print(specz_file.name)
-
         args = ImportArguments(
             ra_column=col_ra,
             dec_column=col_dec,
-            file_reader=specz_file.suffix.replace(".",""),
+            file_reader=specz_file.suffix.replace(".", ""),
             input_file_list=[str(specz_file)],
             output_artifact_name=specz_file.name,
             output_path=tmp_output_dir.name,
-            resume=False
+            resume=False,
         )
 
         pipeline_with_client(args, client)
         return str(pathlib.Path(tmp_output_dir.name, specz_file.name))
 
     def __exit__(self, exc_type, exc_value, traceback):
-        
+
         self.cluster.close()
         self.add_info("end_time", datetime.datetime.now())
 
@@ -167,7 +167,9 @@ if __name__ == "__main__":
     # Create the parser and add arguments
     parser = argparse.ArgumentParser()
     parser.add_argument(dest="config_path", help="yaml config path")
-    parser.add_argument(dest="cwd", help="processing dir", default='.')
+    parser.add_argument(
+        dest="cwd", nargs="?", help="processing dir", default=os.getcwd()
+    )
 
     args = parser.parse_args()
     config_path = args.config_path

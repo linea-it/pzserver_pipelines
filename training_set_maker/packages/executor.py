@@ -1,10 +1,10 @@
 """_summary_ """
 
-from dask.distributed import LocalCluster
-from dask_jobqueue import SLURMCluster
-from utils import load_yml
 import logging
 from typing import Union
+
+from dask.distributed import LocalCluster
+from dask_jobqueue import SLURMCluster
 
 
 def get_executor(

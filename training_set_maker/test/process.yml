@@ -1,6 +1,0 @@
-end_time: 2024-07-24 14:12:07.801093
-outputs:
-- path: /workspaces/pzserver_pipelines/training_set_maker/test/outputs/tsm-output.parquet
-  role: main
-start_time: 2024-07-24 14:12:06.566775
-status: Successful

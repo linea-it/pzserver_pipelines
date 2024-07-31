@@ -134,6 +134,5 @@ dmypy.json
 
 # config files 
 env.sh
-pipelines.yml
-config.yml
-data-example/datasets.yml
+pipelines.yaml
+config.yaml

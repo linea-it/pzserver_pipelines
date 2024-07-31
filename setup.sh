@@ -26,42 +26,42 @@ if [ "$dinput" != "yes" ]; then
 	exit 1
 fi
 
-sed "s|<PIPELINES_DIR>|$PIPELINES_DIR|g" $PIPELINES_DIR/pipelines.template.yml > $PIPELINES_DIR/pipelines.yml
+sed "s|<PIPELINES_DIR>|$PIPELINES_DIR|g" $PIPELINES_DIR/pipelines.template.yaml > $PIPELINES_DIR/pipelines.yaml
 # sed "s|<DATASETS_DIR>|$DATASETS_DIR|g" $DATASETS_DIR/datasets.template.yml > $DATASETS_DIR/datasets.yml
 
-for pipe in $( ls ${PIPELINES_DIR}/*/config.template.yml)
+for pipe in $( ls ${PIPELINES_DIR}/*/config.template.yaml)
 do
     echo $pipe
     # sed -i'' -e "s|<DATASETS_DIR>|$DATASETS_DIR|g" $pipe
     DIRCONF=`dirname $pipe`
     echo $DIRCONF
-    sed "s|<DATASETS_DIR>|$DATASETS_DIR|g" $pipe > $DIRCONF/config.yml
+    sed "s|<DATASETS_DIR>|$DATASETS_DIR|g" $pipe > $DIRCONF/config.yaml
 done
 
 sed "s|<APP_DIR>|$APP_DIR|g" $APP_DIR/env.template.sh > $APP_DIR/env.sh
 sed -i'' -e "s|<DATASETS_DIR>|$DATASETS_DIR|g" $APP_DIR/env.sh
 sed -i'' -e "s|<PIPELINES_DIR>|$PIPELINES_DIR|g" $APP_DIR/env.sh
 
-source `dirname $CONDA_EXE`/activate || { echo "Failed to activate Conda environment"; exit 1; }
+# source `dirname $CONDA_EXE`/activate || { echo "Failed to activate Conda environment"; exit 1; }
 
-HASENV=`conda env list | grep pz_pipelines`
+# HASENV=`conda env list | grep pz_pipelines`
 
-if [ -z "$HASENV" ]; then
-    echo "Create virtual environment..."
-    conda env create -f environment.yml
-    echo "Virtual environment created and packages installed."
-else
-    if [ "$CONDA_FORCE_UPDATE" == "yes" ]; then
-        echo "Virtual environment already exists. Updating..."
-        conda env update --file environment.yml --prune
-    fi
-fi
+# if [ -z "$HASENV" ]; then
+#     echo "Create virtual environment..."
+#     conda env create -f environment.yml
+#     echo "Virtual environment created and packages installed."
+# else
+#     if [ "$CONDA_FORCE_UPDATE" == "yes" ]; then
+#         echo "Virtual environment already exists. Updating..."
+#         conda env update --file environment.yml --prune
+#     fi
+# fi
 
-for pipe in $( ls ${PIPELINES_DIR}/*/install.sh)
-do
-    echo "Installing: ${pipe}"
-    . "$pipe"
-done
+# for pipe in $( ls ${PIPELINES_DIR}/*/install.sh)
+# do
+#     echo "Installing: ${pipe}"
+#     . "$pipe"
+# done
 
-conda activate pz_pipelines
-echo "Conda Environment: $CONDA_DEFAULT_ENV"
+# conda activate pz_pipelines
+# echo "Conda Environment: $CONDA_DEFAULT_ENV"
