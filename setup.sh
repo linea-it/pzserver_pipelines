@@ -2,15 +2,15 @@
 
 export APP_DIR=`pwd`
 
-if [ ! -d "$PIPELINES_DIR" ]; then
+if [ -z "$PIPELINES_DIR" ]; then
     export PIPELINES_DIR=$APP_DIR
 fi
 
-if [ ! -d "$DATASETS_DIR" ]; then
+if [ -z "$DATASETS_DIR" ]; then
     export DATASETS_DIR=$APP_DIR/data-example
 fi
 
-echo "The directory containing the pipelines is: " $PIPELINES_DIR
+echo "The directory containing the pipelines is: " "$PIPELINES_DIR"
 read -p "Enter 'yes' to confirm the installation or 'no' to exit and reconfigure the variable PIPELINES_DIR " pinput
 
 if [ "$pinput" != "yes" ]; then
