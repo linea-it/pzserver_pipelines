@@ -63,7 +63,7 @@ class TSMRunner:
         self.logger.info("Specz temporary dir: %s", self.specz_tmp_dir)
 
         # Get dask executor
-        executor_key = os.getenv("DASK_EXECUTOR_KEY", "local")
+        executor_key = os.getenv("DASK_EXECUTOR_KEY", "slurm")
         self.cluster = get_executor(executor_key, self.executors)
 
     def __enter__(self):
