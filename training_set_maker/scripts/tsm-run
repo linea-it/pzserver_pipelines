@@ -37,9 +37,10 @@ class Runner:
 
         # Loading parameters
         self.param = pipe_config.get("param", {})
+        self.param["crossmatch"] = self.param.get("crossmatch", {})
 
-        if not self.param.get("suffixes", None):
-            self.param["suffixes"] = ["_specz", ""]
+        if not self.param.get("crossmatch").get("suffixes", None):
+            self.param["crossmatch"]["suffixes"] = ["_specz", ""]
 
         self.logger.info("Params: %s", self.param)
 
@@ -96,11 +97,12 @@ class Runner:
 
             dataset = lsdb.read_hipscat(dataset_path)
             duplicate_criteria = self.param.get('duplicate_criteria', 'closest')
+            cm_args = self.param.get('crossmatch', {})
 
             try:
-                cross = specz_df.crossmatch(dataset, **self.param)
+                cross = specz_df.crossmatch(dataset, **cm_args)
                 if duplicate_criteria == 'closest':
-                    suffix_dataset = self.param.get("suffixes")[1]
+                    suffix_dataset = cm_args.get("suffixes")[1]
                     _id = f"{dataset_id}{suffix_dataset}"
                     cross = cross._ddf.shuffle(on=_id).map_partitions(
                         lambda x: x.sort_values("_dist_arcsec").drop_duplicates(_id)

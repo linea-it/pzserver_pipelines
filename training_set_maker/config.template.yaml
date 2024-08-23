@@ -35,6 +35,8 @@ inputs:
 output_dir: "outputs"
 
 param:
-  output_catalog_name: "tsm_cross_001"
-  radius_arcsec: 1.0
-  n_neighbors: 1
+  duplicate_criteria: "closest"
+  crossmatch:
+    output_catalog_name: "tsm_cross_001"
+    radius_arcsec: 1.0
+    n_neighbors: 1

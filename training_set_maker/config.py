@@ -53,10 +53,14 @@ class Inputs(BaseModel):
 
 
 class Param(BaseModel):
-  output_catalog_name: str = "tsm_cross_001"
-  radius_arcsec: float = 1.0
-  n_neighbors: int = 1
 
+  class Crossmatch(BaseModel):
+    output_catalog_name: str = "tsm_cross_001"
+    radius_arcsec: float = 1.0
+    n_neighbors: int = 1
+
+  crossmatch: Crossmatch = Crossmatch()
+  duplicate_criteria: str = "closest"
 
 class Config(BaseModel):
   output_dir: str = "./outputs"
