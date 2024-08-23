@@ -5,9 +5,8 @@ import datetime
 import os
 import time
 from pathlib import Path
-import tables_io
+from specz import Specz
 
-import lsdb
 from dask.distributed import Client
 from executor import get_executor
 from utils import dump_yml, load_yml, setup_logger
@@ -16,7 +15,7 @@ from utils import dump_yml, load_yml, setup_logger
 class Runner:
 
     def __init__(self, config, cwd=".") -> None:
-        self.logger = setup_logger("tsm", logdir=cwd)
+        self.logger = setup_logger("csc", logdir=cwd)
         self.cwd = cwd
         self.process_info_path = Path(self.cwd, "process.yml")
         self.process_info = None
@@ -31,23 +30,19 @@ class Runner:
         if not self.output_dir.is_absolute():
             self.output_dir = Path(self.cwd, self.output_dir)
 
+        # Create output dir
+        os.makedirs(self.output_dir, exist_ok=True)
+
         # Loading inputs
         self.inputs = pipe_config.get("inputs")
         self.logger.info("Inputs: %s", self.inputs)
 
         # Loading parameters
         self.param = pipe_config.get("param", {})
-
-        if not self.param.get("suffixes", None):
-            self.param["suffixes"] = ["_specz", ""]
-
         self.logger.info("Params: %s", self.param)
 
         # Set executors
         self.executors = pipe_config.get("executor")
-
-        # Create output dir
-        os.makedirs(self.output_dir, exist_ok=True)
 
         # Creating process info yaml
         if not self.process_info_path.is_file():
@@ -68,62 +63,37 @@ class Runner:
 
     def add_info(self, key, value):
         """ Add info in process.yaml """
-
         self.process_info[key] = value
         dump_yml(self.process_info_path, self.process_info)
 
     def run(self):
-        """ Run TSM"""
+        """ Run Combine Specz Catalog """
 
         # Adding start time
         self.start_time = time.time()
         self.add_info("start_time", datetime.datetime.now())
 
         specz = self.inputs.get("specz")
-        if len(specz) > 1:
-            self.logger.warn(f"more than one specz was selected: {specz}")
+        self.logger.info(f"Number of selected catalogs: {len(specz)}")
 
-        specz = specz.pop()
-        self.logger.info(f"Specz used: {specz}")
-
-        with Client(self.cluster) as client:
-            specz_df = lsdb.from_dataframe(
-                tables_io.read(specz.get("path"), tables_io.types.PD_DATAFRAME)
+        if len(specz) < 2:
+            self.logger.exception(
+                f"There must be at least 2 catalogs to run the pipeline."
             )
 
-            dataset_path = self.inputs.get("dataset").get("path")
-            dataset_id = self.inputs.get("dataset").get("columns", {}).get("id", {})
+        with Client(self.cluster) as client:
+            specz = Specz(specz, client)
+            output_name = Path(self.output_dir, "csc-output.parquet")
+            specz.dataframe.to_parquet(output_name)
+            self.__register_outputs(output_name)
 
-            dataset = lsdb.read_hipscat(dataset_path)
-            duplicate_criteria = self.param.get('duplicate_criteria', 'closest')
-
-            try:
-                cross = specz_df.crossmatch(dataset, **self.param)
-                if duplicate_criteria == 'closest':
-                    suffix_dataset = self.param.get("suffixes")[1]
-                    _id = f"{dataset_id}{suffix_dataset}"
-                    cross = cross._ddf.shuffle(on=_id).map_partitions(
-                        lambda x: x.sort_values("_dist_arcsec").drop_duplicates(_id)
-                    )
-                data = cross.compute()
-            except ValueError as err:
-                if "size 0 inputs" in str(err):
-                    self.logger.exception("No cross matches were found!")
-                    raise
-                self.logger.exception("Error when cross-matching")
-                raise
-
-            outputfile = Path(self.output_dir, "tsm-output.parquet")
-            data.to_parquet(outputfile)
-            self.__register_outputs(outputfile)
-
-            self.logger.info("--> Object Count: \n%s", str(data.count()))
+            self.logger.info(f"--> Object Count: {len(specz.dataframe)}")
 
         self.end_time = time.time() - self.start_time
         self.logger.info("Time elapsed: %s", str(self.end_time))
 
     def __register_outputs(self, filepath, role="main"):
-        """Register outputs in process.yml
+        """ Register outputs in process.yml
 
         Args:
             filepath (str): output path
@@ -161,5 +131,5 @@ if __name__ == "__main__":
     cwd = args.cwd
 
     # Run pipeline
-    with Runner(config_path, cwd) as tsmrun:
-        tsmrun.run()
+    with Runner(config_path, cwd) as cscrun:
+        cscrun.run()

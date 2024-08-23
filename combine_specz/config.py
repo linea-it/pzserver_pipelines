@@ -32,30 +32,21 @@ class Executor(BaseModel):
 
 class Inputs(BaseModel):
 
-  class Dataset(BaseModel):
-
-    class Columns(BaseModel):
-      id: int = 1
-
-    path: str = f"{DATASETS_DIR}/mini_dataset"
-
   class Specz(BaseModel):
 
     class Columns(BaseModel):
       ra: str = "ra"
       dec: str = "dec"
+      z: str = "z"
 
     path: str = f"{DATASETS_DIR}/specz.parquet"
     columns: Columns = Columns()
 
-  dataset: Dataset = Dataset()
-  specz: list = [Specz()]
+  specz: list = [Specz(), Specz()]
 
 
 class Param(BaseModel):
-  output_catalog_name: str = "tsm_cross_001"
-  radius_arcsec: float = 1.0
-  n_neighbors: int = 1
+  debug: bool = True
 
 
 class Config(BaseModel):

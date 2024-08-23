@@ -14,7 +14,7 @@ if [ ! -d "$PIPELINES_DIR" ]; then
     exit 1
 fi
 
-INSTALL_PIPE="$PIPELINES_DIR/training_set_maker/install.sh"
+INSTALL_PIPE="$PIPELINES_DIR/combine_specz/install.sh"
 
 if [ ! -f "$INSTALL_PIPE" ]; then
     echo "Error: Installation script not found."
@@ -28,6 +28,6 @@ echo "Installing pipeline..."
 set -xe
 
 # Run the Python code with the given argument
-tsm-run $ARGS || { echo "Failed to tsm-run"; exit 1; }
+csc-run $ARGS || { echo "Failed to csc-run"; exit 1; }
 
 echo "Done."

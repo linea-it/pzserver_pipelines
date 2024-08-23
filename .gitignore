@@ -128,9 +128,11 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# Parsl outputs
+# outputs/tests
 */runinfo
 */output
+data-test
+results
 
 # config files
 env.sh

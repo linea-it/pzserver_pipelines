@@ -6,3 +6,12 @@ training_set_maker:
   executable: 'run.sh'
   schema_config: '<PIPELINES_DIR>/training_set_maker/config.py'
   version: '0.0.1'
+
+combine_specz:
+  display_name: 'Combine Specz Catalogs'
+  path: '<PIPELINES_DIR>/combine_specz'
+  executor: 'local' # only to orchestration
+  runner: 'bash'
+  executable: 'run.sh'
+  schema_config: '<PIPELINES_DIR>/combine_specz/config.py'
+  version: '0.0.1'
