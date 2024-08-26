@@ -62,12 +62,12 @@ class Runner:
         return self
 
     def add_info(self, key, value):
-        """ Add info in process.yaml """
+        """Add info in process.yaml"""
         self.process_info[key] = value
         dump_yml(self.process_info_path, self.process_info)
 
     def run(self):
-        """ Run Combine Specz Catalog """
+        """Run Combine Specz Catalog"""
 
         # Adding start time
         self.start_time = time.time()
@@ -78,7 +78,7 @@ class Runner:
 
         if len(specz) < 2:
             self.logger.exception(
-                f"There must be at least 2 catalogs to run the pipeline."
+                "There must be at least 2 catalogs to run the pipeline."
             )
 
         with Client(self.cluster) as client:
@@ -93,7 +93,7 @@ class Runner:
         self.logger.info("Time elapsed: %s", str(self.end_time))
 
     def __register_outputs(self, filepath, role="main"):
-        """ Register outputs in process.yml
+        """Register outputs in process.yml
 
         Args:
             filepath (str): output path
@@ -128,8 +128,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     config_path = args.config_path
-    cwd = args.cwd
+    _cwd = args.cwd
 
     # Run pipeline
-    with Runner(config_path, cwd) as cscrun:
+    with Runner(config_path, _cwd) as cscrun:
         cscrun.run()
