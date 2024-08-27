@@ -22,21 +22,19 @@ executor:
   #     maximum_jobs: 10
 
 inputs:
-  dataset:
-    path: "<DATASETS_DIR>/mini_dataset"
-    columns:
-      id: "id"
   specz:
     - path: "<DATASETS_DIR>/specz.parquet"
       columns:
         ra: "ra"
         dec: "dec"
+        z: "z"
+    - path: "<DATASETS_DIR>/specz.parquet"
+      columns:
+        ra: "ra"
+        dec: "dec"
+        z: "z"
 
 output_dir: "outputs"
 
 param:
-  duplicate_criteria: "closest"
-  crossmatch:
-    output_catalog_name: "tsm_cross_001"
-    radius_arcsec: 1.0
-    n_neighbors: 1
+  debug: true

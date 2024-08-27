@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 DATASETS_DIR = os.getenv("DATASETS_DIR", "/datasets")
 
+
 class Executor(BaseModel):
 
   class Slurm(BaseModel):
@@ -28,17 +29,7 @@ class Executor(BaseModel):
   name: str = "local"
   args: Slurm | Local = Local()
 
-
 class Inputs(BaseModel):
-
-  class Dataset(BaseModel):
-
-    class Columns(BaseModel):
-      id: str = "id"
-
-    path: str = f"{DATASETS_DIR}/mini_dataset"
-    columns: Columns = Columns()
-
 
   class Specz(BaseModel):
 
@@ -50,19 +41,11 @@ class Inputs(BaseModel):
     path: str = f"{DATASETS_DIR}/specz.parquet"
     columns: Columns = Columns()
 
-  dataset: Dataset = Dataset()
-  specz: list = [Specz()]
+  specz: list = [Specz(), Specz()]
 
 
 class Param(BaseModel):
-
-  class Crossmatch(BaseModel):
-    output_catalog_name: str = "tsm_cross_001"
-    radius_arcsec: float = 1.0
-    n_neighbors: int = 1
-
-  crossmatch: Crossmatch = Crossmatch()
-  duplicate_criteria: str = "closest"
+  debug: bool = True
 
 
 class Config(BaseModel):
