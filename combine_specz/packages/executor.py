@@ -5,29 +5,28 @@ from dask.distributed import LocalCluster
 from dask_jobqueue import SLURMCluster
 
 
-def get_executor(
-    executor_key: str, executors: str
-) -> Union[LocalCluster, SLURMCluster]:
+def get_executor(executor: str) -> Union[LocalCluster, SLURMCluster]:
     """ Returns the configuration of where the pipeline will be run
 
     Args:
-        executor_key (str): executor key
-        executors (dict): executors dict 
+        executor (dict): executor dict 
 
     Returns:
         Union[LocalCluster, SLURMCluster]: Executor object
     """
 
+    executor_name = executor.get("name", "local") # type: ignore
+
     logger = logging.getLogger()
-    logger.info("Getting executor config: %s", executor_key)
+    logger.info("Getting executor config: %s", executor_name)
 
     try:
-        config = executors[executor_key]
+        config = executor.get("args") # type: ignore
     except KeyError:
-        logger.warning("The executor key not found. Using minimal local config.")
-        executor_key = "minimal"
+        logger.warning("The executor not found. Using minimal local config.")
+        executor_name = "minimal"
 
-    match executor_key:
+    match executor_name:
         case "local":
             cluster = LocalCluster(**config)
         case "slurm":

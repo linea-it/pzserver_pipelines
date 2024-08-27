@@ -3,23 +3,23 @@
 # http://docs.ansible.com/ansible/latest/YAMLSyntax.html
 # More general reference: http://www.yaml.org/spec/1.2/spec.html
 
-executor:
-  local:
+executor: 
+  name: "local"   # or "slurm"
+  args:
     n_workers: 2
     threads_per_worker: 2
     memory_limit: "1GiB"
-
-  slurm:
-    instance:
-      cores: 54
-      processes: 1
-      memory: "123GiB"
-      queue: "cpu"
-      job_extra_directives:
-        - "--propagate"
-        - "--time=2:00:00"
-    adapt:
-      maximum_jobs: 10
+  # args:
+  #   instance:
+  #     cores: 54
+  #     processes: 1
+  #     memory: "123GiB"
+  #     queue: "cpu"
+  #     job_extra_directives:
+  #       - "--propagate"
+  #       - "--time=2:00:00"
+  #   adapt:
+  #     maximum_jobs: 10
 
 inputs:
   dataset:

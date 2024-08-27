@@ -26,9 +26,8 @@ class Executor(BaseModel):
     threads_per_worker: int = 2
     memory_limit: str = "1GiB"
 
-  local: Local = Local()
-  slurm: Slurm = Slurm()
-
+  name: str = "local"
+  args: Slurm | Local = Local()
 
 class Inputs(BaseModel):
 

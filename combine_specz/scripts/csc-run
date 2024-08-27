@@ -5,10 +5,10 @@ import datetime
 import os
 import time
 from pathlib import Path
-from specz import Specz
 
 from dask.distributed import Client
 from executor import get_executor
+from specz import Specz
 from utils import dump_yml, load_yml, setup_logger
 
 
@@ -54,9 +54,7 @@ class Runner:
             process_info = {}
         self.process_info = process_info
 
-        # Get dask executor
-        executor_key = os.getenv("DASK_EXECUTOR_KEY", "slurm")
-        self.cluster = get_executor(executor_key, self.executors)
+        self.cluster = get_executor(self.executors)
 
     def __enter__(self):
         return self

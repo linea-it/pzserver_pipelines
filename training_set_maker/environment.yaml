@@ -11,3 +11,4 @@ dependencies:
       - hipscat==0.3.7
       - hipscat-import==0.3.4
       - lsdb==0.2.8
+      - tables_io==0.9.8

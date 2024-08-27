@@ -4,7 +4,6 @@ from pydantic import BaseModel
 
 DATASETS_DIR = os.getenv("DATASETS_DIR", "/datasets")
 
-
 class Executor(BaseModel):
 
   class Slurm(BaseModel):
@@ -26,8 +25,8 @@ class Executor(BaseModel):
     threads_per_worker: int = 2
     memory_limit: str = "1GiB"
 
-  local: Local = Local()
-  slurm: Slurm = Slurm()
+  name: str = "local"
+  args: Slurm | Local = Local()
 
 
 class Inputs(BaseModel):
@@ -35,15 +34,18 @@ class Inputs(BaseModel):
   class Dataset(BaseModel):
 
     class Columns(BaseModel):
-      id: int = 1
+      id: str = "id"
 
     path: str = f"{DATASETS_DIR}/mini_dataset"
+    columns: Columns = Columns()
+
 
   class Specz(BaseModel):
 
     class Columns(BaseModel):
       ra: str = "ra"
       dec: str = "dec"
+      z: str = "z"
 
     path: str = f"{DATASETS_DIR}/specz.parquet"
     columns: Columns = Columns()
@@ -61,6 +63,7 @@ class Param(BaseModel):
 
   crossmatch: Crossmatch = Crossmatch()
   duplicate_criteria: str = "closest"
+
 
 class Config(BaseModel):
   output_dir: str = "./outputs"

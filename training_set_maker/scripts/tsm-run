@@ -5,9 +5,9 @@ import datetime
 import os
 import time
 from pathlib import Path
-import tables_io
 
 import lsdb
+import tables_io
 from dask.distributed import Client
 from executor import get_executor
 from utils import dump_yml, load_yml, setup_logger
@@ -61,8 +61,7 @@ class Runner:
         self.process_info = process_info
 
         # Get dask executor
-        executor_key = os.getenv("DASK_EXECUTOR_KEY", "slurm")
-        self.cluster = get_executor(executor_key, self.executors)
+        self.cluster = get_executor(self.executors)
 
     def __enter__(self):
         return self
@@ -70,7 +69,7 @@ class Runner:
     def add_info(self, key, value):
         """Add info in process.yaml"""
 
-        self.process_info[key] = value
+        self.process_info[key] = value # type: ignore
         dump_yml(self.process_info_path, self.process_info)
 
     def run(self):
@@ -93,7 +92,7 @@ class Runner:
             )
 
             dataset_path = self.inputs.get("dataset").get("path")
-            dataset_id = self.inputs.get("dataset").get("columns", {}).get("id", {})
+            dataset_id = self.inputs.get("dataset").get("columns", {}).get("id", "id")
 
             dataset = lsdb.read_hipscat(dataset_path)
             duplicate_criteria = self.param.get("duplicate_criteria", "closest")
@@ -133,7 +132,7 @@ class Runner:
         """
 
         outpath = str(Path(filepath).resolve())
-        outputs = self.process_info.get("outputs", [])
+        outputs = self.process_info.get("outputs", []) # type: ignore
         outputs.append({"path": outpath, "role": role})
         self.add_info("outputs", outputs)
 
