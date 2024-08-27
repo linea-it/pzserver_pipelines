@@ -132,7 +132,9 @@ dmypy.json
 */runinfo
 */output
 
-# config files 
+# config files
 env.sh
+pipelines.yaml
 pipelines.yml
-data-example/datasets.yml
+config.yaml
+config.yml

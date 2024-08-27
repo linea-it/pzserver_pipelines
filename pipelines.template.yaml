@@ -1,0 +1,8 @@
+training_set_maker:
+  display_name: 'Training Set Maker'
+  path: '<PIPELINES_DIR>/training_set_maker'
+  executor: 'local' # only to orchestration
+  runner: 'bash'
+  executable: 'run.sh'
+  schema_config: '<PIPELINES_DIR>/training_set_maker/config.py'
+  version: '0.0.1'

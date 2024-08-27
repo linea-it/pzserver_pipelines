@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+
+import argparse
+import datetime
+import os
+import pathlib
+import tempfile
+import time
+from pathlib import Path
+
+import lsdb
+from dask.distributed import Client
+from executor import get_executor
+from hipscat_import.catalog.arguments import ImportArguments
+from hipscat_import.pipeline import pipeline_with_client
+from utils import dump_yml, load_yml, setup_logger
+
+
+class TSMRunner:
+
+    def __init__(self, config, cwd=".") -> None:
+        self.logger = setup_logger("tsm", logdir=cwd)
+        self.cwd = cwd
+        self.process_info_path = Path(self.cwd, "process.yml")
+        self.process_info = None
+        self.start_time = None
+        self.end_time = None
+
+        # Loading config
+        pipe_config = load_yml(config)
+
+        # Define output dir
+        self.output_dir = Path(pipe_config.get("output_dir", "out"))
+        if not self.output_dir.is_absolute():
+            self.output_dir = Path(self.cwd, self.output_dir)
+
+        # Loading inputs
+        self.inputs = pipe_config.get("inputs")
+        self.logger.info("Inputs: %s", self.inputs)
+
+        # Loading parameters
+        self.param = pipe_config.get("param", {})
+        self.logger.info("Params: %s", self.param)
+
+        # Set executors
+        self.executors = pipe_config.get("executor")
+
+        # Create output dir
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # Creating process info yaml
+        if not self.process_info_path.is_file():
+            self.process_info_path.touch()
+
+        # Loading process info yaml
+        process_info = load_yml(self.process_info_path)
+        if not process_info:
+            process_info = {}
+        self.process_info = process_info
+
+        # Define output dir temporary to specz hipscat
+        self.specz_tmp_dir = tempfile.TemporaryDirectory(dir=self.output_dir)
+        self.logger.info("Specz temporary dir: %s", self.specz_tmp_dir)
+
+        # Get dask executor
+        executor_key = os.getenv("DASK_EXECUTOR_KEY", "slurm")
+        self.cluster = get_executor(executor_key, self.executors)
+
+    def __enter__(self):
+        return self
+
+    def add_info(self, key, value):
+        """ """
+
+        self.process_info[key] = value
+        dump_yml(self.process_info_path, self.process_info)
+
+    def run(self):
+        """ """
+
+        # Adding start time
+        self.start_time = time.time()
+        self.add_info("start_time", datetime.datetime.now())
+
+        specz = self.inputs.get("specz")
+        if len(specz) > 1:
+            self.logger.warn(f"more than one specz was selected: {specz}")
+
+        specz = specz.pop()
+        self.logger.info(f"Specz used: {specz}")
+
+        with Client(self.cluster) as client:
+            specz["tmp_hips_output"] = self.specz_tmp_dir
+            specz_file = self.__specz_to_hipscat(specz, client)
+            specz_df = lsdb.read_hipscat(specz_file)
+
+            dataset = lsdb.read_hipscat(self.inputs.get("dataset").get("path"))
+
+            try:
+                cross = specz_df.crossmatch(dataset, **self.param)
+                data = cross.compute()
+            except ValueError as err:
+                if "size 0 inputs" in str(err):
+                    self.logger.exception("No cross matches were found!")
+                    raise
+                self.logger.exception("Error when cross-matching")
+                raise
+
+            outputfile = Path(self.output_dir, "tsm-output.parquet")
+            data.to_parquet(outputfile)
+            self.__register_outputs(outputfile)
+
+            self.logger.info("--> Object Count: \n%s", str(data.count()))
+
+        # remove specz hipscat temporary
+        self.specz_tmp_dir.cleanup()
+
+        self.end_time = time.time() - self.start_time
+        self.logger.info("Time elapsed: %s", str(self.end_time))
+
+    def __register_outputs(self, filepath, role="main"):
+        """Register outputs in process.yml
+
+        Args:
+            filepath (str): output path
+            role (str, optional): role name. Defaults to 'main'.
+        """
+
+        outpath = str(Path(filepath).resolve())
+        outputs = self.process_info.get("outputs", [])
+        outputs.append({"path": outpath, "role": role})
+        self.add_info("outputs", outputs)
+
+    def __specz_to_hipscat(self, specz, client):
+        specz_file = pathlib.Path(specz.get("path"))
+        col_ra = specz.get("columns", {}).get("ra", "ra")
+        col_dec = specz.get("columns", {}).get("dec", "dec")
+        tmp_output_dir = specz.get("tmp_hips_output")
+
+        args = ImportArguments(
+            ra_column=col_ra,
+            dec_column=col_dec,
+            file_reader=specz_file.suffix.replace(".", ""),
+            input_file_list=[str(specz_file)],
+            output_artifact_name=specz_file.name,
+            output_path=tmp_output_dir.name,
+            resume=False,
+        )
+
+        pipeline_with_client(args, client)
+        return str(pathlib.Path(tmp_output_dir.name, specz_file.name))
+
+    def __exit__(self, exc_type, exc_value, traceback):
+
+        self.cluster.close()
+        self.add_info("end_time", datetime.datetime.now())
+
+        if exc_type:
+            self.logger.error("%s: %s", exc_type.__name__, exc_value)
+            self.logger.debug("Traceback: %s", traceback)
+            self.add_info("status", "Failed")
+        else:
+            self.add_info("status", "Successful")
+
+
+if __name__ == "__main__":
+    # Create the parser and add arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument(dest="config_path", help="yaml config path")
+    parser.add_argument(
+        dest="cwd", nargs="?", help="processing dir", default=os.getcwd()
+    )
+
+    args = parser.parse_args()
+    config_path = args.config_path
+    cwd = args.cwd
+
+    # Run pipeline
+    with TSMRunner(config_path, cwd) as tsmrun:
+        tsmrun.run()

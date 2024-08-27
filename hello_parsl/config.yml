@@ -1,9 +1,0 @@
-##################################################################
-# Parameters file. Should follow the syntax defined in:  
-# http://docs.ansible.com/ansible/latest/YAMLSyntax.html
-# More general reference: http://www.yaml.org/spec/1.2/spec.html
-
-
-executor: 'local'       # local or linea(not implemented)
-sleeptime: '10'
-message: 'Hello World (Parsl)'
