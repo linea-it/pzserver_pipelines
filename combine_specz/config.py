@@ -1,33 +1,57 @@
 import os
+from typing import Any
 
-from pydantic import BaseModel
+from pydantic import (
+    BaseModel,
+    model_validator,
+)
 
 DATASETS_DIR = os.getenv("DATASETS_DIR", "/datasets")
 
 
+class Slurm(BaseModel):
+
+  class Instance(BaseModel):
+    processes: int = 1
+    memory: str = "123GiB"
+    queue: str = "cpu"
+    job_extra_directives: list[str] = ["--propagate", "--time=2:00:00"]
+
+  class Adapt(BaseModel):
+    maximum_jobs: int = 10
+
+  instance: Instance = Instance()
+  adapt: Adapt = Adapt()
+
+class Local(BaseModel):
+  n_workers: int = 2
+  threads_per_worker: int = 2
+  memory_limit: str = "1GiB"
+
+
 class Executor(BaseModel):
 
-  class Slurm(BaseModel):
-
-    class Instance(BaseModel):
-      processes: int = 1
-      memory: str = "123GiB"
-      queue: str = "cpu"
-      job_extra_directives: list[str] = ["--propagate", "--time=2:00:00"]
-
-    class Adapt(BaseModel):
-      maximum_jobs: int = 10
-
-    instance: Instance = Instance()
-    adapt: Adapt = Adapt()
-
-  class Local(BaseModel):
-    n_workers: int = 2
-    threads_per_worker: int = 2
-    memory_limit: str = "1GiB"
-
   name: str = "local"
-  args: Slurm | Local = Local()
+  args: Any = {}
+
+  @model_validator(mode='before')
+  @classmethod
+  def sync_args(cls, data: Any) -> Any:
+    
+      assert (isinstance(data, dict)), 'data is not dict'
+      name = data.get("name", "local")
+
+      match name:
+        case "local":
+          executor = Local(**data.get("args", {}))
+        case "slurm":
+          executor = Slurm(**data.get("args", {}))
+        case _:
+          raise ValueError(f"name '{name}' do not match")    
+
+      data["args"] = executor.model_dump()
+      return data
+
 
 class Inputs(BaseModel):
 
