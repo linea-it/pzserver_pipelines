@@ -7,10 +7,10 @@ import time
 from pathlib import Path
 
 import lsdb
-import tables_io
 from dask.distributed import Client
 from executor import get_executor
 from utils import dump_yml, load_yml, setup_logger
+from product_handle import FileHandle
 
 
 class Runner:
@@ -87,9 +87,11 @@ class Runner:
         self.logger.info(f"Specz used: {specz}")
 
         with Client(self.cluster) as client:
-            specz_df = lsdb.from_dataframe(
-                tables_io.read(specz.get("path"), tables_io.types.PD_DATAFRAME)
-            )
+            df = FileHandle(specz.get("path"))
+            ra = specz.get("columns", {}).get("ra", "ra")
+            dec = specz.get("columns", {}).get("dec", "dec")
+
+            specz_df = lsdb.from_dataframe(df.to_df(), ra_column=ra, dec_column=dec)
 
             dataset_path = self.inputs.get("dataset").get("path")
             dataset_id = self.inputs.get("dataset").get("columns", {}).get("id", "id")
