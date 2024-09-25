@@ -8,6 +8,7 @@
 #SBATCH --error={err}
 #SBATCH --partition=cpu
 #SBATCH --propagate
+#SBATCH --exclusive
 
 {cmd}
 
