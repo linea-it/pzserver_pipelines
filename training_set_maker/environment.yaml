@@ -8,7 +8,5 @@ dependencies:
       - dask==2024.7.0
       - distributed==2024.7.0
       - dask-jobqueue==0.8.5
-      - hipscat==0.3.7
-      - hipscat-import==0.3.4
-      - lsdb==0.2.8
-      - tables_io==0.9.8
+      - lsdb==0.4.2
+      - tables_io==0.9.10
