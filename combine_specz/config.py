@@ -12,6 +12,7 @@ DATASETS_DIR = os.getenv("DATASETS_DIR", "/datasets")
 class Slurm(BaseModel):
 
   class Instance(BaseModel):
+    cores: int = 54
     processes: int = 1
     memory: str = "123GiB"
     queue: str = "cpu"
