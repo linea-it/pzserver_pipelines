@@ -33,6 +33,7 @@ inputs:
         dec: "dec"
 
 output_dir: "outputs"
+output_name: "tsm.parquet"
 
 param:
   duplicate_criteria: "closest"
