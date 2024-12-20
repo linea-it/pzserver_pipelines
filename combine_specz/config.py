@@ -74,6 +74,7 @@ class Param(BaseModel):
 
 class Config(BaseModel):
   output_dir: str = "./outputs"
+  output_name: str = "csc.parquet"
   executor: Executor = Executor()
   inputs: Inputs = Inputs()
   param: Param = Param()

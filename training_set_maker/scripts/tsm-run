@@ -10,7 +10,7 @@ import lsdb
 from dask.distributed import Client
 from executor import get_executor
 from utils import dump_yml, load_yml, setup_logger
-from product_handle import FileHandle
+from product_handle import ProductHandle
 
 
 class Runner:
@@ -26,7 +26,8 @@ class Runner:
         # Loading config
         pipe_config = load_yml(config)
 
-        # Define output dir
+        # Define output dir and output name
+        self.output_name = pipe_config.get("output_name", "tsm.parquet")
         self.output_dir = Path(pipe_config.get("output_dir", "out"))
         if not self.output_dir.is_absolute():
             self.output_dir = Path(self.cwd, self.output_dir)
@@ -87,11 +88,11 @@ class Runner:
         self.logger.info(f"Specz used: {specz}")
 
         with Client(self.cluster) as client:
-            df = FileHandle(specz.get("path"))
+            df = ProductHandle().df_from_file(specz.get("path"))
             ra = specz.get("columns", {}).get("ra", "ra")
             dec = specz.get("columns", {}).get("dec", "dec")
 
-            specz_df = lsdb.from_dataframe(df.to_df(), ra_column=ra, dec_column=dec)
+            specz_df = lsdb.from_dataframe(df, ra_column=ra, dec_column=dec)
 
             dataset_path = self.inputs.get("dataset").get("path")
             margin_cache_path = self.inputs.get("dataset").get("margin_path", None)
@@ -117,7 +118,7 @@ class Runner:
                 self.logger.exception("Error when cross-matching")
                 raise
 
-            outputfile = Path(self.output_dir, "tsm-output.parquet")
+            outputfile = Path(self.output_dir, self.output_name)
             data.to_parquet(outputfile)
             self.__register_outputs(outputfile)
 

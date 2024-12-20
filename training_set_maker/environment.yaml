@@ -8,5 +8,6 @@ dependencies:
       - dask==2024.7.0
       - distributed==2024.7.0
       - dask-jobqueue==0.8.5
-      - lsdb==0.4.2
+      - lsdb==0.4.4
       - tables_io==0.9.10
+      - h5py==3.12.1

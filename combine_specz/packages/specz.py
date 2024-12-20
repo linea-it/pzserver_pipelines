@@ -2,6 +2,7 @@ import pathlib
 from dask.distributed import Client
 import dask.dataframe as dd
 from utils import setup_logger
+from product_handle import ProductHandle
 
 
 class Specz:
@@ -32,21 +33,9 @@ class Specz:
         """ Read specz """
 
         filepath = pathlib.Path(_input.get("path"))
-        extension = filepath.suffix
-
-        match extension:
-            case ".csv":
-                dataframe = dd.read_csv(_input.get('path'))
-            case ".h5" | ".hf5" | ".hdf5":
-                dataframe = dd.read_hdf(_input.get('path'))
-            case ".pq" | ".parq" | ".parquet":
-                dataframe = dd.read_parquet(_input.get('path'))
-            case ".fits" | ".fit":
-                raise NotImplemented()
-            case _:
-                raise NotImplemented()
-                    
+        dataframe = ProductHandle().df_from_file(filepath)      
         columns_mapping = _input.get("columns", None)
+        
         if columns_mapping:
             map_cols = {v: k for k, v in columns_mapping.items()}
         else:
