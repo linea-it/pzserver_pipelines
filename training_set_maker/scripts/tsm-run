@@ -29,6 +29,7 @@ class Runner:
         # Define output dir and output name
         self.output_name = pipe_config.get("output_name", "tsm.parquet")
         self.output_dir = Path(pipe_config.get("output_dir", "out"))
+
         if not self.output_dir.is_absolute():
             self.output_dir = Path(self.cwd, self.output_dir)
 
@@ -40,8 +41,8 @@ class Runner:
         self.param = pipe_config.get("param", {})
         self.param["crossmatch"] = self.param.get("crossmatch", {})
 
-        if not self.param.get("crossmatch").get("suffixes", None):
-            self.param["crossmatch"]["suffixes"] = ["_specz", ""]
+        self.specz_suffix = "_specz"
+        self.param["crossmatch"]["suffixes"] = [self.specz_suffix, ""]
 
         self.logger.info("Params: %s", self.param)
 
@@ -85,12 +86,15 @@ class Runner:
             self.logger.warn(f"more than one specz was selected: {specz}")
 
         specz = specz.pop()
-        self.logger.info(f"Specz used: {specz}")
+        self.logger.debug(f"Specz used: {specz}")
 
         with Client(self.cluster) as client:
             df = ProductHandle().df_from_file(specz.get("path"))
-            ra = specz.get("columns", {}).get("ra", "ra")
-            dec = specz.get("columns", {}).get("dec", "dec")
+            
+            columns = specz.get("columns", {})
+            
+            ra = columns.get("ra", "ra")
+            dec = columns.get("dec", "dec")
 
             specz_df = lsdb.from_dataframe(df, ra_column=ra, dec_column=dec)
 
@@ -118,11 +122,29 @@ class Runner:
                 self.logger.exception("Error when cross-matching")
                 raise
 
+            suffix = self.specz_suffix
+            data_columns = data.columns
+            specz_columns = {}
+
+            self.logger.debug(f"Output columns: {data_columns}")
+
+            for col in data_columns:
+                if col.endswith(suffix):
+                    specz_columns[col] = col.removesuffix(suffix)
+
+            for key, value in specz_columns.copy().items():
+                if value in data_columns:
+                    del(specz_columns[key])
+
+            if specz_columns:
+                self.logger.debug(f"Renaming columns: {specz_columns}")
+                data.rename(columns=specz_columns, inplace=True)
+
             outputfile = Path(self.output_dir, self.output_name)
             data.to_parquet(outputfile)
             self.__register_outputs(outputfile)
 
-            self.logger.info("--> Object Count: \n%s", str(data.count()))
+            self.logger.debug("--> Object Count: \n%s", str(data.count()))
 
         self.end_time = time.time() - self.start_time
         self.logger.info("Time elapsed: %s", str(self.end_time))
