@@ -10,7 +10,7 @@ import lsdb
 from dask.distributed import Client
 from executor import get_executor
 from utils import dump_yml, load_yml, setup_logger
-from product_handle import ProductHandle
+from product_handle import ProductHandle, create_output
 
 
 class Runner:
@@ -28,6 +28,7 @@ class Runner:
 
         # Define output dir and output name
         self.output_name = pipe_config.get("output_name", "tsm.parquet")
+        self.output_format = pipe_config.get("output_format", None)
         self.output_dir = Path(pipe_config.get("output_dir", "out"))
 
         if not self.output_dir.is_absolute():
@@ -140,14 +141,19 @@ class Runner:
                 self.logger.debug(f"Renaming columns: {specz_columns}")
                 data.rename(columns=specz_columns, inplace=True)
 
-            outputfile = Path(self.output_dir, self.output_name)
-            data.to_parquet(outputfile)
+
+            if not self.output_format:
+                self.output_format = specz.get("format")
+
+            outputpath = str(Path(self.output_dir, self.output_name))
+            outputfile = create_output(data, outputpath, self.output_format)
             self.__register_outputs(outputfile)
 
             self.logger.debug("--> Object Count: \n%s", str(data.count()))
 
         self.end_time = time.time() - self.start_time
         self.logger.info("Time elapsed: %s", str(self.end_time))
+
 
     def __register_outputs(self, filepath, role="main"):
         """Register outputs in process.yml

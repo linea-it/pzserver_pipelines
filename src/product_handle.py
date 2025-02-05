@@ -5,6 +5,7 @@ from typing import List
 
 import pandas as pd
 import tables_io
+# from astropy.io.votable import from_table
 from collections import OrderedDict
 
 from os import PathLike
@@ -14,6 +15,39 @@ FilePath = Union[str, "PathLike[str]"]
 Column = Union[str, int]
 OpInt = Union[int, None]
 OpStr = Union[str, None]
+
+
+def create_output(data, output_path, extension):
+    """Create output file
+    
+    Args:
+        data (pandas.dataframe): 
+        output_path (str): output path
+        extension (str): output extension
+
+    Return:
+        str: output filepath
+    """
+
+    outputfile = f"{output_path}.{extension}"
+
+    match extension:
+        case "csv":
+            data.to_csv(outputfile)
+        case "fits" | "fit" | "hf5" | "hdf5" | "h5" | "pq" | "parquet":
+            tables_io.write(data, outputfile, extension)
+        case "votable":
+            raise NotImplementedError('VOTable not implemented')
+            # outputfile = f"{output_path}.xml"
+            # table = tables_io.convert(data, tables_io.types.AP_TABLE)
+            # votable = from_table(table)
+            # votable.to_xml(outputfile)
+        case _:
+            raise ValueError(
+                f"The {extension} extension is not valid for output file from this pipeline."
+            )
+        
+    return outputfile
 
 
 class NotTableError(TypeError):

@@ -3,6 +3,7 @@ channels:
   - defaults
 dependencies:
   - python=3.10
+  - pytables=3.10
   - pip:
       - PyYaml
       - dask==2024.7.0
