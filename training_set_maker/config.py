@@ -1,10 +1,7 @@
 import os
 from typing import Any
 
-from pydantic import (
-    BaseModel,
-    model_validator,
-)
+from pydantic import BaseModel, model_validator
 
 DATASETS_DIR = os.getenv("DATASETS_DIR", "/datasets")
 
@@ -71,6 +68,7 @@ class Inputs(BaseModel):
       z: str = "z"
 
     path: str = f"{DATASETS_DIR}/specz.parquet"
+    format: str = 'parquet'
     columns: Columns = Columns()
 
   dataset: Dataset = Dataset()
@@ -90,7 +88,8 @@ class Param(BaseModel):
 
 class Config(BaseModel):
   output_dir: str = "./outputs"
-  output_name: str = "tsm.parquet"
+  output_format: str | None = None
+  output_name: str = "tsm"
   executor: Executor = Executor()
   inputs: Inputs = Inputs()
   param: Param = Param()
