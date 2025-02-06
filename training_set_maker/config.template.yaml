@@ -28,11 +28,13 @@ inputs:
       id: "id"
   specz:
     - path: "<DATASETS_DIR>/specz.parquet"
+      format: "csv"
       columns:
         ra: "ra"
         dec: "dec"
 
 output_dir: "outputs"
+output_format: "csv"
 output_name: "tsm.parquet"
 
 param:

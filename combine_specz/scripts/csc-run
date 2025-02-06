@@ -8,6 +8,7 @@ from pathlib import Path
 
 from dask.distributed import Client
 from executor import get_executor
+from product_handle import create_output
 from specz import Specz
 from utils import dump_yml, load_yml, setup_logger
 
@@ -27,6 +28,11 @@ class Runner:
 
         # Define output dir and output name
         self.output_name = pipe_config.get("output_name", "csc.parquet")
+        self.output_format = pipe_config.get("output_format", None)
+
+        if not self.output_format:
+            self.output_format = "parquet"
+
         self.output_dir = Path(pipe_config.get("output_dir", "out"))
         if not self.output_dir.is_absolute():
             self.output_dir = Path(self.cwd, self.output_dir)
@@ -82,8 +88,9 @@ class Runner:
 
         with Client(self.cluster) as client:
             specz = Specz(specz, client)
-            output_name = Path(self.output_dir, self.output_name)
-            specz.dataframe.to_parquet(output_name)
+
+            output_path = str(Path(self.output_dir, self.output_name))
+            output_name = create_output(specz.dataframe, output_path, self.output_format)
             self.__register_outputs(output_name)
 
             self.logger.info(f"--> Object Count: {len(specz.dataframe)}")

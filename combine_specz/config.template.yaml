@@ -35,7 +35,8 @@ inputs:
         z: "z"
 
 output_dir: "outputs"
-output_name: "csc.parquet"
+output_format: "parquet"
+output_name: "csc"
 
 param:
   debug: true
