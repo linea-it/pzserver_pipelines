@@ -146,25 +146,39 @@ class Runner:
 
             outputpath = str(Path(self.output_dir, self.output_name))
             outputfile = create_output(data, outputpath, self.output_format)
-            self.__register_outputs(outputfile)
+
+            columns_suffix = {k: f"{v}{self.specz_suffix}" for k, v in columns.items()}
+            columns_assoc = self.__get_columns_associations(columns_suffix, specz_columns)
+
+            self.__register_outputs(outputfile, columns_assoc)
 
             self.logger.debug("--> Object Count: \n%s", str(data.count()))
 
         self.end_time = time.time() - self.start_time
         self.logger.info("Time elapsed: %s", str(self.end_time))
 
+    def __get_columns_associations(self, columns, specz_columns):
+        """Get columns associations of the product output
+        
+        Args:
+            columns (dict): used columns
+            specz_columns (dict): output columns
+        """
 
-    def __register_outputs(self, filepath, role="main"):
+        return {k: specz_columns[v] if v in specz_columns else v for k, v in columns.items()}
+
+    def __register_outputs(self, filepath, assoc, role="main"):
         """Register outputs in process.yml
 
         Args:
             filepath (str): output path
+            assoc (dic): columns association
             role (str, optional): role name. Defaults to 'main'.
         """
 
         outpath = str(Path(filepath).resolve())
         outputs = self.process_info.get("outputs", []) # type: ignore
-        outputs.append({"path": outpath, "role": role})
+        outputs.append({"path": outpath, "role": role, "columns_assoc": assoc})
         self.add_info("outputs", outputs)
 
     def __add_train_flag(self):

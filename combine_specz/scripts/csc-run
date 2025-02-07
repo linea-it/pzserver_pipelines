@@ -91,24 +91,25 @@ class Runner:
 
             output_path = str(Path(self.output_dir, self.output_name))
             output_name = create_output(specz.dataframe, output_path, self.output_format)
-            self.__register_outputs(output_name)
+            self.__register_outputs(output_name, {"ra": "ra", "dec": "dec", "z": "z"})
 
             self.logger.info(f"--> Object Count: {len(specz.dataframe)}")
 
         self.end_time = time.time() - self.start_time
         self.logger.info("Time elapsed: %s", str(self.end_time))
 
-    def __register_outputs(self, filepath, role="main"):
+    def __register_outputs(self, filepath, assoc, role="main"):
         """Register outputs in process.yml
 
         Args:
             filepath (str): output path
+            assoc (dic): columns association
             role (str, optional): role name. Defaults to 'main'.
         """
 
         outpath = str(Path(filepath).resolve())
         outputs = self.process_info.get("outputs", [])
-        outputs.append({"path": outpath, "role": role})
+        outputs.append({"path": outpath, "role": role, "columns_assoc": assoc})
         self.add_info("outputs", outputs)
 
     def __exit__(self, exc_type, exc_value, traceback):
