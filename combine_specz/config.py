@@ -8,83 +8,85 @@ DATASETS_DIR = os.getenv("DATASETS_DIR", "/datasets")
 
 class Slurm(BaseModel):
 
-  class Instance(BaseModel):
-    processes: int = 1
-    memory: str = "123GiB"
-    queue: str = "cpu"
-    job_extra_directives: list[str] = ["--propagate", "--time=2:00:00"]
+    class Instance(BaseModel):
+        processes: int = 1
+        memory: str = "123GiB"
+        queue: str = "cpu"
+        job_extra_directives: list[str] = ["--propagate", "--time=2:00:00"]
 
-  class Adapt(BaseModel):
-    maximum_jobs: int = 10
+    class Adapt(BaseModel):
+        maximum_jobs: int = 10
 
-  instance: Instance = Instance()
-  adapt: Adapt = Adapt()
+    instance: Instance = Instance()
+    adapt: Adapt = Adapt()
+
 
 class Local(BaseModel):
-  n_workers: int = 2
-  threads_per_worker: int = 2
-  memory_limit: str = "1GiB"
+    n_workers: int = 2
+    threads_per_worker: int = 2
+    memory_limit: str = "1GiB"
 
 
 class Executor(BaseModel):
 
-  name: str = "local"
-  args: Any = {}
+    name: str = "local"
+    args: Any = {}
 
-  @model_validator(mode='before')
-  @classmethod
-  def sync_args(cls, data: Any) -> Any:
-    
-      assert (isinstance(data, dict)), 'data is not dict'
-      name = data.get("name", "local")
+    @model_validator(mode="before")
+    @classmethod
+    def sync_args(cls, data: Any) -> Any:
 
-      match name:
-        case "local":
-          executor = Local(**data.get("args", {}))
-        case "slurm":
-          executor = Slurm(**data.get("args", {}))
-        case _:
-          raise ValueError(f"name '{name}' do not match")    
+        assert isinstance(data, dict), "data is not dict"
+        name = data.get("name", "local")
 
-      data["args"] = executor.model_dump()
-      return data
+        match name:
+            case "local":
+                executor = Local(**data.get("args", {}))
+            case "slurm":
+                executor = Slurm(**data.get("args", {}))
+            case _:
+                raise ValueError(f"name '{name}' do not match")
+
+        data["args"] = executor.model_dump()
+        return data
 
 
 class Inputs(BaseModel):
 
-  class Specz(BaseModel):
+    class Specz(BaseModel):
 
-    class Columns(BaseModel):
-      ra: str = "ra"
-      dec: str = "dec"
-      z: str = "z"
+        class Columns(BaseModel):
+            ra: str = "ra"
+            dec: str = "dec"
+            z: str = "z"
 
-    path: str = f"{DATASETS_DIR}/specz.parquet"
-    format: str = 'parquet'
-    columns: Columns = Columns()
+        path: str = f"{DATASETS_DIR}/specz.parquet"
+        format: str = "parquet"
+        columns: Columns = Columns()
 
-  specz: list = [Specz(), Specz()]
+    specz: list = [Specz(), Specz()]
 
 
 class Param(BaseModel):
-  debug: bool = True
+    debug: bool = True
 
 
 class Config(BaseModel):
-  output_dir: str = "./outputs"
-  output_format: str | None = "parquet"
-  output_name: str = "csc"
-  executor: Executor = Executor()
-  inputs: Inputs = Inputs()
-  param: Param = Param()
+    output_root_dir: str = "."
+    output_dir: str = "outputs"
+    output_format: str | None = "parquet"
+    output_name: str = "csc"
+    executor: Executor = Executor()
+    inputs: Inputs = Inputs()
+    param: Param = Param()
 
 
 if __name__ == "__main__":
-  import yaml
+    import yaml
 
-  cfg = Config()
+    cfg = Config()
 
-  with open('config.yml', 'w') as outfile:
-    data_json = cfg.model_dump()
-    print(data_json)
-    yaml.dump(data_json, outfile)
+    with open("config.yml", "w") as outfile:
+        data_json = cfg.model_dump()
+        print(data_json)
+        yaml.dump(data_json, outfile)
