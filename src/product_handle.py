@@ -1,15 +1,14 @@
 import abc
 import csv
+
+# from astropy.io.votable import from_table
+from collections import OrderedDict
+from os import PathLike
 from pathlib import Path
-from typing import List
+from typing import List, Union
 
 import pandas as pd
 import tables_io
-# from astropy.io.votable import from_table
-from collections import OrderedDict
-
-from os import PathLike
-from typing import Union
 
 FilePath = Union[str, "PathLike[str]"]
 Column = Union[str, int]
@@ -17,28 +16,31 @@ OpInt = Union[int, None]
 OpStr = Union[str, None]
 
 
-def create_output(data, output_path, extension):
+def create_output(data, output_root_dir, output_dir, output_name, extension):
     """Create output file
-    
+
     Args:
-        data (pandas.dataframe): 
-        output_path (str): output path
+        data (pandas.dataframe):
+        output_root_dir (str): output root dir
+        output_dir (str): output dir
+        output_name (str): output name
         extension (str): output extension
 
     Return:
         str: output filepath
     """
 
-    outputfile = f"{output_path}.{extension}"
+    outputfile = str(Path(output_dir, f"{output_name}.{extension}"))
+    output_full_file = str(Path(output_root_dir, outputfile).resolve())
 
     match extension:
         case "csv":
-            data.to_csv(outputfile)
+            data.to_csv(output_full_file)
         case "fits" | "fit" | "hf5" | "hdf5" | "h5" | "pq" | "parquet":
-            tables_io.write(data, outputfile, extension)
+            tables_io.write(data, output_full_file, extension)
         case "votable":
-            raise NotImplementedError('VOTable not implemented')
-            # outputfile = f"{output_path}.xml"
+            raise NotImplementedError("VOTable not implemented")
+            # outputfile = str(Path(output_dir, f"{output_name}.xml").resolve())
             # table = tables_io.convert(data, tables_io.types.AP_TABLE)
             # votable = from_table(table)
             # votable.to_xml(outputfile)
@@ -46,7 +48,7 @@ def create_output(data, output_path, extension):
             raise ValueError(
                 f"The {extension} extension is not valid for output file from this pipeline."
             )
-        
+
     return outputfile
 
 

@@ -29,16 +29,19 @@ class Runner:
         # Define output dir and output name
         self.output_name = pipe_config.get("output_name", "csc.parquet")
         self.output_format = pipe_config.get("output_format", None)
+        self.output_root_dir = Path(pipe_config.get("output_root_dir", "."))
+
+        if not self.output_root_dir.is_absolute():
+            self.output_root_dir = Path(self.cwd, self.output_root_dir)
 
         if not self.output_format:
             self.output_format = "parquet"
 
         self.output_dir = Path(pipe_config.get("output_dir", "out"))
-        if not self.output_dir.is_absolute():
-            self.output_dir = Path(self.cwd, self.output_dir)
 
         # Create output dir
-        os.makedirs(self.output_dir, exist_ok=True)
+        output_full_dir = Path(self.output_root_dir, self.output_dir)
+        os.makedirs(output_full_dir, exist_ok=True)
 
         # Loading inputs
         self.inputs = pipe_config.get("inputs")
@@ -89,19 +92,28 @@ class Runner:
         with Client(self.cluster) as client:
             specz = Specz(specz, client)
 
-            output_path = str(Path(self.output_dir, self.output_name))
-            output_name = create_output(specz.dataframe, output_path, self.output_format)
-            self.__register_outputs(output_name, {"ra": "ra", "dec": "dec", "z": "z"})
+            outputfile = create_output(
+                specz.dataframe,
+                self.output_root_dir,
+                self.output_dir,
+                self.output_name,
+                self.output_format,
+            )
+
+            self.__register_outputs(
+                self.output_root_dir, outputfile, {"ra": "ra", "dec": "dec", "z": "z"}
+            )
 
             self.logger.info(f"--> Object Count: {len(specz.dataframe)}")
 
         self.end_time = time.time() - self.start_time
         self.logger.info("Time elapsed: %s", str(self.end_time))
 
-    def __register_outputs(self, filepath, assoc, role="main"):
+    def __register_outputs(self, root_dir, filepath, assoc, role="main"):
         """Register outputs in process.yml
 
         Args:
+            root_dir (str): output root dir
             filepath (str): output path
             assoc (dic): columns association
             role (str, optional): role name. Defaults to 'main'.
@@ -109,7 +121,14 @@ class Runner:
 
         outpath = str(Path(filepath).resolve())
         outputs = self.process_info.get("outputs", [])
-        outputs.append({"path": outpath, "role": role, "columns_assoc": assoc})
+        outputs.append(
+            {
+                "path": outpath,
+                "root_dir": root_dir,
+                "role": role,
+                "columns_assoc": assoc,
+            }
+        )
         self.add_info("outputs", outputs)
 
     def __exit__(self, exc_type, exc_value, traceback):

@@ -26,13 +26,17 @@ class Runner:
         # Loading config
         pipe_config = load_yml(config)
 
+        self.logger.debug("Configs: %s", pipe_config)
+
         # Define output dir and output name
         self.output_name = pipe_config.get("output_name", "tsm.parquet")
         self.output_format = pipe_config.get("output_format", None)
-        self.output_dir = Path(pipe_config.get("output_dir", "out"))
+        self.output_root_dir = pipe_config.get("output_root_dir", ".")
 
-        if not self.output_dir.is_absolute():
-            self.output_dir = Path(self.cwd, self.output_dir)
+        if not Path(self.output_root_dir).is_absolute():
+            self.output_root_dir = Path(self.cwd, self.output_root_dir)
+
+        self.output_dir = Path(pipe_config.get("output_dir", "out"))
 
         # Loading inputs
         self.inputs = pipe_config.get("inputs")
@@ -51,7 +55,8 @@ class Runner:
         self.executors = pipe_config.get("executor")
 
         # Create output dir
-        os.makedirs(self.output_dir, exist_ok=True)
+        output_full_dir = Path(self.output_root_dir, self.output_dir)
+        os.makedirs(output_full_dir, exist_ok=True)
 
         # Creating process info yaml
         if not self.process_info_path.is_file():
@@ -72,7 +77,7 @@ class Runner:
     def add_info(self, key, value):
         """Add info in process.yaml"""
 
-        self.process_info[key] = value # type: ignore
+        self.process_info[key] = value  # type: ignore
         dump_yml(self.process_info_path, self.process_info)
 
     def run(self):
@@ -91,9 +96,9 @@ class Runner:
 
         with Client(self.cluster) as client:
             df = ProductHandle().df_from_file(specz.get("path"))
-            
+
             columns = specz.get("columns", {})
-            
+
             ra = columns.get("ra", "ra")
             dec = columns.get("dec", "dec")
 
@@ -135,7 +140,7 @@ class Runner:
 
             for key, value in specz_columns.copy().items():
                 if value in data_columns:
-                    del(specz_columns[key])
+                    del specz_columns[key]
 
             if specz_columns:
                 self.logger.debug(f"Renaming columns: {specz_columns}")
@@ -144,13 +149,20 @@ class Runner:
             if not self.output_format:
                 self.output_format = specz.get("format")
 
-            outputpath = str(Path(self.output_dir, self.output_name))
-            outputfile = create_output(data, outputpath, self.output_format)
+            outputfile = create_output(
+                data,
+                self.output_root_dir,
+                self.output_dir,
+                self.output_name,
+                self.output_format,
+            )
 
             columns_suffix = {k: f"{v}{self.specz_suffix}" for k, v in columns.items()}
-            columns_assoc = self.__get_columns_associations(columns_suffix, specz_columns)
+            columns_assoc = self.__get_columns_associations(
+                columns_suffix, specz_columns
+            )
 
-            self.__register_outputs(outputfile, columns_assoc)
+            self.__register_outputs(self.output_root_dir, outputfile, columns_assoc)
 
             self.logger.debug("--> Object Count: \n%s", str(data.count()))
 
@@ -159,26 +171,36 @@ class Runner:
 
     def __get_columns_associations(self, columns, specz_columns):
         """Get columns associations of the product output
-        
+
         Args:
             columns (dict): used columns
             specz_columns (dict): output columns
         """
 
-        return {k: specz_columns[v] if v in specz_columns else v for k, v in columns.items()}
+        return {
+            k: specz_columns[v] if v in specz_columns else v for k, v in columns.items()
+        }
 
-    def __register_outputs(self, filepath, assoc, role="main"):
+    def __register_outputs(self, root_dir, filepath, assoc, role="main"):
         """Register outputs in process.yml
 
         Args:
+            root_dir (str): output root dir
             filepath (str): output path
             assoc (dic): columns association
             role (str, optional): role name. Defaults to 'main'.
         """
 
-        outpath = str(Path(filepath).resolve())
-        outputs = self.process_info.get("outputs", []) # type: ignore
-        outputs.append({"path": outpath, "role": role, "columns_assoc": assoc})
+        outpath = str(Path(filepath))
+        outputs = self.process_info.get("outputs", [])  # type: ignore
+        outputs.append(
+            {
+                "path": outpath,
+                "root_dir": root_dir,
+                "role": role,
+                "columns_assoc": assoc,
+            }
+        )
         self.add_info("outputs", outputs)
 
     def __add_train_flag(self):
