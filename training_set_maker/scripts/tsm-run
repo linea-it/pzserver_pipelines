@@ -33,12 +33,8 @@ class Runner:
         self.output_format = pipe_config.get("output_format", None)
         self.output_root_dir = pipe_config.get("output_root_dir", ".")
 
-        self.logger.info("root dir: %s", self.output_root_dir)
-
         if not Path(self.output_root_dir).is_absolute():
             self.output_root_dir = Path(self.cwd, self.output_root_dir)
-
-        self.logger.info("root dir new: %s", self.output_root_dir)
 
         self.output_dir = Path(pipe_config.get("output_dir", "out"))
 
