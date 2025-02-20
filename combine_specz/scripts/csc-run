@@ -29,10 +29,10 @@ class Runner:
         # Define output dir and output name
         self.output_name = pipe_config.get("output_name", "csc.parquet")
         self.output_format = pipe_config.get("output_format", None)
-        self.output_root_dir = Path(pipe_config.get("output_root_dir", "."))
+        self.output_root_dir = pipe_config.get("output_root_dir", ".")
 
-        if not self.output_root_dir.is_absolute():
-            self.output_root_dir = Path(self.cwd, self.output_root_dir)
+        if not Path(self.output_root_dir).is_absolute():
+            self.output_root_dir = str(Path(self.cwd, self.output_root_dir))
 
         if not self.output_format:
             self.output_format = "parquet"
@@ -119,7 +119,7 @@ class Runner:
             role (str, optional): role name. Defaults to 'main'.
         """
 
-        outpath = str(Path(filepath).resolve())
+        outpath = str(Path(filepath))
         outputs = self.process_info.get("outputs", [])
         outputs.append(
             {
