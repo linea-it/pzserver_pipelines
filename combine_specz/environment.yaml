@@ -1,15 +1,14 @@
 name: pipe_csc
 channels:
-  - conda-forge
+  - defaults
 dependencies:
-  - python=3.12
-  - pytables
-  - pyyaml
-  - dask
-  - distributed
-  - dask-jobqueue
-  - lsdb
-  - tables-io
-  - h5py
-  - hats
-  - hats-import
+  - python=3.10
+  - pytables=3.10
+  - pip:
+      - PyYaml
+      - dask==2024.7.0
+      - distributed==2024.7.0
+      - dask-jobqueue==0.8.5
+      - lsdb==0.4.4
+      - tables_io==0.9.10
+      - h5py==3.12.1

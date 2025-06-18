@@ -10,26 +10,14 @@ fi
 PIPE_BASE="$PIPELINES_DIR/combine_specz"
 HASENV=`conda env list | grep pipe_csc`
 
-# Checa versão do conda
-CONDA_VERSION=$(conda --version | awk '{print $2}')
-# Extrai versão maior e menor
-CONDA_MAJOR=$(echo $CONDA_VERSION | cut -d. -f1)
-CONDA_MINOR=$(echo $CONDA_VERSION | cut -d. -f2)
-
-if [ "$CONDA_MAJOR" -ge 23 ] && [ "$CONDA_MINOR" -ge 1 ]; then
-    SOLVER="--solver=libmamba"
-else
-    SOLVER=""
-fi
-
 if [ -z "$HASENV" ]; then
     echo "Create virtual environment..."
-    conda env create $SOLVER -f ${PIPE_BASE}/environment.yaml
+    conda env create -f ${PIPE_BASE}/environment.yaml
     echo "Virtual environment created and packages installed."
 # else
 #     if [ "$CONDA_FORCE_UPDATE" == "yes" ]; then
 #         echo "Virtual environment already exists. Updating..."
-#         conda env update $SOLVER --file ${PIPE_BASE}/environment.yaml --prune
+#         conda env update --file ${PIPE_BASE}/environment.yaml --prune
 #     fi
 fi
 
