@@ -1,0 +1,18 @@
+name: pipe_csc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - dask=2025.5.1
+  - dask-core=2025.5.1
+  - distributed=2025.5.1
+  - dask-jobqueue=0.9.0
+  - hats=0.5.0
+  - hats-import=0.5.0
+  - lsdb=0.5.0
+  - pandas
+  - numpy
+  - pyyaml
+  - pyarrow
+  - astropy
+  - ipykernel

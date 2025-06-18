@@ -1,0 +1,66 @@
+##################################################################
+# Parameters file. Should follow the syntax defined in:
+# http://docs.ansible.com/ansible/latest/YAMLSyntax.html
+# More general reference: http://www.yaml.org/spec/1.2/spec.html
+
+executor: 
+  name: "slurm"   # or "local"
+  #args:
+  #  n_workers: 2
+  #  threads_per_worker: 2
+  #  memory_limit: "1GiB"
+  args:
+    instance:
+      cores: 50
+      processes: 1
+      memory: "120GB"
+      queue: "cpu"
+      job_extra_directives:
+        - "--propagate"
+        - "--time=2:00:00"
+    adapt:
+      maximum_jobs: 10
+      
+
+inputs:
+  specz:
+    - path: "/scratch/users/luigi.silva/pzserver_pipelines/combine_specz/notebooks/mock-specz-1.parquet"
+      survey: mock-1
+      year: 2015
+      columns:
+        id: "id"
+        ra: "ra"
+        dec: "dec"
+        z: "z"
+        z_flag: "z_flag"
+    - path: "/scratch/users/luigi.silva/pzserver_pipelines/combine_specz/notebooks/mock-specz-2.parquet"
+      survey: mock-2
+      year: 2018
+      columns:
+        id: "id"
+        ra: "ra"
+        dec: "dec"
+        z: "z"
+        z_flag: "z_flag"
+    - path: "/scratch/users/luigi.silva/pzserver_pipelines/combine_specz/notebooks/mock-specz-3.parquet"
+      survey: mock-3
+      year: 2021
+      columns:
+        id: "id"
+        ra: "ra"
+        dec: "dec"
+        z: "z"
+        z_flag: "z_flag"
+
+base_dir: "/scratch/users/luigi.silva/pzserver_pipelines/combine_specz/notebooks/process001"
+output_dir: "outputs"
+logs_dir: "logs"
+temp_dir: "temp"
+output_format: "parquet"
+output_name: "csc"
+
+combine_type: "resolve_duplicates"  # ou "just_concatenate"
+#combine_type: "just_concatenate"
+
+param:
+  debug: true
