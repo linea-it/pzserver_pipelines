@@ -23,7 +23,7 @@ executor:
 
 inputs:
   dataset:
-    path: "<DATASETS_DIR>/mini_dataset"
+    path: "<DATASETS_DIR>/dr2"
     columns:
       id: "id"
   specz:
@@ -39,6 +39,9 @@ output_name: "tsm.parquet"
 
 param:
   duplicate_criteria: "closest"
+  flux_types: "cmodel"
+  convert_flux_to_mag: true
+  dereddening: "sfd"
   crossmatch:
     output_catalog_name: "tsm_cross_001"
     radius_arcsec: 1.0

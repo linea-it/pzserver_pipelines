@@ -104,9 +104,16 @@ class Runner:
 
             specz_df = lsdb.from_dataframe(df, ra_column=ra, dec_column=dec)
 
-            dataset_path = self.inputs.get("dataset").get("path")
-            margin_cache_path = self.inputs.get("dataset").get("margin_path", None)
+            # dataset_path = self.inputs.get("dataset").get("path")
+            # margin_cache_path = self.inputs.get("dataset").get("margin_path", None)
+            dataset_path, margin_cache_path = self.__get_photometric_data_path()
             dataset_id = self.inputs.get("dataset").get("columns", {}).get("id", "id")
+
+            if not os.path.exists(dataset_path):
+                self.logger.error("Dataset path does not exist: %s", str(dataset_path))
+                raise FileNotFoundError(
+                    f"Dataset path does not exist: {str(dataset_path)}"
+                )
 
             dataset = lsdb.read_hats(dataset_path, margin_cache=margin_cache_path)
             duplicate_criteria = self.param.get("duplicate_criteria", "closest")
@@ -168,6 +175,35 @@ class Runner:
 
         self.end_time = time.time() - self.start_time
         self.logger.info("Time elapsed: %s", str(self.end_time))
+
+    def __get_photometric_data_path(self):
+        """Get photometric data path and margin cache path
+
+        Returns:
+            tuple: dataset path and margin cache path
+        """
+        dataset_path = self.inputs.get("dataset").get("path")
+
+        flux_type = self.param.get("flux_type")
+        convert_flux_to_mag = self.param.get("convert_flux_to_mag")
+
+        if convert_flux_to_mag:
+            flux_or_mag = "mag"
+        else:
+            flux_or_mag = "flux"
+
+        dereddening = self.param.get("dereddening")
+
+        ptmd_path = Path(dataset_path, flux_or_mag, flux_type, dereddening, "catalog")
+
+        margin_cache_path = Path(
+            dataset_path, flux_or_mag, flux_type, dereddening, "catalog_1arcsec"
+        )
+
+        if not margin_cache_path.exists():
+            margin_cache_path = None
+
+        return str(ptmd_path), margin_cache_path
 
     def __get_columns_associations(self, columns, specz_columns):
         """Get columns associations of the product output
