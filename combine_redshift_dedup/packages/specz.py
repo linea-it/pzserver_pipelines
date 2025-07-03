@@ -3,7 +3,9 @@
 import os
 import glob
 import numpy as np
+import pandas as pd
 import dask.dataframe as dd
+
 from hats_import.pipeline import ImportArguments, pipeline_with_client
 from hats_import.catalog.file_readers import ParquetReader
 from hats_import.margin_cache.margin_cache_arguments import MarginCacheArguments
@@ -11,37 +13,23 @@ import hats
 
 from combine_redshift_dedup.packages.product_handle import ProductHandle
 
-def prepare_catalog(entry, translation_config, temp_dir):
-    """
-    Load, rename and translate columns of a catalog. Save the intermediate Parquet result.
-
-    Args:
-        entry (dict): Catalog configuration entry from YAML.
-        translation_config (dict): Translation rules from flags_translation.yaml.
-        temp_dir (str): Directory to save the prepared Parquet.
-
-    Returns:
-        tuple: (Parquet path, RA column name, DEC column name, internal catalog name)
-    """
-    # Use ProductHandle to read input file
+def prepare_catalog(entry, translation_config, temp_dir, combine_type="resolve_duplicates"):
     ph = ProductHandle(entry["path"])
     df = ph.to_ddf()
-
     product_name = entry["internal_name"]
 
-    # Add source column
-    df["source"] = product_name
-
-    # Rename columns according to mapping
+    # Renomeia colunas
     col_map = {v: k for k, v in entry["columns"].items() if v and v in df.columns}
     df = df.rename(columns=col_map)
 
-    # Ensure standard columns exist
+    # Adiciona source
+    df["source"] = product_name
+
+    # Garante colunas padrão
     for col in ["id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey"]:
         if col not in df.columns:
             df[col] = np.nan
 
-    # Enforce types
     df["id"] = df["id"].astype(str)
     df["ra"] = df["ra"].astype(float)
     df["dec"] = df["dec"].astype(float)
@@ -49,72 +37,95 @@ def prepare_catalog(entry, translation_config, temp_dir):
     df["z_err"] = df["z_err"].astype(float)
     df["z_flag"] = df["z_flag"].astype(str)
 
-    # Initialize control columns
+    # Inicializa tie_result e homogenizados
     df["tie_result"] = 1
-    df["z_flag_homogenized_ozdes"] = np.nan
-    df["z_flag_homogenized_vvds"] = np.nan
+    df["z_flag_homogenized"] = np.nan
     df["type_homogenized"] = np.nan
 
-    # Apply translation row by row
-    def translate_row(row):
-        survey = row.get("survey", None)
+    # ===============================
+    # LÓGICA DE ELIMINAÇÃO DE DUPLICADOS POR ID
+    # ===============================
+    delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
+    dup_counts = df.groupby("id").size().compute()
+    ids_dup = dup_counts[dup_counts > 1].index.tolist()
+
+    if ids_dup:
+        print(f"⚠️ {product_name}: Found duplicate ids. Applying delta_z_threshold = {delta_z_threshold}")
+
+        df_dup_local = df[df["id"].isin(ids_dup)].compute()
+
+        delta_status = (
+            df_dup_local.groupby("id")["z"]
+            .apply(lambda z: "diff" if z.max() - z.min() > delta_z_threshold else "same")
+        )
+
+        ids_same = delta_status[delta_status == "same"].index.tolist()
+        ids_diff = delta_status[delta_status == "diff"].index.tolist()
+
+        def mark_tie_result(partition):
+            partition = partition.copy()
+            dup_ids_same = partition["id"].isin(ids_same)
+            dup_ids_diff = partition["id"].isin(ids_diff)
+
+            # Para grupos com z consistente: first = 1, resto = 0
+            partition["dup_rank"] = partition.groupby("id").cumcount()
+            same_mask = dup_ids_same & (partition["dup_rank"] > 0)
+            partition.loc[same_mask, "tie_result"] = 0
+            partition = partition.drop(columns="dup_rank")
+
+            # Para grupos com z inconsistente: todos = 2
+            partition.loc[dup_ids_diff, "tie_result"] = 2
+
+            return partition
+
+        df = df.map_partitions(mark_tie_result)
+
+        if ids_diff:
+            print(f"⚠️ {product_name}: Duplicate ids with differing z beyond threshold found: {ids_diff[:5]} ...")
+
+    # ===============================
+    # HOMOGENEIZAÇÃO
+    # ===============================
+    def apply_translation(row, key):
+        survey = row.get("survey")
         rules = translation_config.get("translation_rules", {}).get(survey, {})
-        zflag = row.get("z_flag", None)
+        rule = rules.get(f"{key}_translation", {})
 
-        z_ozdes = np.nan
-        z_vvds = np.nan
-        type_homog = np.nan
+        val = row.get(key)
 
-        def process_flag(rule, zflag_val, row):
-            if isinstance(rule, dict):
-                direct = {k: v for k, v in rule.items() if k != "conditions"}
-                if zflag_val in direct:
-                    return direct[zflag_val]
-                if "conditions" in rule:
-                    for cond in rule["conditions"]:
-                        try:
-                            if eval(cond["expr"], {}, {"row": row}):
-                                return cond["value"]
-                        except Exception:
-                            continue
-            return np.nan
+        if val in rule:
+            return rule[val]
 
-        if "z_flag_translation" in rules:
-            if "ozdes" in rules["z_flag_translation"]:
-                z_ozdes = process_flag(rules["z_flag_translation"]["ozdes"], zflag, row)
-            if "vvds" in rules["z_flag_translation"]:
-                z_vvds = process_flag(rules["z_flag_translation"]["vvds"], zflag, row)
+        if "conditions" in rule:
+            for cond in rule["conditions"]:
+                try:
+                    if eval(cond["expr"], {}, row.to_dict()):
+                        return cond["value"]
+                except Exception:
+                    continue
 
-        if "type_translation" in rules:
-            tval = row.get("type", None)
-            tmap = rules["type_translation"]
-            type_homog = tmap.get(tval, tmap.get("default", np.nan)) if isinstance(tmap, dict) else tmap
+        if "default" in rule:
+            return rule["default"]
 
-        return {
-            "z_flag_homogenized_ozdes": z_ozdes,
-            "z_flag_homogenized_vvds": z_vvds,
-            "type_homogenized": type_homog
-        }
+        return np.nan
 
-    translated = df.map_partitions(lambda p: p.apply(translate_row, axis=1, result_type="expand"),
-                                   meta={
-                                       "z_flag_homogenized_ozdes": "f8",
-                                       "z_flag_homogenized_vvds": "f8",
-                                       "type_homogenized": "object"
-                                   })
-
-    df = df.assign(
-        z_flag_homogenized_ozdes=translated["z_flag_homogenized_ozdes"],
-        z_flag_homogenized_vvds=translated["z_flag_homogenized_vvds"],
-        type_homogenized=translated["type_homogenized"]
+    df["z_flag_homogenized"] = df.map_partitions(
+        lambda p: p.apply(lambda row: apply_translation(row, "z_flag"), axis=1),
+        meta=("z_flag_homogenized", "f8")
     )
 
+    df["type_homogenized"] = df.map_partitions(
+        lambda p: p.apply(lambda row: apply_translation(row, "type"), axis=1),
+        meta=("type_homogenized", "object")
+    )
+
+    # ===============================
+    # FINALIZAÇÃO
+    # ===============================
     final_cols = [
         "id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey",
-        "source", "tie_result", "z_flag_homogenized_ozdes",
-        "z_flag_homogenized_vvds", "type_homogenized"
+        "source", "tie_result", "z_flag_homogenized", "type_homogenized"
     ]
-
     df = df[final_cols]
 
     out_path = os.path.join(temp_dir, f"prepared_{product_name}")

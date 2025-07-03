@@ -4,11 +4,7 @@
 # More general reference: http://www.yaml.org/spec/1.2/spec.html
 
 executor: 
-  name: "slurm"   # or "local"
-  #args:
-  #  n_workers: 2
-  #  threads_per_worker: 2
-  #  memory_limit: "1GiB"
+  name: "slurm"
   args:
     instance:
       cores: 50
@@ -20,7 +16,6 @@ executor:
         - "--time=2:00:00"
     adapt:
       maximum_jobs: 10
-      
 
 inputs:
   specz:
@@ -33,7 +28,6 @@ inputs:
         z: "z"
         z_flag: "quality"
         z_err: null
-        type: "type"  # Pode ser null no parquet se não existir, mas previsto aqui
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2dflens_final_release.parquet"
@@ -45,7 +39,6 @@ inputs:
         z: "z"
         z_flag: "qual"
         z_err: null
-        type: "type"
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2mrs_v240.parquet"
@@ -57,7 +50,6 @@ inputs:
         z: "redshift"
         z_flag: null
         z_err: "redshift_err"
-        type: "type"
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/jades_dr3.parquet"
@@ -69,26 +61,26 @@ inputs:
         z: "z_Spec"
         z_flag: "z_Spec_flag"
         z_err: null
-        type: "type"
         survey: "survey_name"
 
-tiebreaking_priority:
-  - "z_flag_homogenized_vvds"
-  - "type_homogenized"
-  # ou:
-  # - "z_flag_homogenized_ozdes"
-  # - "type_homogenized"
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/primus_dr1.parquet"
+      internal_name: "005_primus_dr1"
+      columns:
+        id: "OBJNAME"
+        ra: "RA"
+        dec: "DEC"
+        z: "Z"
+        z_flag: "ZQUALITY"
+        z_err: null
+        survey: "survey_name"
 
-base_dir: "/scratch/users/luigi.silva/pzserver_pipelines/combine_specz/notebooks/process001"
+base_dir: "/scratch/users/luigi.silva/pzserver_pipelines/combine_redshift_dedup/process001"
 output_dir: "outputs"
 logs_dir: "logs"
 temp_dir: "temp"
-output_format: "parquet"
-output_name: "csc"
-
-combine_type: "resolve_duplicates"  # ou "just_concatenate"
-#combine_type: "just_concatenate"
-
+output_format: "csv"
+output_name: "crd"
+combine_type: "resolve_duplicates"
 flags_translation_file: flags_translation.yaml
 
 param:
