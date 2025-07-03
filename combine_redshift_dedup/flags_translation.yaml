@@ -1,0 +1,94 @@
+translation_rules:
+  2DFGRS:
+    z_flag_translation:
+      ozdes:
+        "1": 1
+        "2": 2
+        "3": 3
+        "4": 4
+        "5": 4
+      vvds:
+        "1": 0
+        "2": 1
+        "3": 3
+        "4": 4
+        "5": 4
+    type_translation:
+      default: "s"
+
+  2DFLENS:
+    z_flag_translation:
+      ozdes:
+        "1": 1
+        "2": 2
+        "3": 3
+        "4": 4
+        "6": 6
+      vvds:
+        "1": 0
+        "2": 1
+        "3": 3
+        "4": 4
+        "6": 6
+    type_translation:
+      default: "s"
+
+  2MRS:
+    z_flag_translation:
+      ozdes:
+        conditions:
+          - expr: "row['z_err'] == 0"
+            value: 3
+          - expr: "0 < row['z_err'] < 0.0005"
+            value: 4
+          - expr: "row['z_err'] >= 0.0005"
+            value: 3
+      vvds:
+        conditions:
+          - expr: "row['z_err'] == 0"
+            value: 3
+          - expr: "0 < row['z_err'] < 0.0005"
+            value: 4
+          - expr: "row['z_err'] >= 0.0005"
+            value: 3
+    type_translation:
+      default: "s"
+
+  JADES:
+    z_flag_translation:
+      ozdes:
+        "A": 4
+        "B": 3
+        "C": 2
+        "D": 2
+        "E": 1
+      vvds:
+        "A": 4
+        "B": 3
+        "C": 2
+        "D": 1
+        "E": 0
+    type_translation:
+      default: "s"
+
+  example_survey:
+    z_flag_translation:
+      ozdes:
+        "X": 4
+        "Y": 3
+        "Z": 2
+        conditions:
+          - expr: "row['z_err'] < 0.001"
+            value: 4
+          - expr: "row['z_err'] >= 0.001"
+            value: 3
+      vvds:
+        conditions:
+          - expr: "row['z_err'] < 0.001"
+            value: 4
+          - expr: "row['z_err'] >= 0.001"
+            value: 3
+    type_translation:
+      SPEC: "s"
+      GRISM: "g"
+      PHOTO: "p"

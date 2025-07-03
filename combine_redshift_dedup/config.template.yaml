@@ -1,0 +1,95 @@
+##################################################################
+# Parameters file. Should follow the syntax defined in:
+# http://docs.ansible.com/ansible/latest/YAMLSyntax.html
+# More general reference: http://www.yaml.org/spec/1.2/spec.html
+
+executor: 
+  name: "slurm"   # or "local"
+  #args:
+  #  n_workers: 2
+  #  threads_per_worker: 2
+  #  memory_limit: "1GiB"
+  args:
+    instance:
+      cores: 50
+      processes: 1
+      memory: "120GB"
+      queue: "cpu"
+      job_extra_directives:
+        - "--propagate"
+        - "--time=2:00:00"
+    adapt:
+      maximum_jobs: 10
+      
+
+inputs:
+  specz:
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2dfgrs_final_release.parquet"
+      internal_name: "001_2dfgrs_final_release"
+      columns:
+        id: "name"
+        ra: "ra_j2000_deg"
+        dec: "dec_j2000_deg"
+        z: "z"
+        z_flag: "quality"
+        z_err: null
+        type: "type"  # Pode ser null no parquet se não existir, mas previsto aqui
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2dflens_final_release.parquet"
+      internal_name: "002_2dflens_final_release"
+      columns:
+        id: "unique_id"
+        ra: "RA"
+        dec: "Dec"
+        z: "z"
+        z_flag: "qual"
+        z_err: null
+        type: "type"
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2mrs_v240.parquet"
+      internal_name: "003_2mrs_v240"
+      columns:
+        id: "TMID"
+        ra: "RA"
+        dec: "DEC"
+        z: "redshift"
+        z_flag: null
+        z_err: "redshift_err"
+        type: "type"
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/jades_dr3.parquet"
+      internal_name: "004_jades_dr3"
+      columns:
+        id: "unique_id"
+        ra: "RA_TARG"
+        dec: "Dec_TARG"
+        z: "z_Spec"
+        z_flag: "z_Spec_flag"
+        z_err: null
+        type: "type"
+        survey: "survey_name"
+
+tiebreaking_priority:
+  - "z_flag_homogenized_vvds"
+  - "type_homogenized"
+  # ou:
+  # - "z_flag_homogenized_ozdes"
+  # - "type_homogenized"
+
+base_dir: "/scratch/users/luigi.silva/pzserver_pipelines/combine_specz/notebooks/process001"
+output_dir: "outputs"
+logs_dir: "logs"
+temp_dir: "temp"
+output_format: "parquet"
+output_name: "csc"
+
+combine_type: "resolve_duplicates"  # ou "just_concatenate"
+#combine_type: "just_concatenate"
+
+flags_translation_file: flags_translation.yaml
+
+param:
+  debug: true
