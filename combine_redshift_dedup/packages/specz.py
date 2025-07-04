@@ -2,6 +2,7 @@
 
 import os
 import glob
+import json
 import numpy as np
 import pandas as pd
 import dask.dataframe as dd
@@ -13,84 +14,144 @@ import hats
 
 from combine_redshift_dedup.packages.product_handle import ProductHandle
 
-def prepare_catalog(entry, translation_config, temp_dir, combine_type="resolve_duplicates"):
+def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combine_type="resolve_duplicates"):
+    """
+    Load, rename, and translate columns of a catalog. Apply tie-breaking for duplicate RA/DEC pairs.
+    Generate unique CRD_IDs. Save the processed Parquet catalog for later steps.
+
+    Args:
+        entry (dict): Catalog configuration entry.
+        translation_config (dict): Config with translation rules and delta_z_threshold.
+        temp_dir (str): Path to temp directory for output files.
+        compared_to_dict (defaultdict): Shared dict to store compared pairs (RA/DEC duplicates).
+        combine_type (str): Type of combine (default is "resolve_duplicates").
+
+    Returns:
+        tuple: (output_path, ra_col_name, dec_col_name, internal_catalog_name)
+    """
+    # Load input catalog
     ph = ProductHandle(entry["path"])
     df = ph.to_ddf()
     product_name = entry["internal_name"]
 
-    # Renomeia colunas
+    # Rename columns according to the config mapping
     col_map = {v: k for k, v in entry["columns"].items() if v and v in df.columns}
     df = df.rename(columns=col_map)
 
-    # Adiciona source
+    # Add a source column to identify the catalog of origin
     df["source"] = product_name
 
-    # Garante colunas padrão
+    # Ensure all standard columns exist (create NaN columns if missing)
     for col in ["id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey"]:
         if col not in df.columns:
             df[col] = np.nan
 
+    # Standardize column types
     df["id"] = df["id"].astype(str)
     df["ra"] = df["ra"].astype(float)
     df["dec"] = df["dec"].astype(float)
     df["z"] = df["z"].astype(float)
-    df["z_err"] = df["z_err"].astype(float)
     df["z_flag"] = df["z_flag"].astype(str)
+    df["z_err"] = df["z_err"].astype(float)
+    df["type"] = df["type"].astype(str)
+    df["survey"] = df["survey"].astype(str).str.strip().str.upper()
 
-    # Inicializa tie_result e homogenizados
+    # === Generate unique CRD_IDs ===
+    counter_path = os.path.join(temp_dir, "crd_id_counter.json")
+    if os.path.exists(counter_path):
+        with open(counter_path, "r") as f:
+            last_counter = json.load(f).get("last_id", 0)
+    else:
+        last_counter = 0
+
+    sizes = df.map_partitions(len).compute().tolist()
+    offsets = [last_counter]
+    for s in sizes[:-1]:
+        offsets.append(offsets[-1] + s)
+
+    def generate_crd_id(partition, start):
+        n = len(partition)
+        partition = partition.copy()
+        partition["CRD_ID"] = [f"CRD{start + i + 1}" for i in range(n)]
+        return partition
+
+    dfs = []
+    for i, offset in enumerate(offsets):
+        dfs.append(df.get_partition(i).map_partitions(generate_crd_id, offset, meta=df._meta.assign(CRD_ID=str)))
+
+    df = dd.concat(dfs)
+
+    new_last_counter = last_counter + sum(sizes)
+    with open(counter_path, "w") as f:
+        json.dump({"last_id": new_last_counter}, f)
+
     df["tie_result"] = 1
     df["z_flag_homogenized"] = np.nan
     df["type_homogenized"] = np.nan
 
-    # ===============================
-    # LÓGICA DE ELIMINAÇÃO DE DUPLICADOS POR ID
-    # ===============================
-    delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
-    dup_counts = df.groupby("id").size().compute()
-    ids_dup = dup_counts[dup_counts > 1].index.tolist()
+    # === Deduplication logic (only if combine_type == resolve_duplicates) ===
+    if combine_type == "resolve_duplicates":
+        delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
 
-    if ids_dup:
-        print(f"⚠️ {product_name}: Found duplicate ids. Applying delta_z_threshold = {delta_z_threshold}")
+        valid_coord_mask = df["ra"].notnull() & df["dec"].notnull()
+        df_valid_coord = df[valid_coord_mask]
+        df_valid_coord["ra_dec_key"] = df_valid_coord["ra"].round(6).astype(str) + "_" + df_valid_coord["dec"].round(6).astype(str)
 
-        df_dup_local = df[df["id"].isin(ids_dup)].compute()
+        dup_counts = df_valid_coord.groupby("ra_dec_key").size().compute()
+        keys_dup = dup_counts[dup_counts > 1].index.tolist()
 
-        delta_status = (
-            df_dup_local.groupby("id")["z"]
-            .apply(lambda z: "diff" if z.max() - z.min() > delta_z_threshold else "same")
-        )
+        if keys_dup:
+            df_dup_local = df_valid_coord[df_valid_coord["ra_dec_key"].isin(keys_dup)].compute()
 
-        ids_same = delta_status[delta_status == "same"].index.tolist()
-        ids_diff = delta_status[delta_status == "diff"].index.tolist()
+            for key in keys_dup:
+                group = df_dup_local[df_dup_local["ra_dec_key"] == key]
+                ids = group["CRD_ID"].tolist()
+                for i, id1 in enumerate(ids):
+                    for id2 in ids[i + 1:]:
+                        compared_to_dict.setdefault(id1, []).append(id2)
+                        compared_to_dict.setdefault(id2, []).append(id1)
 
-        def mark_tie_result(partition):
-            partition = partition.copy()
-            dup_ids_same = partition["id"].isin(ids_same)
-            dup_ids_diff = partition["id"].isin(ids_diff)
+            delta_status = (
+                df_dup_local.groupby("ra_dec_key")["z"]
+                .apply(lambda z: "diff" if abs(z.max() - z.min()) > delta_z_threshold else "same")
+            )
 
-            # Para grupos com z consistente: first = 1, resto = 0
-            partition["dup_rank"] = partition.groupby("id").cumcount()
-            same_mask = dup_ids_same & (partition["dup_rank"] > 0)
-            partition.loc[same_mask, "tie_result"] = 0
-            partition = partition.drop(columns="dup_rank")
+            keys_same = delta_status[delta_status == "same"].index.tolist()
+            keys_diff = delta_status[delta_status == "diff"].index.tolist()
 
-            # Para grupos com z inconsistente: todos = 2
-            partition.loc[dup_ids_diff, "tie_result"] = 2
+            def mark_tie_result(partition):
+                partition = partition.copy()
+                partition["ra_dec_key"] = partition["ra"].round(6).astype(str) + "_" + partition["dec"].round(6).astype(str)
 
-            return partition
+                dup_same = partition["ra_dec_key"].isin(keys_same)
+                dup_diff = partition["ra_dec_key"].isin(keys_diff)
 
-        df = df.map_partitions(mark_tie_result)
+                partition["dup_rank"] = partition.groupby("ra_dec_key").cumcount()
 
-        if ids_diff:
-            print(f"⚠️ {product_name}: Duplicate ids with differing z beyond threshold found: {ids_diff[:5]} ...")
+                same_mask = dup_same & (partition["dup_rank"] > 0)
 
-    # ===============================
-    # HOMOGENEIZAÇÃO
-    # ===============================
+                partition.loc[dup_diff, "tie_result"] = 2
+                partition.loc[same_mask, "tie_result"] = 0
+
+                partition = partition.drop(columns=["dup_rank", "ra_dec_key"])
+
+                return partition
+
+            df = df.map_partitions(mark_tie_result)
+
+            compared_to_path = os.path.join(temp_dir, "compared_to.json")
+            with open(compared_to_path, "w") as f:
+                json.dump(compared_to_dict, f)
+
+    translation_rules_uc = {
+        survey_name.upper(): rules
+        for survey_name, rules in translation_config.get("translation_rules", {}).items()
+    }
+
     def apply_translation(row, key):
         survey = row.get("survey")
-        rules = translation_config.get("translation_rules", {}).get(survey, {})
+        rules = translation_rules_uc.get(survey, {})
         rule = rules.get(f"{key}_translation", {})
-
         val = row.get(key)
 
         if val in rule:
@@ -113,17 +174,13 @@ def prepare_catalog(entry, translation_config, temp_dir, combine_type="resolve_d
         lambda p: p.apply(lambda row: apply_translation(row, "z_flag"), axis=1),
         meta=("z_flag_homogenized", "f8")
     )
-
     df["type_homogenized"] = df.map_partitions(
         lambda p: p.apply(lambda row: apply_translation(row, "type"), axis=1),
         meta=("type_homogenized", "object")
     )
 
-    # ===============================
-    # FINALIZAÇÃO
-    # ===============================
     final_cols = [
-        "id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey",
+        "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey",
         "source", "tie_result", "z_flag_homogenized", "type_homogenized"
     ]
     df = df[final_cols]

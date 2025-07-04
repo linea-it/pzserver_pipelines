@@ -5,54 +5,59 @@ import pandas as pd
 import dask.dataframe as dd
 import lsdb
 
-def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, step, client, compared_to_dict, type_priority):
+def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, step, client, compared_to_dict, type_priority, translation_config):
     output_xmatch_dir = os.path.join(temp_dir, f"xmatch_step{step}")
 
-    # Perform crossmatch
+    # Perform a spatial crossmatch between the two catalogs within 1 arcsec radius
     xmatched = left_cat.crossmatch(
         right_cat,
         radius_arcsec=1.0,
         n_neighbors=1,
         suffixes=("left", "right")
     )
+    # Save the crossmatched catalog in HATS format
     xmatched.to_hats(output_xmatch_dir, overwrite=True)
+
+    # Read the crossmatched catalog as Dask DataFrame
     df = lsdb.read_hats(output_xmatch_dir)._ddf
 
-    # Filter out no-match rows
+    # Filter out pairs where either side was already rejected (tie_result == 0)
     df = df[(df["tie_resultleft"] != 0) & (df["tie_resultright"] != 0)]
 
-    delta_z_threshold = 0.0  # Pode passar como argumento ou pegar do config
-    if hasattr(right_cat, 'delta_z_threshold'):
-        delta_z_threshold = right_cat.delta_z_threshold
+    # Get delta_z threshold from configuration
+    delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
 
+    # Load or initialize cumulative list of hard ties
+    hard_tie_path = os.path.join(temp_dir, "hard_tie_ids.json")
+    if os.path.exists(hard_tie_path):
+        with open(hard_tie_path, "r") as f:
+            hard_tie_cumulative = set(json.load(f))
+    else:
+        hard_tie_cumulative = set()
+
+    # Function to apply primary tie-breaking rules
     def decide_tie(row):
         left_was_tie = row.get("tie_resultleft", 1) == 2
         right_was_tie = row.get("tie_resultright", 1) == 2
-    
+
         zflag_left = row.get("z_flag_homogenizedleft")
         zflag_right = row.get("z_flag_homogenizedright")
-    
-        # Se ambos são 6, zera os dois
+
         if pd.notna(zflag_left) and zflag_left == 6 and pd.notna(zflag_right) and zflag_right == 6:
             return (0, 0)
-    
-        # Se left é 6
         elif pd.notna(zflag_left) and zflag_left == 6:
             return (0, 2 if right_was_tie else 1)
-    
-        # Se right é 6
         elif pd.notna(zflag_right) and zflag_right == 6:
             return (2 if left_was_tie else 1, 0)
-    
-        # Standard tiebreaking
+
         for col in tiebreaking_priority:
             v1 = row.get(f"{col}left")
             v2 = row.get(f"{col}right")
-    
+
             if col == "type_homogenized":
                 v1 = type_priority.get(v1, 0)
                 v2 = type_priority.get(v2, 0)
-    
+
             if pd.notnull(v1) and pd.notnull(v2):
                 if v1 > v2:
                     return (2 if left_was_tie else 1, 0)
@@ -64,8 +69,7 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
                 return (2 if left_was_tie else 1, 0)
             elif pd.notnull(v2):
                 return (0, 2 if right_was_tie else 1)
-    
-        # Se não decidiu, marca ambos como 2 para avaliar delta_z depois
+
         return (2, 2)
 
     tie_results = df.map_partitions(
@@ -74,37 +78,56 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
     )
     df = df.assign(tie_left=tie_results[0], tie_right=tie_results[1])
 
-    # Avalia delta_z onde tie = (2,2)
-    def apply_delta_z_fix(p):
-        p = p.copy()
-        mask = (p["tie_left"] == 2) & (p["tie_right"] == 2)
-        for idx, row in p[mask].iterrows():
-            z1 = row["zleft"]
-            z2 = row["zright"]
-            if pd.notnull(z1) and pd.notnull(z2):
-                if abs(z1 - z2) <= delta_z_threshold:
-                    # Mantém left, elimina right
-                    p.at[idx, "tie_left"] = 1
-                    p.at[idx, "tie_right"] = 0
-        return p
+    # Compute pairs and update compared_to_dict before delta_z_fix
+    pairs = df[["CRD_IDleft", "CRD_IDright", "tie_left", "tie_right", "zleft", "zright"]].compute()
 
-    df = df.map_partitions(apply_delta_z_fix)
-
-    pairs = df[["idleft", "idright", "tie_left", "tie_right"]].compute()
-
-    # Update compared_to_dict
     for _, row in pairs.iterrows():
-        compared_to_dict.setdefault(str(row["idleft"]), []).append(str(row["idright"]))
-        compared_to_dict.setdefault(str(row["idright"]), []).append(str(row["idleft"]))
+        compared_to_dict.setdefault(str(row["CRD_IDleft"]), []).append(str(row["CRD_IDright"]))
+        compared_to_dict.setdefault(str(row["CRD_IDright"]), []).append(str(row["CRD_IDleft"]))
 
     compared_to_path = os.path.join(temp_dir, "compared_to.json")
     with open(compared_to_path, "w") as f:
         json.dump(compared_to_dict, f)
 
-    # Prepare final tie_result map
+    # Apply delta_z fix using computed pairs
+    if delta_z_threshold > 0:
+        def apply_delta_z_fix(pairs_df):
+            pairs_df = pairs_df.copy()
+            mask = (pairs_df["tie_left"] == 2) & (pairs_df["tie_right"] == 2)
+            for idx, row in pairs_df[mask].iterrows():
+                z1 = row["zleft"]
+                z2 = row["zright"]
+                if pd.notnull(z1) and pd.notnull(z2):
+                    if abs(z1 - z2) <= delta_z_threshold:
+                        left_crd_id = str(row["CRD_IDleft"])
+                        right_crd_id = str(row["CRD_IDright"])
+                        left_in_hard = left_crd_id in hard_tie_cumulative
+                        right_in_hard = right_crd_id in hard_tie_cumulative
+
+                        if left_in_hard and not right_in_hard:
+                            pairs_df.at[idx, "tie_right"] = 0
+                        elif right_in_hard and not left_in_hard:
+                            pairs_df.at[idx, "tie_left"] = 0
+                        else:
+                            n_left = len(compared_to_dict.get(left_crd_id, []))
+                            n_right = len(compared_to_dict.get(right_crd_id, []))
+                            if n_left > n_right:
+                                pairs_df.at[idx, "tie_right"] = 0
+                                pairs_df.at[idx, "tie_left"] = 1
+                            elif n_right > n_left:
+                                pairs_df.at[idx, "tie_left"] = 0
+                                pairs_df.at[idx, "tie_right"] = 1
+                            else:
+                                pairs_df.at[idx, "tie_right"] = 0
+                                pairs_df.at[idx, "tie_left"] = 1
+            return pairs_df
+
+        pairs = apply_delta_z_fix(pairs)
+
+    # Consolidate tie results
     expanded = pd.concat([
-        pairs[["idleft", "tie_left"]].rename(columns={"idleft": "id", "tie_left": "tie_result"}),
-        pairs[["idright", "tie_right"]].rename(columns={"idright": "id", "tie_right": "tie_result"})
+        pairs[["CRD_IDleft", "tie_left"]].rename(columns={"CRD_IDleft": "CRD_ID", "tie_left": "tie_result"}),
+        pairs[["CRD_IDright", "tie_right"]].rename(columns={"CRD_IDright": "CRD_ID", "tie_right": "tie_result"})
     ])
 
     def consolidate_results(series):
@@ -114,11 +137,17 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
             return 2
         return 1
 
-    final_results = expanded.groupby("id")["tie_result"].apply(consolidate_results)
+    expanded["CRD_ID"] = expanded["CRD_ID"].astype(str)
+    final_results = expanded.groupby("CRD_ID")["tie_result"].apply(consolidate_results)
+
+    hard_tie_ids = final_results[final_results == 2].index.tolist()
+    hard_tie_cumulative.update(hard_tie_ids)
+    with open(hard_tie_path, "w") as f:
+        json.dump(list(hard_tie_cumulative), f)
 
     def apply_final(df_part):
-        df_part["tie_result"] = df_part["id"].map(final_results).fillna(df_part["tie_result"])
-        df_part["compared_to"] = df_part["id"].map(lambda x: ",".join(compared_to_dict.get(str(x), [])))
+        df_part["tie_result"] = df_part["CRD_ID"].map(final_results).fillna(df_part["tie_result"])
+        df_part["compared_to"] = df_part["CRD_ID"].map(lambda x: ",".join(compared_to_dict.get(str(x), [])))
         return df_part
 
     left_df = left_cat._ddf.map_partitions(apply_final)

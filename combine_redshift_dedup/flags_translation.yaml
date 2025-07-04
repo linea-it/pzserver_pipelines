@@ -66,6 +66,6 @@ translation_rules:
         - expr: "z_err >= 0.001"
           value: 3
     type_translation:
-      SPEC: "s"
-      GRISM: "g"
-      PHOTO: "p"
+      "SPEC": "s"
+      "GRISM": "g"
+      "PHOTO": "p"
