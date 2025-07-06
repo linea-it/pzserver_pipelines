@@ -4,6 +4,11 @@ tiebreaking_priority:
 
 delta_z_threshold: 0.0005
 
+type_priority:
+  s: 3
+  g: 2
+  p: 1
+
 translation_rules:
   2DFGRS:
     z_flag_translation:

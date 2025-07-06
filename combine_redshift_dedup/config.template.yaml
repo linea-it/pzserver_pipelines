@@ -80,7 +80,7 @@ logs_dir: "logs"
 temp_dir: "temp"
 output_format: "csv"
 output_name: "crd"
-combine_type: "resolve_duplicates"
+combine_type: "concatenate_and_mark_duplicates" # Can be also "concatenate" or "concatenate_and_remove_duplicates"
 flags_translation_file: flags_translation.yaml
 
 param:

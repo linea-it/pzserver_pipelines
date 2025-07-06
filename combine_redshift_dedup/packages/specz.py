@@ -14,7 +14,7 @@ import hats
 
 from combine_redshift_dedup.packages.product_handle import ProductHandle
 
-def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combine_type="resolve_duplicates"):
+def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combine_type="concatenate_and_mark_duplicates"):
     """
     Load, rename, and translate columns of a catalog. Apply tie-breaking for duplicate RA/DEC pairs.
     Generate unique CRD_IDs. Save the processed Parquet catalog for later steps.
@@ -24,7 +24,7 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         translation_config (dict): Config with translation rules and delta_z_threshold.
         temp_dir (str): Path to temp directory for output files.
         compared_to_dict (defaultdict): Shared dict to store compared pairs (RA/DEC duplicates).
-        combine_type (str): Type of combine (default is "resolve_duplicates").
+        combine_type (str): Type of combine (default is "concatenate_and_mark_duplicates").
 
     Returns:
         tuple: (output_path, ra_col_name, dec_col_name, internal_catalog_name)
@@ -89,8 +89,8 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     df["z_flag_homogenized"] = np.nan
     df["type_homogenized"] = np.nan
 
-    # === Deduplication logic (only if combine_type == resolve_duplicates) ===
-    if combine_type == "resolve_duplicates":
+    # === Deduplication logic (only if combine_type requests duplicate marking) ===
+    if combine_type in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
         delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
 
         valid_coord_mask = df["ra"].notnull() & df["dec"].notnull()
@@ -111,31 +111,40 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
                         compared_to_dict.setdefault(id1, []).append(id2)
                         compared_to_dict.setdefault(id2, []).append(id1)
 
-            delta_status = (
-                df_dup_local.groupby("ra_dec_key")["z"]
-                .apply(lambda z: "diff" if abs(z.max() - z.min()) > delta_z_threshold else "same")
-            )
+            if delta_z_threshold > 0:
+                delta_status = (
+                    df_dup_local.groupby("ra_dec_key")["z"]
+                    .apply(lambda z: "diff" if abs(z.max() - z.min()) > delta_z_threshold else "same")
+                )
 
-            keys_same = delta_status[delta_status == "same"].index.tolist()
-            keys_diff = delta_status[delta_status == "diff"].index.tolist()
+                keys_same = delta_status[delta_status == "same"].index.tolist()
+                keys_diff = delta_status[delta_status == "diff"].index.tolist()
 
-            def mark_tie_result(partition):
-                partition = partition.copy()
-                partition["ra_dec_key"] = partition["ra"].round(6).astype(str) + "_" + partition["dec"].round(6).astype(str)
+                def mark_tie_result(partition):
+                    partition = partition.copy()
+                    partition["ra_dec_key"] = partition["ra"].round(6).astype(str) + "_" + partition["dec"].round(6).astype(str)
 
-                dup_same = partition["ra_dec_key"].isin(keys_same)
-                dup_diff = partition["ra_dec_key"].isin(keys_diff)
+                    dup_same = partition["ra_dec_key"].isin(keys_same)
+                    dup_diff = partition["ra_dec_key"].isin(keys_diff)
 
-                partition["dup_rank"] = partition.groupby("ra_dec_key").cumcount()
+                    partition["dup_rank"] = partition.groupby("ra_dec_key").cumcount()
 
-                same_mask = dup_same & (partition["dup_rank"] > 0)
+                    same_mask = dup_same & (partition["dup_rank"] > 0)
 
-                partition.loc[dup_diff, "tie_result"] = 2
-                partition.loc[same_mask, "tie_result"] = 0
+                    partition.loc[dup_diff, "tie_result"] = 2
+                    partition.loc[same_mask, "tie_result"] = 0
 
-                partition = partition.drop(columns=["dup_rank", "ra_dec_key"])
+                    partition = partition.drop(columns=["dup_rank", "ra_dec_key"])
 
-                return partition
+                    return partition
+            else:
+                def mark_tie_result(partition):
+                    partition = partition.copy()
+                    partition["ra_dec_key"] = partition["ra"].round(6).astype(str) + "_" + partition["dec"].round(6).astype(str)
+                    dup_mask = partition["ra_dec_key"].isin(keys_dup)
+                    partition.loc[dup_mask, "tie_result"] = 2
+                    partition = partition.drop(columns=["ra_dec_key"])
+                    return partition
 
             df = df.map_partitions(mark_tie_result)
 
@@ -179,9 +188,41 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         meta=("type_homogenized", "object")
     )
 
+    # === Final check for homogenized columns ===
+    if combine_type in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
+        zflag_nan = df["z_flag_homogenized"].isna().all().compute()
+        type_nan = df["type_homogenized"].isna().all().compute()
+        if zflag_nan and type_nan:
+            raise ValueError(
+                f"❌ Cannot mark/remove duplicates: catalog '{product_name}' has both z_flag_homogenized and type_homogenized fully NaN."
+            )
+
+    # === Add is_in_ComCam_ECDFS_field column ===
+    ra_cen = 53.13
+    dec_cen = -28.10
+    radius = 0.72
+
+    def compute_in_cone(partition):
+        partition = partition.copy()
+        ra_rad = np.deg2rad(partition["ra"])
+        dec_rad = np.deg2rad(partition["dec"])
+        ra_cen_rad = np.deg2rad(ra_cen)
+        dec_cen_rad = np.deg2rad(dec_cen)
+
+        cos_angle = (
+            np.sin(dec_cen_rad) * np.sin(dec_rad) +
+            np.cos(dec_cen_rad) * np.cos(dec_rad) * np.cos(ra_rad - ra_cen_rad)
+        )
+        angle_deg = np.rad2deg(np.arccos(np.clip(cos_angle, -1, 1)))
+        partition["is_in_ComCam_ECDFS_field"] = (angle_deg <= radius).astype(int)
+        return partition
+
+    df = df.map_partitions(compute_in_cone, meta=df._meta.assign(is_in_ComCam_ECDFS_field=np.int64()))
+
     final_cols = [
         "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey",
-        "source", "tie_result", "z_flag_homogenized", "type_homogenized"
+        "source", "tie_result", "z_flag_homogenized", "type_homogenized",
+        "is_in_ComCam_ECDFS_field"
     ]
     df = df[final_cols]
 

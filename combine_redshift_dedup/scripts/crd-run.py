@@ -36,7 +36,8 @@ def main(config_path, cwd="."):
     Workflow:
         - Load configuration files.
         - Prepare individual catalogs (standardization, translation, etc.).
-        - Combine catalogs using either simple concatenation or duplicate resolution.
+        - Combine catalogs using one of the supported modes:
+          concatenate, concatenate_and_mark_duplicates, concatenate_and_remove_duplicates.
         - Clean and save the final combined catalog.
     """
     logger = setup_logger("combine_redshift_dedup", logdir=cwd)
@@ -65,8 +66,8 @@ def main(config_path, cwd="."):
 
     catalogs = config["inputs"]["specz"]
     tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
-    type_priority = {"s": 3, "g": 2, "p": 1}
-    combine_type = config.get("combine_type", "resolve_duplicates").lower()
+    type_priority = translation_config.get("type_priority", {})
+    combine_type = config.get("combine_type", "concatenate_and_mark_duplicates").lower()
     output_format = config.get('output_format', 'parquet').lower()
 
     if not tiebreaking_priority:
@@ -96,7 +97,6 @@ def main(config_path, cwd="."):
         tag = f"prepare_{entry['internal_name']}"
         if tag not in completed:
             path_info = prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combine_type)
-
             log_step(log_file, tag)
         else:
             path_info = (
@@ -109,14 +109,14 @@ def main(config_path, cwd="."):
 
     final_base_path = os.path.join(output_dir, config['output_name'])
 
-    if combine_type == "just_concatenate":
-        logger.info("🔗 Combining catalogs by simple concatenation (just_concatenate mode)")
+    if combine_type == "concatenate":
+        logger.info("🔗 Combining catalogs by simple concatenation (concatenate mode)")
         dfs = [dd.read_parquet(p[0]) for p in prepared_paths]
         df_final = dd.concat(dfs)
         df_final = df_final.compute()
 
-    elif combine_type == "resolve_duplicates":
-        logger.info("🔍 Combining catalogs with duplicate resolution (resolve_duplicates mode)")
+    elif combine_type in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
+        logger.info(f"🔍 Combining catalogs with duplicate marking ({combine_type} mode)")
 
         # Import and crossmatch catalogs progressively
         import_tag = f"import_{prepared_paths[0][3]}"
@@ -171,11 +171,21 @@ def main(config_path, cwd="."):
         df_final = dd.read_parquet(os.path.join(temp_dir, f"merged_step{len(prepared_paths)-1}")).compute()
         df_final["compared_to"] = df_final["CRD_ID"].map(lambda x: ",".join(compared_to_dict.get(str(x), [])))
 
+        if combine_type == "concatenate_and_remove_duplicates":
+            before = len(df_final)
+            df_final = df_final[df_final["tie_result"] == 1]
+            after = len(df_final)
+            logger.info(f"🧹 Removed duplicates: kept {after} of {before} rows (tie_result == 1)")
+
     else:
         logger.error(f"❌ Unknown combine_type: {combine_type}")
         client.close()
         cluster.close()
         return
+
+    if combine_type == "concatenate" and "tie_result" in df_final.columns:
+        logger.info("ℹ️ Dropping column 'tie_result' (not needed for combine_type == concatenate)")
+        df_final = df_final.drop(columns=["tie_result"])
 
     # === Drop columns that are fully NaN or empty before saving ===
     for col in df_final.columns:
@@ -187,7 +197,6 @@ def main(config_path, cwd="."):
         if all_missing:
             logger.info(f"ℹ️ Dropping column '{col}' (all values missing or empty)")
             df_final = df_final.drop(columns=[col])
-
 
     # Save the cleaned final catalog
     save_dataframe(df_final, final_base_path, output_format)
