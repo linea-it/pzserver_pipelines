@@ -1,6 +1,7 @@
 #!/bin/bash --login
 
-source `dirname $CONDA_EXE`/activate || { echo "Failed to activate Conda environment"; exit 1; }
+source $(conda info --base)/etc/profile.d/conda.sh || { echo "Failed to source conda.sh"; exit 1; }
+conda activate pipe_crd || { echo "Failed to activate pipe_crd"; exit 1; }
 
 if [ ! -d "$PIPELINES_DIR" ]; then
     echo "Error: PIPELINES_DIR not defined."

@@ -1,13 +1,12 @@
 #!/bin/bash
 
-# Check if the argument was given
-if [ $# -eq 0 ]; then
-    echo "Error: No arguments provided."
+if [ $# -lt 1 ]; then
+    echo "Usage: ./run.sh <config.yaml> [base_dir_override]"
     exit 1
 fi
 
-ARGS=$@
-shift $#
+CONFIG_PATH="$1"
+BASE_DIR_OVERRIDE="$2"
 
 if [ ! -d "$PIPELINES_DIR" ]; then
     echo "Error: PIPELINES_DIR not defined."
@@ -26,14 +25,14 @@ if [ ! -f "$INSTALL_PIPE" ]; then
     exit 1
 fi
 
-# Start logging everything
 {
     echo "Installing pipeline..."
     . "$INSTALL_PIPE"
 
     set -xe
 
-    PYTHONPATH="$PIPELINES_DIR:$PYTHONPATH" python "$PIPE_BASE/scripts/crd-run.py" $ARGS
+    PYTHONPATH="$PIPELINES_DIR:$PYTHONPATH" \
+    python "$PIPE_BASE/scripts/crd-run.py" "$CONFIG_PATH" --base_dir "$BASE_DIR_OVERRIDE"
 
     echo "Done."
 

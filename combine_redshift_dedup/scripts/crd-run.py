@@ -26,7 +26,7 @@ from combine_redshift_dedup.packages.product_handle import save_dataframe
 
 import lsdb
 
-def main(config_path, cwd="."):
+def main(config_path, cwd=".", base_dir_override=None):
     """
     Main pipeline function to process and combine redshift catalogs.
 
@@ -46,7 +46,7 @@ def main(config_path, cwd="."):
 
     # Load main config first to get directories
     config = load_yml(config_path)
-    base_dir = config["base_dir"]
+    base_dir = base_dir_override if base_dir_override else config["base_dir"]
     output_dir = os.path.join(base_dir, config["output_dir"])
     logs_dir = os.path.join(base_dir, config["logs_dir"])
     temp_dir = os.path.join(base_dir, config["temp_dir"])
@@ -268,13 +268,13 @@ def main(config_path, cwd="."):
     cluster.close()
 
 if __name__ == "__main__":
-    # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Combine redshift catalogs with deduplication or concatenation.")
     parser.add_argument("config_path", help="Path to YAML config file")
     parser.add_argument("--cwd", default=os.getcwd(), help="Working directory (default: current dir)")
+    parser.add_argument("--base_dir", default=None, help="Override base_dir from config file")
     args = parser.parse_args()
 
     start_time = time.time()
-    main(args.config_path, args.cwd)
+    main(args.config_path, args.cwd, args.base_dir)
     duration = time.time() - start_time
     print(f"✅ Pipeline completed in {duration:.2f} seconds.")
