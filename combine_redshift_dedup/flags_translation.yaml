@@ -4,6 +4,8 @@ tiebreaking_priority:
 
 delta_z_threshold: 0.0005
 
+crossmatch_radius_arcsec: 1.0
+
 type_priority:
   s: 3
   g: 2

@@ -2,6 +2,7 @@ import argparse
 import os
 import time
 import json
+import shutil
 import pandas as pd
 import numpy as np
 import dask.dataframe as dd
@@ -40,29 +41,34 @@ def main(config_path, cwd="."):
           concatenate, concatenate_and_mark_duplicates, concatenate_and_remove_duplicates.
         - Clean and save the final combined catalog.
     """
-    logger = setup_logger("combine_redshift_dedup", logdir=cwd)
+
+    delete_temp_files = True  # Flag to clean temporary files along the pipeline
+
+    # Load main config first to get directories
+    config = load_yml(config_path)
+    base_dir = config["base_dir"]
+    output_dir = os.path.join(base_dir, config["output_dir"])
+    logs_dir = os.path.join(base_dir, config["logs_dir"])
+    temp_dir = os.path.join(base_dir, config["temp_dir"])
+
+    # Ensure output directories exist
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    # Now setup logger pointing to logs_dir
+    logger = setup_logger("combine_redshift_dedup", logdir=logs_dir)
     logger.info(f"Loading config from {config_path}")
 
-    # Load main config and translation config
-    config = load_yml(config_path)
+    # Load translation config
     path_to_translation_file = config.get("flags_translation_file")
     if path_to_translation_file is None:
         logger.error("Missing 'flags_translation_file' in config!")
         return
     translation_config = load_yml(path_to_translation_file)
 
-    # Prepare directory paths
-    base_dir = config["base_dir"]
-    output_dir = os.path.join(base_dir, config["output_dir"])
-    logs_dir = os.path.join(base_dir, config["logs_dir"])
-    temp_dir = os.path.join(base_dir, config["temp_dir"])
-    log_file = os.path.join(logs_dir, "process_resume.log")
+    log_file = os.path.join(temp_dir, "process_resume.log")
     compared_to_path = os.path.join(temp_dir, "compared_to.json")
-
-    # Ensure output directories exist
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(logs_dir, exist_ok=True)
-    os.makedirs(temp_dir, exist_ok=True)
 
     catalogs = config["inputs"]["specz"]
     tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
@@ -70,14 +76,10 @@ def main(config_path, cwd="."):
     combine_type = config.get("combine_type", "concatenate_and_mark_duplicates").lower()
     output_format = config.get('output_format', 'parquet').lower()
 
-    if not tiebreaking_priority:
-        logger.error("❌ No tiebreaking_priority defined in flags_translation.yaml!")
-        return
-
     completed = read_completed_steps(log_file)
 
     # Initialize Dask cluster and client
-    cluster = get_executor(config["executor"])
+    cluster = get_executor(config["executor"], logs_dir=logs_dir)
     client = Client(cluster)
 
     # Load or initialize compared_to dict
@@ -117,6 +119,17 @@ def main(config_path, cwd="."):
 
     elif combine_type in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
         logger.info(f"🔍 Combining catalogs with duplicate marking ({combine_type} mode)")
+
+        # Validate deduplication criteria
+        delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
+        if not tiebreaking_priority:
+            if delta_z_threshold is None or delta_z_threshold == 0.0:
+                logger.error("❌ Cannot deduplicate: tiebreaking_priority is empty and delta_z_threshold is not set or is zero. Please define at least one deduplication criterion.")
+                client.close()
+                cluster.close()
+                return
+            else:
+                logger.warning("⚠️ tiebreaking_priority is empty. Proceeding with delta_z_threshold tie-breaking only.")
 
         # Import and crossmatch catalogs progressively
         import_tag = f"import_{prepared_paths[0][3]}"
@@ -158,6 +171,17 @@ def main(config_path, cwd="."):
                     compared_to_dict, type_priority, translation_config
                 )
                 log_step(log_file, xmatch_tag)
+
+                # Delete intermediates
+                if delete_temp_files:
+                    for path in [
+                        os.path.join(temp_dir, f"cat{i}_hats"),
+                        os.path.join(temp_dir, f"cat{i}_margin"),
+                        os.path.join(temp_dir, f"xmatch_step{i}")
+                    ]:
+                        if os.path.exists(path):
+                            shutil.rmtree(path)
+                            logger.info(f"🗑️ Deleted temporary directory {path}")
             else:
                 cat_prev = lsdb.read_hats(os.path.join(temp_dir, f"merged_step{i}_hats"))
 
@@ -201,6 +225,14 @@ def main(config_path, cwd="."):
     # Save the cleaned final catalog
     save_dataframe(df_final, final_base_path, output_format)
     logger.info(f"✅ Final combined catalog saved at {final_base_path}.{output_format}")
+
+    # Final cleanup
+    if delete_temp_files:
+        try:
+            shutil.rmtree(temp_dir)
+            logger.info(f"🧹 Deleted entire temp_dir {temp_dir} after successful pipeline completion")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not delete temp_dir {temp_dir}: {e}")
 
     client.close()
     cluster.close()

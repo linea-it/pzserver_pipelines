@@ -3,6 +3,7 @@
 import os
 import glob
 import json
+import warnings
 import numpy as np
 import pandas as pd
 import dask.dataframe as dd
@@ -37,7 +38,7 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     Returns:
         tuple: (output_path, ra_col_name, dec_col_name, internal_catalog_name)
     """
-    # === Load and rename ===
+    # === Load catalog and rename columns according to configuration ===
     ph = ProductHandle(entry["path"])
     df = ph.to_ddf()
     product_name = entry["internal_name"]
@@ -46,10 +47,12 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     df = df.rename(columns=col_map)
     df["source"] = product_name
 
+    # Ensure required columns exist, fill with NaN if missing
     for col in ["id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey"]:
         if col not in df.columns:
             df[col] = np.nan
 
+    # Standardize column types
     df["id"] = df["id"].astype(str)
     df["ra"] = df["ra"].astype(float)
     df["dec"] = df["dec"].astype(float)
@@ -59,7 +62,7 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     df["type"] = df["type"].astype(str)
     df["survey"] = df["survey"].astype(str).str.strip().str.upper()
 
-    # === Generate CRD_IDs ===
+    # === Generate unique CRD_IDs ===
     counter_path = os.path.join(temp_dir, "crd_id_counter.json")
     if os.path.exists(counter_path):
         with open(counter_path, "r") as f:
@@ -67,11 +70,13 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     else:
         last_counter = 0
 
+    # Determine partition sizes and offsets for ID generation
     sizes = df.map_partitions(len).compute().tolist()
     offsets = [last_counter]
     for s in sizes[:-1]:
         offsets.append(offsets[-1] + s)
 
+    # Assign CRD_ID to each row
     def generate_crd_id(partition, start):
         n = len(partition)
         partition = partition.copy()
@@ -90,9 +95,10 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     with open(counter_path, "w") as f:
         json.dump({"last_id": last_counter + sum(sizes)}, f)
 
+    # Initialize tie_result to 1 (default: kept)
     df["tie_result"] = 1
 
-    # === Translation rules ===
+    # === Apply translation rules for z_flag and type ===
     translation_rules_uc = {
         survey_name.upper(): rules
         for survey_name, rules in translation_config.get("translation_rules", {}).items()
@@ -117,6 +123,7 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
             return rule["default"]
         return np.nan
 
+    # Compute homogenized z_flag and type
     df["z_flag_homogenized"] = df.map_partitions(
         lambda p: p.apply(lambda row: apply_translation(row, "z_flag"), axis=1),
         meta=("z_flag_homogenized", "f8")
@@ -126,12 +133,39 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         meta=("type_homogenized", "object")
     )
 
-    # === Tie-breaking ===
+    # === Apply tie-breaking and duplicate removal if required ===
     if combine_type in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
         delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
         tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
         type_priority = translation_config.get("type_priority", {})
 
+        if not tiebreaking_priority:
+            warnings.warn(f"tiebreaking_priority is empty for catalog '{product_name}'. Proceeding with delta_z_threshold tie-breaking only.")
+        else:
+            for col in tiebreaking_priority:
+                if col not in df.columns:
+                    raise ValueError(
+                        f"Tiebreaking column '{col}' is missing in catalog '{product_name}'."
+                    )
+                if df[col].isna().all().compute():
+                    raise ValueError(
+                        f"Tiebreaking column '{col}' is invalid in catalog '{product_name}' (all values are NaN)."
+                    )
+                if col != "type_homogenized":
+                    col_dtype = df[col].dtype
+                    if not np.issubdtype(col_dtype, np.number):
+                        raise ValueError(
+                            f"Tiebreaking column '{col}' must be numeric (except for 'type_homogenized'). Found dtype: {col_dtype}"
+                        )
+
+        # After this validation, check if there's *any* deduplication criterion
+        if not tiebreaking_priority and (delta_z_threshold is None or delta_z_threshold == 0.0):
+            raise ValueError(
+                f"Cannot deduplicate catalog '{product_name}': tiebreaking_priority is empty and delta_z_threshold is not set or is zero. "
+                f"Please provide at least one deduplication criterion."
+            )
+
+        # Identify duplicates by RA/DEC rounded to 6 decimals
         valid_coord_mask = df["ra"].notnull() & df["dec"].notnull()
         df_valid_coord = df[valid_coord_mask]
         df_valid_coord["ra_dec_key"] = (
@@ -144,20 +178,21 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         tie_updates = []
 
         if keys_dup:
+            # Compute duplicates locally
             df_dup_local = df_valid_coord[df_valid_coord["ra_dec_key"].isin(keys_dup)].compute()
 
             for key in keys_dup:
                 group = df_dup_local[df_dup_local["ra_dec_key"] == key].copy()
-                group["tie_result"] = 0
+                group["tie_result"] = 0  # All start as eliminated
                 surviving = group.copy()
 
+                # Apply tiebreaking priority columns
                 for priority_col in tiebreaking_priority:
                     if priority_col == "type_homogenized":
                         surviving["_priority_value"] = surviving["type_homogenized"].map(type_priority).fillna(0)
                     else:
                         surviving["_priority_value"] = surviving[priority_col]
 
-                    # If z_flag_homogenized is 6, force tie_result = 0
                     if priority_col == "z_flag_homogenized":
                         ids_to_eliminate = surviving.loc[surviving["z_flag_homogenized"] == 6, "CRD_ID"].tolist()
                         group.loc[group["CRD_ID"].isin(ids_to_eliminate), "tie_result"] = 0
@@ -172,8 +207,10 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
                     if len(surviving) == 1:
                         break
 
+                # Mark surviving objects as tie_result = 2 (potential ties)
                 group.loc[group["CRD_ID"].isin(surviving["CRD_ID"]), "tie_result"] = 2
 
+                # Apply delta_z_threshold if needed
                 if len(surviving) > 1 and delta_z_threshold > 0:
                     z_vals = surviving["z"].values
                     ids = surviving["CRD_ID"].values
@@ -191,6 +228,7 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
                                 group.loc[group["CRD_ID"] == ids[j], "tie_result"] = 0
                                 remaining_ids.discard(ids[j])
 
+                # Final clean-up of tie_result
                 survivors = group[group["tie_result"] == 2]
                 if len(survivors) == 1:
                     group.loc[group["tie_result"] == 2, "tie_result"] = 1
@@ -201,12 +239,14 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
 
                 tie_updates.append(group[["CRD_ID", "tie_result"]].copy())
 
+                # Update compared_to_dict for reporting
                 ids_all = group["CRD_ID"].tolist()
                 for i, id1 in enumerate(ids_all):
                     for id2 in ids_all[i + 1:]:
                         compared_to_dict.setdefault(id1, []).append(id2)
                         compared_to_dict.setdefault(id2, []).append(id1)
 
+            # Merge tie updates back to main dataframe
             if tie_updates:
                 combined_update = pd.concat(tie_updates)
                 tie_update_dd = dd.from_pandas(combined_update, npartitions=1)
@@ -214,13 +254,11 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
                     tie_update_dd, on="CRD_ID", how="left"
                 ).fillna({"tie_result": 1})
 
+            # Save compared_to_dict for debugging / later use
             with open(os.path.join(temp_dir, "compared_to.json"), "w") as f:
                 json.dump(compared_to_dict, f)
 
-        if df["z_flag_homogenized"].isna().all().compute() and df["type_homogenized"].isna().all().compute():
-            raise ValueError(f"❌ Cannot mark/remove duplicates: catalog '{product_name}' has both z_flag_homogenized and type_homogenized fully NaN.")
-
-    # === ComCam ECDFS flag ===
+    # === Flag objects inside ComCam ECDFS field ===
     ra_cen = 53.13
     dec_cen = -28.10
     radius = 0.72
@@ -244,6 +282,7 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         meta=df._meta.assign(is_in_ComCam_ECDFS_field=np.int64())
     )
 
+    # Select and save final output columns
     df = df[
         ["CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey",
          "source", "tie_result", "z_flag_homogenized", "type_homogenized",
