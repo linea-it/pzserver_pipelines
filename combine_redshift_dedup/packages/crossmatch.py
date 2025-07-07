@@ -80,94 +80,70 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
     def decide_tie(row):
         left_was_tie = row.get("tie_resultleft", 1) == 2
         right_was_tie = row.get("tie_resultright", 1) == 2
-
+    
         zflag_left = row.get("z_flag_homogenizedleft")
         zflag_right = row.get("z_flag_homogenizedright")
-
-        # Special handling for z_flag = 6 (stars)
+    
+        # Special case: if both are stars (z_flag == 6), eliminate both
         if pd.notna(zflag_left) and zflag_left == 6 and pd.notna(zflag_right) and zflag_right == 6:
             return (0, 0)
+        # If only the left is a star, eliminate left
         elif pd.notna(zflag_left) and zflag_left == 6:
             return (0, 2 if right_was_tie else 1)
+        # If only the right is a star, eliminate right
         elif pd.notna(zflag_right) and zflag_right == 6:
             return (2 if left_was_tie else 1, 0)
-
+    
+        # If no tiebreaking columns provided, mark as hard tie (to be resolved by delta_z)
         if not tiebreaking_priority:
-            # No tiebreaking columns: mark as hard tie, let delta_z resolve
             return (2, 2)
-
-        # First tiebreaking column
-        col1 = tiebreaking_priority[0]
-        v1_col1 = row.get(f"{col1}left")
-        v2_col1 = row.get(f"{col1}right")
-
-        # Apply type priority if needed
-        if col1 == "type_homogenized":
-            v1_col1 = type_priority.get(v1_col1, 0)
-            v2_col1 = type_priority.get(v2_col1, 0)
-
-        if len(tiebreaking_priority) == 1:
-            # Only one tiebreaking column: simple rules
-            if pd.notnull(v1_col1) and pd.notnull(v2_col1):
-                if v1_col1 > v2_col1:
+    
+        # Track the first column where one side was not NaN and the other was
+        first_non_nan_col = None
+        first_non_nan_side = None
+    
+        # Loop through all tiebreaking columns in priority order
+        for col in tiebreaking_priority:
+            v1 = row.get(f"{col}left")
+            v2 = row.get(f"{col}right")
+    
+            # Apply type priority mapping if column is type_homogenized
+            if col == "type_homogenized":
+                v1 = type_priority.get(v1, 0)
+                v2 = type_priority.get(v2, 0)
+    
+            if pd.notnull(v1) and pd.notnull(v2):
+                # If both values are valid, decide immediately
+                if v1 > v2:
                     return (2 if left_was_tie else 1, 0)
-                elif v2_col1 > v1_col1:
+                elif v2 > v1:
                     return (0, 2 if right_was_tie else 1)
+                # If values are equal, continue to next column
                 else:
-                    # Values equal → hard tie
-                    return (2, 2)
-            elif pd.notnull(v1_col1):
-                return (2 if left_was_tie else 1, 0)
-            elif pd.notnull(v2_col1):
-                return (0, 2 if right_was_tie else 1)
-            else:
-                return (2, 2)
-
-        # Two tiebreaking columns
-        col2 = tiebreaking_priority[1]
-        v1_col2 = row.get(f"{col2}left")
-        v2_col2 = row.get(f"{col2}right")
-
-        if col2 == "type_homogenized":
-            v1_col2 = type_priority.get(v1_col2, 0)
-            v2_col2 = type_priority.get(v2_col2, 0)
-
-        # Track which side had value when other was NaN in first column
-        first_col_nan_case = None
-
-        if pd.notnull(v1_col1) and pd.notnull(v2_col1):
-            if v1_col1 > v2_col1:
-                return (2 if left_was_tie else 1, 0)
-            elif v2_col1 > v1_col1:
-                return (0, 2 if right_was_tie else 1)
-        elif pd.isnull(v1_col1) and pd.notnull(v2_col1):
-            first_col_nan_case = "right"
-        elif pd.isnull(v2_col1) and pd.notnull(v1_col1):
-            first_col_nan_case = "left"
-
-        # Now evaluate second column
-        if pd.notnull(v1_col2) and pd.notnull(v2_col2):
-            if v1_col2 > v2_col2:
-                return (2 if left_was_tie else 1, 0)
-            elif v2_col2 > v1_col2:
-                return (0, 2 if right_was_tie else 1)
-        elif pd.isnull(v1_col2) and pd.notnull(v2_col2):
-            if first_col_nan_case == "right":
-                return (0, 2 if right_was_tie else 1)
-            elif first_col_nan_case == "left":
-                return (2 if left_was_tie else 1, 0)
-            else:
-                return (0, 2 if right_was_tie else 1)
-        elif pd.isnull(v2_col2) and pd.notnull(v1_col2):
-            if first_col_nan_case == "right":
-                return (0, 2 if right_was_tie else 1)
-            elif first_col_nan_case == "left":
-                return (2 if left_was_tie else 1, 0)
-            else:
-                return (2 if left_was_tie else 1, 0)
-
-        # No decision → hard tie
-        return (2, 2)
+                    continue
+    
+            elif pd.notnull(v1) and pd.isnull(v2):
+                # Found a column where left has value and right does not
+                if first_non_nan_col is None:
+                    first_non_nan_col = col
+                    first_non_nan_side = "left"
+    
+            elif pd.isnull(v1) and pd.notnull(v2):
+                # Found a column where right has value and left does not
+                if first_non_nan_col is None:
+                    first_non_nan_col = col
+                    first_non_nan_side = "right"
+    
+            # If both are NaN, move to next column without setting first_non_nan
+    
+        # After checking all columns, if no pair of values resolved the tie:
+        if first_non_nan_side == "left":
+            return (2 if left_was_tie else 1, 0)
+        elif first_non_nan_side == "right":
+            return (0, 2 if right_was_tie else 1)
+        else:
+            # No information to break tie → hard tie
+            return (2, 2)
 
     # Apply tie-breaking function
     tie_results = df.map_partitions(
