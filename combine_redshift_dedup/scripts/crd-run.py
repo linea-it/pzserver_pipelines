@@ -70,7 +70,27 @@ def main(config_path, cwd=".", base_dir_override=None):
     log_file = os.path.join(temp_dir, "process_resume.log")
     compared_to_path = os.path.join(temp_dir, "compared_to.json")
 
-    catalogs = config["inputs"]["specz"]
+    # === Sort catalogs by disk size (smallest → largest) ===
+    catalogs_unsorted = config["inputs"]["specz"]
+    
+    def get_file_size_mb(path):
+        try:
+            return os.path.getsize(path) / 1024 / 1024
+        except Exception:
+            return float("inf")
+    
+    catalogs_sorted = sorted(
+        catalogs_unsorted,
+        key=lambda entry: get_file_size_mb(entry["path"])
+    )
+    
+    logger.info("📏 Catalogs sorted by disk size:")
+    for entry in catalogs_sorted:
+        size_mb = get_file_size_mb(entry["path"])
+        logger.info(f" - {entry['internal_name']}: {size_mb:.1f} MB")
+    
+    catalogs = catalogs_sorted
+    
     tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
     type_priority = translation_config.get("type_priority", {})
     combine_type = config.get("combine_type", "concatenate_and_mark_duplicates").lower()

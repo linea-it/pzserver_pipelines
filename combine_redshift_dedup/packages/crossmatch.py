@@ -247,7 +247,10 @@ def crossmatch_tiebreak_safe(*args, **kwargs):
     try:
         return crossmatch_tiebreak(*args, **kwargs)
     except RuntimeError as e:
-        if "The output catalog is empty" in str(e):
+        if (
+            "The output catalog is empty" in str(e)
+            or "Catalogs do not overlap" in str(e)
+        ):
             print(f"⚠️ {e} Proceeding by merging left and right without crossmatching.")
             left_cat, right_cat = args[0], args[1]
             temp_dir = args[3]
