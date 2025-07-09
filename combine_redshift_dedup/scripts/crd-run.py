@@ -39,6 +39,8 @@ def main(config_path, cwd=".", base_dir_override=None):
 
     # === Load main config ===
     config = load_yml(config_path)
+    param_config = config.get("param", {})
+    
     if base_dir_override is None:
         raise ValueError("❌ You must specify --base_dir via the command line.")
     base_dir = base_dir_override
@@ -70,7 +72,7 @@ def main(config_path, cwd=".", base_dir_override=None):
     configure_exception_hook(logger, process_info, process_info_path)
 
     # === Load translation configuration ===
-    path_to_translation_file = config.get("flags_translation_file")
+    path_to_translation_file = param_config.get("flags_translation_file")
     if path_to_translation_file is None:
         logger.error("❌ Missing 'flags_translation_file' in config!")
         return
@@ -100,7 +102,7 @@ def main(config_path, cwd=".", base_dir_override=None):
     catalogs = catalogs_sorted
     tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
     type_priority = translation_config.get("type_priority", {})
-    combine_type = config.get("combine_type", "concatenate_and_mark_duplicates").lower()
+    combine_type = param_config.get("combine_type", "concatenate_and_mark_duplicates").lower()
     output_format = config.get('output_format', 'parquet').lower()
     completed = read_completed_steps(log_file)
 
