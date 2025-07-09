@@ -261,8 +261,8 @@ class Runner:
         if self.process_info_path.exists():
             shutil.move(f"{self.cwd}/slurm-*.out", self.process_info_path)
 
-        if self.output_full_dir.exists():
-            shutil.move(f"{self.cwd}/*", self.output_full_dir)
+        # if self.output_full_dir.exists():
+        #     shutil.move(self.process_info_file, self.output_full_dir)
 
 
 if __name__ == "__main__":
