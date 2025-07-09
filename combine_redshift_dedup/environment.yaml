@@ -1,0 +1,18 @@
+name: pipe_crd
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - dask=2025.5.1
+  - distributed=2025.5.1
+  - dask-jobqueue=0.8.5         
+  - pandas
+  - numpy
+  - pyyaml
+  - lsdb=0.5.0
+  - hats=0.5.0
+  - hats-import=0.5.0
+  - tables-io                  
+  - h5py
+

@@ -1,0 +1,108 @@
+# === Tiebreaking and deduplication configuration ===
+
+tiebreaking_priority:
+  - "z_flag_homogenized"    # Priority column 1: homogenized redshift quality flag (higher is better)
+  - "type_homogenized"      # Priority column 2: homogenized object type (e.g., s > g > p based on type_priority)
+
+  # You may specify any column here as a tiebreaking criterion,
+  # as long as:
+  # - It exists in all catalogs being crossmatched.
+  # - It is numeric (except for 'type_homogenized', which uses a string-to-priority mapping).
+  # - Higher values are considered better; lower values are worse.
+  # The columns will be evaluated in the order listed to resolve duplicates.
+
+delta_z_threshold: 0.0005    # Maximum allowed redshift difference (|z1 - z2|) to resolve hard ties
+                             # Applied only when initial tiebreaking via columns results in a tie (tie_result == 2)
+
+crossmatch_radius_arcsec: 0.75  # Angular radius (in arcseconds) used to perform spatial crossmatching BETWEEN different catalogs
+                               # This is NOT used for resolving internal duplicates (within the same catalog), 
+                               # which are resolved only when RA and DEC are exactly equal (to 6 decimal places)
+
+type_priority:
+  s: 3     # Spectroscopic (most reliable type)
+  g: 2     # Grism
+  p: 1     # Photometric (least reliable)
+
+# === Survey-specific translation rules for z_flag and type ===
+# These are our internal definitions used to harmonize redshift quality and object types across surveys.
+# The quality flag system is inspired by the VVDS survey but adapted to our needs:
+#
+# About the quality flag in our VVDS-inspired system:
+# - 0: No redshift could be assigned
+# - 1: Confidence < 70% (tentative redshift)
+# - 2: 70% < Confidence < 90%
+# - 3: 90% < Confidence < 99%
+# - 4: Confidence > 99%
+# - 6: Object identified as non-extragalactic (e.g., stars)
+
+# Each block corresponds to a survey name and includes:
+# - z_flag_translation: how to map original quality flags or based on conditions into a standardized quality scale (0-6)
+# - type_translation: how to map original types into a standard label (s, g, p)
+# You can mix value-based mappings and conditional rules (using Python expressions)
+
+translation_rules:
+
+  2DFGRS:
+    z_flag_translation:
+      "1": 0
+      "2": 1
+      "3": 3
+      "4": 4
+      "5": 4
+    type_translation:
+      default: "s"   # All objects in this survey are considered spectroscopic
+
+  2DFLENS:
+    z_flag_translation:
+      "1": 0
+      "2": 1
+      "3": 3
+      "4": 4
+      "6": 6         # Special code indicating star
+    type_translation:
+      default: "s"
+
+  2MRS:
+    z_flag_translation:
+      conditions:    # Use redshift error (z_err) to determine flag (preliminary criteria)
+        - expr: "z_err == 0"
+          value: 3
+        - expr: "0 < z_err < 0.0005"
+          value: 4
+        - expr: "z_err >= 0.0005"
+          value: 3
+    type_translation:
+      default: "s"
+
+  JADES:
+    z_flag_translation:
+      "A": 4
+      "B": 3
+      "C": 2
+      "D": 1
+      "E": 0
+    type_translation:
+      default: "s"
+
+  PRIMUS:
+    z_flag_translation:
+      "2": 1
+      "3": 2
+      "4": 3
+    type_translation:
+      default: "g"
+
+  example_survey:
+    z_flag_translation:
+      "X": 4
+      "Y": 3
+      "Z": 2
+      conditions:
+        - expr: "z_err < 0.001"
+          value: 4
+        - expr: "z_err >= 0.001"
+          value: 3
+    type_translation:
+      "SPEC": "s"
+      "GRISM": "g"
+      "PHOTO": "p"
