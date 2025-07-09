@@ -258,36 +258,59 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
             with open(os.path.join(temp_dir, "compared_to.json"), "w") as f:
                 json.dump(compared_to_dict, f)
 
-    # === Flag objects inside ComCam ECDFS field ===
-    ra_cen = 53.13
-    dec_cen = -28.10
-    radius = 0.72
+    # === Flag objects inside any DP1 region ===
+    # Hardcoded list of DP1 regions: (RA_center, DEC_center, radius_deg)
+    dp1_regions = [
+        (53.13163389359315,  -28.08888865891979, 1.0),
+        (40.01005293691379,  -34.440310487764044, 1.0),
+        (94.98576245425922,  -25.000393830207237, 1.0),
+        (6.640995866241859,  -72.18300875125159, 1.0),
+        (37.87272091870681,    7.006361772249324, 1.4),
+        (59.13369199852245,  -48.73771452812897, 1.0),
+        (106.11995951242615, -10.459343866530372, 1.1),
+    ]
 
-    def compute_in_cone(partition):
+    # Precompute centers in radians
+    ra_centers = np.deg2rad([r[0] for r in dp1_regions])
+    dec_centers = np.deg2rad([r[1] for r in dp1_regions])
+    radii = [r[2] for r in dp1_regions]
+    
+    def compute_in_dp1_fields(partition):
         partition = partition.copy()
-        ra_rad = np.deg2rad(partition["ra"])
-        dec_rad = np.deg2rad(partition["dec"])
-        ra_cen_rad = np.deg2rad(ra_cen)
-        dec_cen_rad = np.deg2rad(dec_cen)
-        cos_angle = (
-            np.sin(dec_cen_rad) * np.sin(dec_rad) +
-            np.cos(dec_cen_rad) * np.cos(dec_rad) * np.cos(ra_rad - ra_cen_rad)
-        )
-        angle_deg = np.rad2deg(np.arccos(np.clip(cos_angle, -1, 1)))
-        partition["is_in_ComCam_ECDFS_field"] = (angle_deg <= radius).astype(int)
+        ra_rad = np.deg2rad(partition["ra"].values)
+        dec_rad = np.deg2rad(partition["dec"].values)
+    
+        # Initialize boolean mask for whether each object is inside any region
+        in_any_field = np.zeros(len(partition), dtype=bool)
+    
+        for ra_cen, dec_cen, radius_deg in zip(ra_centers, dec_centers, radii):
+            # Compute angular distance between object and region center
+            cos_angle = (
+                np.sin(dec_cen) * np.sin(dec_rad) +
+                np.cos(dec_cen) * np.cos(dec_rad) * np.cos(ra_rad - ra_cen)
+            )
+            angle_deg = np.rad2deg(np.arccos(np.clip(cos_angle, -1, 1)))
+            in_field = angle_deg <= radius_deg
+    
+            # Mark objects inside this region
+            in_any_field |= in_field
+    
+        partition["is_in_DP1_fields"] = in_any_field.astype(int)
         return partition
-
+    
+    # Apply the region check to each Dask partition
     df = df.map_partitions(
-        compute_in_cone,
-        meta=df._meta.assign(is_in_ComCam_ECDFS_field=np.int64())
+        compute_in_dp1_fields,
+        meta=df._meta.assign(is_in_DP1_fields=np.int64())
     )
-
-    # Select and save final output columns
+    
+    # Select final output columns
     df = df[
         ["CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey",
          "source", "tie_result", "z_flag_homogenized", "type_homogenized",
-         "is_in_ComCam_ECDFS_field"]
+         "is_in_DP1_fields"]
     ]
+
     out_path = os.path.join(temp_dir, f"prepared_{product_name}")
     df.to_parquet(out_path, write_index=False)
 
