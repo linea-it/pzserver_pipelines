@@ -124,21 +124,27 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         return np.nan
 
     # Check and compute homogenized z_flag and type only if not present
-    if "z_flag_homogenized" not in df.columns:
-        df["z_flag_homogenized"] = df.map_partitions(
-            lambda p: p.apply(lambda row: apply_translation(row, "z_flag"), axis=1),
-            meta=("z_flag_homogenized", "f8")
-        )
-    else:
-        logger.warning(f"Column 'z_flag_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
+    tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
+    type_priority = translation_config.get("type_priority", {})
     
-    if "type_homogenized" not in df.columns:
-        df["type_homogenized"] = df.map_partitions(
-            lambda p: p.apply(lambda row: apply_translation(row, "type"), axis=1),
-            meta=("type_homogenized", "object")
-        )
-    else:
-        logger.warning(f"Column 'type_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
+    # Only generate homogenized columns if they are required for tie-breaking
+    if "z_flag_homogenized" in tiebreaking_priority:
+        if "z_flag_homogenized" not in df.columns:
+            df["z_flag_homogenized"] = df.map_partitions(
+                lambda p: p.apply(lambda row: apply_translation(row, "z_flag"), axis=1),
+                meta=("z_flag_homogenized", "f8")
+            )
+        else:
+            logger.warning(f"Column 'z_flag_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
+    
+    if "type_homogenized" in tiebreaking_priority:
+        if "type_homogenized" not in df.columns:
+            df["type_homogenized"] = df.map_partitions(
+                lambda p: p.apply(lambda row: apply_translation(row, "type"), axis=1),
+                meta=("type_homogenized", "object")
+            )
+        else:
+            logger.warning(f"Column 'type_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
 
     # === Apply tie-breaking and duplicate removal if required ===
     if combine_type in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
@@ -311,12 +317,30 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         meta=df._meta.assign(is_in_DP1_fields=np.int64())
     )
     
-    # Select final output columns
-    df = df[
-        ["CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey",
-         "source", "tie_result", "z_flag_homogenized", "type_homogenized",
-         "is_in_DP1_fields"]
+    # Default required output columns
+    final_columns = [
+        "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey",
+        "source", "tie_result", "is_in_DP1_fields"
     ]
+    
+    # Add homogenized columns only if they were generated or needed
+    if "z_flag_homogenized" in df.columns:
+        final_columns.append("z_flag_homogenized")
+    if "type_homogenized" in df.columns:
+        final_columns.append("type_homogenized")
+    
+    # Ensure all tiebreaking columns are included if present in the DataFrame
+    extra_columns = [
+        col for col in tiebreaking_priority
+        if col not in final_columns and col in df.columns
+    ]
+    final_columns += extra_columns
+    
+    # Remove duplicates while preserving order
+    final_columns = list(dict.fromkeys(final_columns))
+    
+    # Select only columns that actually exist in the DataFrame
+    df = df[[col for col in final_columns if col in df.columns]]
 
     out_path = os.path.join(temp_dir, f"prepared_{product_name}")
     df.to_parquet(out_path, write_index=False)
