@@ -123,15 +123,22 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
             return rule["default"]
         return np.nan
 
-    # Compute homogenized z_flag and type
-    df["z_flag_homogenized"] = df.map_partitions(
-        lambda p: p.apply(lambda row: apply_translation(row, "z_flag"), axis=1),
-        meta=("z_flag_homogenized", "f8")
-    )
-    df["type_homogenized"] = df.map_partitions(
-        lambda p: p.apply(lambda row: apply_translation(row, "type"), axis=1),
-        meta=("type_homogenized", "object")
-    )
+    # Check and compute homogenized z_flag and type only if not present
+    if "z_flag_homogenized" not in df.columns:
+        df["z_flag_homogenized"] = df.map_partitions(
+            lambda p: p.apply(lambda row: apply_translation(row, "z_flag"), axis=1),
+            meta=("z_flag_homogenized", "f8")
+        )
+    else:
+        logger.warning(f"Column 'z_flag_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
+    
+    if "type_homogenized" not in df.columns:
+        df["type_homogenized"] = df.map_partitions(
+            lambda p: p.apply(lambda row: apply_translation(row, "type"), axis=1),
+            meta=("type_homogenized", "object")
+        )
+    else:
+        logger.warning(f"Column 'type_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
 
     # === Apply tie-breaking and duplicate removal if required ===
     if combine_type in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
@@ -261,13 +268,13 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     # === Flag objects inside any DP1 region ===
     # Hardcoded list of DP1 regions: (RA_center, DEC_center, radius_deg)
     dp1_regions = [
-        (53.13163389359315,  -28.08888865891979, 1.0),
-        (40.01005293691379,  -34.440310487764044, 1.0),
-        (94.98576245425922,  -25.000393830207237, 1.0),
-        (6.640995866241859,  -72.18300875125159, 1.0),
-        (37.87272091870681,    7.006361772249324, 1.4),
-        (59.13369199852245,  -48.73771452812897, 1.0),
-        (106.11995951242615, -10.459343866530372, 1.1),
+        (53.13,  -28.09, 1.0),
+        (40.01,  -34.44, 1.0),
+        (94.99,  -25.00, 1.0),
+        (6.64,   -72.18, 1.0),
+        (37.87,    7.01, 1.4),
+        (59.13,  -48.74, 1.0),
+        (106.12, -10.46, 1.1),
     ]
 
     # Precompute centers in radians
