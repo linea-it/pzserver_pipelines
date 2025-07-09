@@ -14,7 +14,7 @@ tiebreaking_priority:
 delta_z_threshold: 0.0005    # Maximum allowed redshift difference (|z1 - z2|) to resolve hard ties
                              # Applied only when initial tiebreaking via columns results in a tie (tie_result == 2)
 
-crossmatch_radius_arcsec: 1.0  # Angular radius (in arcseconds) used to perform spatial crossmatching BETWEEN different catalogs
+crossmatch_radius_arcsec: 0.75  # Angular radius (in arcseconds) used to perform spatial crossmatching BETWEEN different catalogs
                                # This is NOT used for resolving internal duplicates (within the same catalog), 
                                # which are resolved only when RA and DEC are exactly equal (to 6 decimal places)
 
@@ -64,7 +64,7 @@ translation_rules:
 
   2MRS:
     z_flag_translation:
-      conditions:    # Use redshift error (z_err) to determine flag
+      conditions:    # Use redshift error (z_err) to determine flag (preliminary criteria)
         - expr: "z_err == 0"
           value: 3
         - expr: "0 < z_err < 0.0005"
