@@ -5,6 +5,7 @@ import datetime
 import os
 import time
 from pathlib import Path
+import shutil
 
 import lsdb
 from dask.distributed import Client
@@ -15,16 +16,18 @@ from utils import dump_yml, load_yml, setup_logger
 
 class Runner:
 
-    def __init__(self, config, cwd=".") -> None:
-        self.logger = setup_logger("tsm", logdir=cwd)
-        self.cwd = cwd
-        self.process_info_path = Path(self.cwd, "process.yml")
+    def __init__(self, config_path, working_dir=".") -> None:
+        self.process_info_path = Path(working_dir, "process_info")
+        os.makedirs(self.process_info_path, exist_ok=True)
+        self.logger = setup_logger("process", logdir=self.process_info_path)
+        self.process_info_file = Path(self.process_info_path, "process.yml")
+        self.cwd = working_dir
         self.process_info = None
         self.start_time = None
         self.end_time = None
 
         # Loading config
-        pipe_config = load_yml(config)
+        pipe_config = load_yml(config_path)
 
         self.logger.debug("Configs: %s", pipe_config)
 
@@ -55,15 +58,15 @@ class Runner:
         self.executors = pipe_config.get("executor")
 
         # Create output dir
-        output_full_dir = Path(self.output_root_dir, self.output_dir)
-        os.makedirs(output_full_dir, exist_ok=True)
+        self.output_full_dir = Path(self.output_root_dir, self.output_dir)
+        os.makedirs(self.output_full_dir, exist_ok=True)
 
         # Creating process info yaml
-        if not self.process_info_path.is_file():
-            self.process_info_path.touch()
+        if not self.process_info_file.is_file():
+            self.process_info_file.touch()
 
         # Loading process info yaml
-        process_info = load_yml(self.process_info_path)
+        process_info = load_yml(self.process_info_file)
         if not process_info:
             process_info = {}
         self.process_info = process_info
@@ -78,7 +81,7 @@ class Runner:
         """Add info in process.yaml"""
 
         self.process_info[key] = value  # type: ignore
-        dump_yml(self.process_info_path, self.process_info)
+        dump_yml(self.process_info_file, self.process_info)
 
     def run(self):
         """Run TSM"""
@@ -102,10 +105,10 @@ class Runner:
             ra = columns.get("ra", "ra")
             dec = columns.get("dec", "dec")
 
-            specz_df = lsdb.from_dataframe(df, ra_column=ra, dec_column=dec)
+            specz_df = lsdb.from_dataframe(
+                df, use_pyarrow_types=False, ra_column=ra, dec_column=dec
+            )
 
-            # dataset_path = self.inputs.get("dataset").get("path")
-            # margin_cache_path = self.inputs.get("dataset").get("margin_path", None)
             dataset_path, margin_cache_path = self.__get_photometric_data_path()
             dataset_id = self.inputs.get("dataset").get("columns", {}).get("id", "id")
 
@@ -254,6 +257,12 @@ class Runner:
             self.add_info("status", "Failed")
         else:
             self.add_info("status", "Successful")
+
+        if self.process_info_path.exists():
+            shutil.move(f"{self.cwd}/slurm-*.out", self.process_info_path)
+
+        if self.output_full_dir.exists():
+            shutil.move(f"{self.cwd}/*", self.output_full_dir)
 
 
 if __name__ == "__main__":
