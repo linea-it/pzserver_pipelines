@@ -75,7 +75,7 @@ class Inputs(BaseModel):
 
 class Param(BaseModel):
     combine_type: str = "concatenate"
-    flags_translation_file: str = "flags_translation.yaml"
+    flags_translation_file: str = "/data/apps/app.orch/datasets/flags_translation.yaml"
 
 
 class Config(BaseModel):
