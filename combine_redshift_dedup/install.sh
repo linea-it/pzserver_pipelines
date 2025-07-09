@@ -1,7 +1,6 @@
 #!/bin/bash --login
 
 source $(conda info --base)/etc/profile.d/conda.sh || { echo "Failed to source conda.sh"; exit 1; }
-conda activate pipe_crd || { echo "Failed to activate pipe_crd"; exit 1; }
 
 if [ ! -d "$PIPELINES_DIR" ]; then
     echo "Error: PIPELINES_DIR not defined."
@@ -22,7 +21,7 @@ if [ -z "$HASENV" ]; then
 #     fi
 fi
 
-conda activate pipe_crd
+conda activate pipe_crd || { echo "Failed to activate pipe_crd"; exit 1; }
 
 # PATH export no longer needed since we're calling python explicitly
 # export PATH=$PATH:"$PIPE_BASE/scripts/"

@@ -1,7 +1,7 @@
 #!/bin/bash
 
-if [ $# -lt 1 ]; then
-    echo "Usage: ./run.sh <config.yaml> [base_dir_override]"
+if [ $# -lt 2 ]; then
+    echo "Usage: ./run.sh <config.yaml> <base_dir_override>"
     exit 1
 fi
 
@@ -15,10 +15,13 @@ fi
 
 INSTALL_PIPE="$PIPELINES_DIR/combine_redshift_dedup/install.sh"
 PIPE_BASE="$PIPELINES_DIR/combine_redshift_dedup"
-LOGS_DIR="$PIPE_BASE/logs"
+
+# Creates logs directory inside base_dir_override/process_info
+LOGS_DIR="${BASE_DIR_OVERRIDE}/process_info"
 mkdir -p "$LOGS_DIR"
 
-LOG_FILE="$LOGS_DIR/run_$(date +'%Y%m%d_%H%M%S').log"
+# Nome fixo do arquivo de log
+LOG_FILE="$LOGS_DIR/process.log"
 
 if [ ! -f "$INSTALL_PIPE" ]; then
     echo "Error: Installation script not found."

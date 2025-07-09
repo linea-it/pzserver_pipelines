@@ -78,11 +78,8 @@ inputs:
         z_err: null
         survey: "survey_name"
 
-base_dir: "/scratch/users/luigi.silva/pzserver_pipelines/combine_redshift_dedup/process001"  # Base path for outputs/logs/temp
 output_dir: "outputs"     # Relative directory for final outputs
-logs_dir: "logs"          # Relative directory for log files
-temp_dir: "temp"          # Relative directory for temporary files
-output_format: "parquet"      # Output format: csv, parquet, hdf5, or fits
+output_format: "parquet"  # Output format: csv, parquet, hdf5, or fits
 output_name: "crd"        # Name prefix for the final output files
 combine_type: "concatenate_and_mark_duplicates"  # Options: "concatenate", "concatenate_and_mark_duplicates", or "concatenate_and_remove_duplicates"
 flags_translation_file: flags_translation.yaml   # File with homogenization rules for z_flag and type

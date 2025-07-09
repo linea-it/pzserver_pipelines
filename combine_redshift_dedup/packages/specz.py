@@ -14,6 +14,10 @@ from hats_import.margin_cache.margin_cache_arguments import MarginCacheArguments
 import hats
 
 from combine_redshift_dedup.packages.product_handle import ProductHandle
+from combine_redshift_dedup.packages.utils import (
+    log_and_print, get_global_logger
+)
+
 
 def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combine_type="concatenate_and_mark_duplicates"):
     """
@@ -38,6 +42,9 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     Returns:
         tuple: (output_path, ra_col_name, dec_col_name, internal_catalog_name)
     """
+
+    logger = get_global_logger()
+    
     # === Load catalog and rename columns according to configuration ===
     ph = ProductHandle(entry["path"])
     df = ph.to_ddf()
@@ -153,7 +160,7 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         type_priority = translation_config.get("type_priority", {})
 
         if not tiebreaking_priority:
-            warnings.warn(f"tiebreaking_priority is empty for catalog '{product_name}'. Proceeding with delta_z_threshold tie-breaking only.")
+            logger.warning(f"⚠️ tiebreaking_priority is empty for catalog '{product_name}'. Proceeding with delta_z_threshold tie-breaking only.")
         else:
             for col in tiebreaking_priority:
                 if col not in df.columns:
@@ -273,14 +280,15 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
 
     # === Flag objects inside any DP1 region ===
     # Hardcoded list of DP1 regions: (RA_center, DEC_center, radius_deg)
+    # Source of centers: https://rtn-011.lsst.io/
     dp1_regions = [
-        (53.13,  -28.09, 1.0),
-        (40.01,  -34.44, 1.0),
-        (94.99,  -25.00, 1.0),
-        (6.64,   -72.18, 1.0),
-        (37.87,    7.01, 1.4),
-        (59.13,  -48.74, 1.0),
-        (106.12, -10.46, 1.1),
+        (6.02,   -72.08, 2.5),   # 47 Tuc
+        (37.86,    6.98, 2.5),   # Rubin SV 38 7
+        (40.00,  -34.45, 2.5),   # Fornax dSph
+        (53.13,  -28.10, 2.5),   # ECDFS
+        (59.10,  -48.73, 2.5),   # EDFS
+        (95.00,  -25.00, 2.5),   # Rubin SV 95 -25
+        (106.23, -10.51, 1),   # Seagull
     ]
 
     # Precompute centers in radians
@@ -381,7 +389,8 @@ def import_catalog(path, ra_col, dec_col, artifact_name, output_path, client):
 def generate_margin_cache_safe(hats_path, output_path, artifact_name, client):
     """
     Generate margin cache if partitions > 1; otherwise, skip gracefully.
-
+    If resume fails due to missing critical files, clean and regenerate.
+    
     Args:
         hats_path (str): Path to HATS catalog.
         output_path (str): Path to save margin cache.
@@ -391,6 +400,20 @@ def generate_margin_cache_safe(hats_path, output_path, artifact_name, client):
     Returns:
         str or None: Path to margin cache or None if skipped.
     """
+    logger = get_global_logger()
+    margin_dir = os.path.join(output_path, artifact_name)
+    intermediate_dir = os.path.join(margin_dir, "intermediate")
+    critical_file = os.path.join(intermediate_dir, "margin_pair.csv")
+
+    # Check for broken resumption state
+    if os.path.exists(intermediate_dir) and not os.path.exists(critical_file):
+        log_and_print(f"⚠️ Detected incomplete margin cache at {margin_dir}. Deleting to force regeneration...", logger)
+        try:
+            shutil.rmtree(margin_dir)
+        except Exception as e:
+            log_and_print(f"❌ Failed to delete corrupted margin cache at {margin_dir}: {e}", logger)
+            raise
+
     try:
         catalog = hats.read_hats(hats_path)
         info = catalog.partition_info.as_dataframe().astype(int)
@@ -402,13 +425,13 @@ def generate_margin_cache_safe(hats_path, output_path, artifact_name, client):
                 output_artifact_name=artifact_name
             )
             pipeline_with_client(args, client)
-            return os.path.join(output_path, artifact_name)
+            return margin_dir
         else:
-            print(f"⚠️ Margin cache skipped: single partition for {artifact_name}")
+            log_and_print(f"⚠️ Margin cache skipped: single partition for {artifact_name}", logger)
             return None
     except ValueError as e:
         if "Margin cache contains no rows" in str(e):
-            print(f"⚠️ {e} Proceeding without margin cache.")
+            log_and_print(f"⚠️ {e} Proceeding without margin cache.", logger)
             return None
         else:
             raise

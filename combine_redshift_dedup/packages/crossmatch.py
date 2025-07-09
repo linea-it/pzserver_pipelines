@@ -6,7 +6,12 @@ import pandas as pd
 import dask.dataframe as dd
 import lsdb
 
+from combine_redshift_dedup.packages.utils import get_global_logger, log_and_print
+
 def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, step, client, compared_to_dict, type_priority, translation_config):
+
+    logger = get_global_logger()
+    
     output_xmatch_dir = os.path.join(temp_dir, f"xmatch_step{step}")
 
     crossmatch_radius = translation_config.get("crossmatch_radius_arcsec", 1.0)
@@ -27,7 +32,7 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
 
     # Validate tiebreaking_priority configuration
     if not tiebreaking_priority:
-        warnings.warn("tiebreaking_priority is empty. Proceeding directly to delta_z_threshold tie-breaking.")
+        logger.warning("⚠️ tiebreaking_priority is empty. Proceeding directly to delta_z_threshold tie-breaking.")
     else:
         for col in tiebreaking_priority:
             col_left = f"{col}left"
@@ -244,6 +249,9 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
     return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats"))
 
 def crossmatch_tiebreak_safe(*args, **kwargs):
+
+    logger = get_global_logger()
+    
     try:
         return crossmatch_tiebreak(*args, **kwargs)
     except RuntimeError as e:
@@ -251,7 +259,7 @@ def crossmatch_tiebreak_safe(*args, **kwargs):
             "The output catalog is empty" in str(e)
             or "Catalogs do not overlap" in str(e)
         ):
-            print(f"⚠️ {e} Proceeding by merging left and right without crossmatching.")
+            log_and_print(f"⚠️ {e} Proceeding by merging left and right without crossmatching.", logger)
             left_cat, right_cat = args[0], args[1]
             temp_dir = args[3]
             step = args[4]
