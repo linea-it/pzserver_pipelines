@@ -288,7 +288,7 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         (53.13,  -28.10, 2.5),   # ECDFS
         (59.10,  -48.73, 2.5),   # EDFS
         (95.00,  -25.00, 2.5),   # Rubin SV 95 -25
-        (106.23, -10.51, 1),   # Seagull
+        (106.23, -10.51, 2.5),   # Seagull
     ]
 
     # Precompute centers in radians
