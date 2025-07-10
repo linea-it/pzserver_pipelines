@@ -45,11 +45,16 @@ def main(config_path, cwd=".", base_dir_override=None):
         raise ValueError("❌ You must specify --base_dir via the command line.")
     base_dir = base_dir_override
 
-    output_dir = os.path.join(base_dir, config["output_dir"])
+    output_root_dir = config["output_root_dir"]
+    output_dir = config["output_dir"]
+    output_root_dir_and_output_dir = os.path.join(output_root_dir, output_dir)
+    output_name = config["output_name"]
+    output_format = config.get('output_format', 'parquet').lower()
+    
     logs_dir = os.path.join(base_dir, "process_info")
     temp_dir = os.path.join(base_dir, "temp")
 
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(output_root_dir_and_output_dir, exist_ok=True)
     os.makedirs(logs_dir, exist_ok=True)
     os.makedirs(temp_dir, exist_ok=True)
 
@@ -103,7 +108,6 @@ def main(config_path, cwd=".", base_dir_override=None):
     tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
     type_priority = translation_config.get("type_priority", {})
     combine_type = param_config.get("combine_type", "concatenate_and_mark_duplicates").lower()
-    output_format = config.get('output_format', 'parquet').lower()
     completed = read_completed_steps(log_file)
 
     # === Initialize Dask cluster ===
@@ -137,7 +141,7 @@ def main(config_path, cwd=".", base_dir_override=None):
         prepared_paths.append(path_info)
 
     # === Begin combination logic ===
-    final_base_path = os.path.join(output_dir, config['output_name'])
+    final_base_path = os.path.join(output_root_dir_and_output_dir, output_name)
 
     if combine_type == "concatenate":
         logger.info("🔗 Combining catalogs by simple concatenation (concatenate mode)")
@@ -265,15 +269,14 @@ def main(config_path, cwd=".", base_dir_override=None):
     save_dataframe(df_final, final_base_path, output_format)
     logger.info(f"✅ Final combined catalog saved at {final_base_path}.{output_format}")
 
-    relative_path = os.path.join(config["output_dir"], f"{config['output_name']}.{output_format}")
-    absolute_root = os.path.abspath(config["output_root_dir"])
+    relative_path = os.path.join(output_dir, f"{output_name}.{output_format}")
 
     expected_columns = ["id", "ra", "dec", "z", "z_flag", "z_err", "survey"]
     columns_assoc = {col: col for col in expected_columns if col in df_final.columns}
 
     update_process_info(process_info, process_info_path, "outputs", [{
         "path": relative_path,
-        "root_dir": absolute_root,
+        "root_dir": output_root_dir,
         "role": "main",
         "columns_assoc": columns_assoc
     }])
