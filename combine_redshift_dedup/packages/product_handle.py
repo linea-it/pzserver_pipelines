@@ -95,7 +95,7 @@ def save_dataframe(df, output_path, format_):
     elif ext == "csv":
         df.to_csv(f"{output_path}.csv", index=False)
     elif ext == "hdf5":
-        tables_io.write(df, f"{output_path}.h5")
+        tables_io.write(df, f"{output_path}.hdf5")
     elif ext == "fits":
         table = Table.from_pandas(df)
         table.write(f"{output_path}.fits", overwrite=True)
