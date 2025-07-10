@@ -266,7 +266,7 @@ def main(config_path, cwd=".", base_dir_override=None):
     logger.info(f"✅ Final combined catalog saved at {final_base_path}.{output_format}")
 
     relative_path = os.path.join(config["output_dir"], f"{config['output_name']}.{output_format}")
-    absolute_root = os.path.abspath(base_dir)
+    absolute_root = os.path.abspath(config["output_root_dir"])
 
     expected_columns = ["id", "ra", "dec", "z", "z_flag", "z_err", "survey"]
     columns_assoc = {col: col for col in expected_columns if col in df_final.columns}

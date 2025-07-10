@@ -81,6 +81,7 @@ inputs:
 output_dir: "outputs"     # Relative directory for final outputs
 output_format: "parquet"  # Output format: csv, parquet, hdf5, or fits
 output_name: "crd"        # Name prefix for the final output files
+output_root_dir: "process001"
 
 param:
     combine_type: "concatenate_and_mark_duplicates"  # Options: "concatenate", "concatenate_and_mark_duplicates", or "concatenate_and_remove_duplicates"
