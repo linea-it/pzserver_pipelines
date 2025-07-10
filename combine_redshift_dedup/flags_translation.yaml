@@ -92,6 +92,48 @@ translation_rules:
     type_translation:
       default: "g"
 
+  OZDES:
+    z_flag_translation:
+      "1": 0
+      "2": 1
+      "3": 3
+      "4": 4
+      "6": 6
+    type_translation:
+      default: "s"
+
+  VANDELS:
+    z_flag_translation:
+      "0": 0
+      "1": 1
+      "2": 2
+      "3": 4
+      "4": 4
+      "9": 3
+    type_translation:
+      default: "s"
+
+  VVDS:
+    z_flag_translation:
+      "0": 0 
+      "1": 1
+      "2": 2
+      "3": 3
+      "4": 4
+      "9": 2
+    type_translation:
+      default: "s"
+
+  DESI:
+    z_flag_translation:
+      conditions:
+        - expr: "ZWARN == 0 and ZCAT_PRIMARY == True and z_err < 0.0005"
+          value: 4
+        - expr: "ZWARN == 0 and ZCAT_PRIMARY == True and z_err >= 0.0005"
+          value: 3
+    type_translation:
+      default: "s"
+
   example_survey:
     z_flag_translation:
       "X": 4
