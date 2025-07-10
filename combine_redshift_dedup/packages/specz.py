@@ -209,9 +209,9 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
                 # Apply tiebreaking priority columns
                 for priority_col in tiebreaking_priority:
                     if priority_col == "type_homogenized":
-                        surviving["_priority_value"] = surviving["type_homogenized"].map(type_priority).fillna(0)
+                        surviving["_priority_value"] = surviving["type_homogenized"].map(type_priority).fillna(-np.inf)
                     else:
-                        surviving["_priority_value"] = surviving[priority_col]
+                        surviving["_priority_value"] = surviving[priority_col].fillna(-np.inf)
 
                     if priority_col == "z_flag_homogenized":
                         ids_to_eliminate = surviving.loc[surviving["z_flag_homogenized"] == 6, "CRD_ID"].tolist()
