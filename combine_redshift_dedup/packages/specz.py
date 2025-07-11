@@ -19,14 +19,14 @@ from combine_redshift_dedup.packages.utils import (
 )
 
 
-def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combine_type="concatenate_and_mark_duplicates"):
+def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combine_mode="concatenate_and_mark_duplicates"):
     """
     Load, standardize, and prepare a redshift catalog for combination.
 
     This function:
     - Renames columns according to configuration.
     - Generates unique CRD_IDs for all rows.
-    - Applies translation rules for z_flag and type homogenization.
+    - Applies translation rules for z_flag and instrument_type homogenization.
     - Identifies and marks duplicates within the catalog (RA/DEC duplicates).
     - Applies tie-breaking logic, including delta_z threshold comparison.
     - Flags objects inside ComCam ECDFS field.
@@ -37,7 +37,7 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         translation_config (dict): Config with translation rules and thresholds.
         temp_dir (str): Temporary output directory.
         compared_to_dict (defaultdict): Tracks pairs of compared objects.
-        combine_type (str): Combine mode (concatenate / mark / remove duplicates).
+        combine_mode (str): Combine mode (concatenate / mark / remove duplicates).
 
     Returns:
         tuple: (output_path, ra_col_name, dec_col_name, internal_catalog_name)
@@ -55,19 +55,28 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     df["source"] = product_name
 
     # Ensure required columns exist, fill with NaN if missing
-    for col in ["id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey"]:
+    for col in ["id", "ra", "dec", "z", "z_flag", "z_err", "instrument_type", "survey"]:
         if col not in df.columns:
             df[col] = np.nan
 
     # Standardize column types
-    df["id"] = df["id"].astype(str)
-    df["ra"] = df["ra"].astype(float)
-    df["dec"] = df["dec"].astype(float)
-    df["z"] = df["z"].astype(float)
-    df["z_flag"] = df["z_flag"].astype(str)
-    df["z_err"] = df["z_err"].astype(float)
-    df["type"] = df["type"].astype(str)
-    df["survey"] = df["survey"].astype(str).str.strip().str.upper()
+    # String columns
+    for col in ["id", "z_flag", "instrument_type", "survey"]:
+        if col in df.columns:
+            try:
+                df[col] = df[col].fillna("").astype(str)
+                if col == "survey":
+                    df[col] = df[col].str.strip().str.upper()
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to convert column '{col}' to str: {e}")
+    
+    # Float columns
+    for col in ["ra", "dec", "z", "z_err"]:
+        if col in df.columns:
+            try:
+                df[col] = df[col].astype(float)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to convert column '{col}' to float: {e}")
 
     # === Generate unique CRD_IDs ===
     counter_path = os.path.join(temp_dir, "crd_id_counter.json")
@@ -105,7 +114,7 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     # Initialize tie_result to 1 (default: kept)
     df["tie_result"] = 1
 
-    # === Apply translation rules for z_flag and type ===
+    # === Apply translation rules for z_flag and instrument_type ===
     translation_rules_uc = {
         survey_name.upper(): rules
         for survey_name, rules in translation_config.get("translation_rules", {}).items()
@@ -130,9 +139,9 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
             return rule["default"]
         return np.nan
 
-    # Check and compute homogenized z_flag and type only if not present
+    # Check and compute homogenized z_flag and instrument_type only if not present
     tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
-    type_priority = translation_config.get("type_priority", {})
+    instrument_type_priority = translation_config.get("instrument_type_priority", {})
     
     # Only generate homogenized columns if they are required for tie-breaking
     if "z_flag_homogenized" in tiebreaking_priority:
@@ -144,20 +153,20 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         else:
             logger.warning(f"Column 'z_flag_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
     
-    if "type_homogenized" in tiebreaking_priority:
-        if "type_homogenized" not in df.columns:
-            df["type_homogenized"] = df.map_partitions(
-                lambda p: p.apply(lambda row: apply_translation(row, "type"), axis=1),
-                meta=("type_homogenized", "object")
+    if "instrument_type_homogenized" in tiebreaking_priority:
+        if "instrument_type_homogenized" not in df.columns:
+            df["instrument_type_homogenized"] = df.map_partitions(
+                lambda p: p.apply(lambda row: apply_translation(row, "instrument_type"), axis=1),
+                meta=("instrument_type", "object")
             )
         else:
-            logger.warning(f"Column 'type_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
+            logger.warning(f"Column 'instrument_type_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
 
     # === Apply tie-breaking and duplicate removal if required ===
-    if combine_type in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
+    if combine_mode in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
         delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
         tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
-        type_priority = translation_config.get("type_priority", {})
+        instrument_type_priority = translation_config.get("instrument_type_priority", {})
 
         if not tiebreaking_priority:
             logger.warning(f"⚠️ tiebreaking_priority is empty for catalog '{product_name}'. Proceeding with delta_z_threshold tie-breaking only.")
@@ -167,16 +176,21 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
                     raise ValueError(
                         f"Tiebreaking column '{col}' is missing in catalog '{product_name}'."
                     )
-                if df[col].isna().all().compute():
+                if (df[col].isna() | (df[col] == "")).all().compute():
                     raise ValueError(
                         f"Tiebreaking column '{col}' is invalid in catalog '{product_name}' (all values are NaN)."
                     )
-                if col != "type_homogenized":
+                if col != "instrument_type_homogenized":
                     col_dtype = df[col].dtype
                     if not np.issubdtype(col_dtype, np.number):
-                        raise ValueError(
-                            f"Tiebreaking column '{col}' must be numeric (except for 'type_homogenized'). Found dtype: {col_dtype}"
-                        )
+                        try:
+                            df[col] = df[col].astype(float)
+                            logger.info(f"ℹ️ Column '{col}' cast to float for tie-breaking.")
+                        except Exception as e:
+                            raise ValueError(
+                                f"Tiebreaking column '{col}' must be numeric (except for 'instrument_type_homogenized'). "
+                                f"Attempted cast to float but failed. Error: {e}"
+                            )
 
         # After this validation, check if there's *any* deduplication criterion
         if not tiebreaking_priority and (delta_z_threshold is None or delta_z_threshold == 0.0):
@@ -208,8 +222,8 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
 
                 # Apply tiebreaking priority columns
                 for priority_col in tiebreaking_priority:
-                    if priority_col == "type_homogenized":
-                        surviving["_priority_value"] = surviving["type_homogenized"].map(type_priority).fillna(-np.inf)
+                    if priority_col == "instrument_type_homogenized":
+                        surviving["_priority_value"] = surviving["instrument_type_homogenized"].map(instrument_type_priority).fillna(-np.inf)
                     else:
                         surviving["_priority_value"] = surviving[priority_col].fillna(-np.inf)
 
@@ -270,9 +284,15 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
             if tie_updates:
                 combined_update = pd.concat(tie_updates)
                 tie_update_dd = dd.from_pandas(combined_update, npartitions=1)
+                
+                # Ensure consistent string type before merging
+                df["CRD_ID"] = df["CRD_ID"].astype(str)
+                tie_update_dd["CRD_ID"] = tie_update_dd["CRD_ID"].astype(str)
+                
                 df = df.drop("tie_result", axis=1).merge(
                     tie_update_dd, on="CRD_ID", how="left"
                 ).fillna({"tie_result": 1})
+
 
             # Save compared_to_dict for debugging / later use
             with open(os.path.join(temp_dir, "compared_to.json"), "w") as f:
@@ -327,15 +347,15 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     
     # Default required output columns
     final_columns = [
-        "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey",
+        "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err", "instrument_type", "survey",
         "source", "tie_result", "is_in_DP1_fields"
     ]
     
     # Add homogenized columns only if they were generated or needed
     if "z_flag_homogenized" in df.columns:
         final_columns.append("z_flag_homogenized")
-    if "type_homogenized" in df.columns:
-        final_columns.append("type_homogenized")
+    if "instrument_type_homogenized" in df.columns:
+        final_columns.append("instrument_type_homogenized")
     
     # Ensure all tiebreaking columns are included if present in the DataFrame
     extra_columns = [
