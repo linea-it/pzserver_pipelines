@@ -50,24 +50,36 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     df = ph.to_ddf()
     product_name = entry["internal_name"]
 
+    # Rename columns according to mapping in entry["columns"]
     col_map = {v: k for k, v in entry["columns"].items() if v and v in df.columns}
     df = df.rename(columns=col_map)
     df["source"] = product_name
 
-    # Ensure required columns exist, fill with NaN if missing
+    # Save original columns before filling missing ones
+    original_columns = set(df.columns)
+
+    # Ensure required columns exist; fill with NaN if missing
     for col in ["id", "ra", "dec", "z", "z_flag", "z_err", "type", "survey"]:
         if col not in df.columns:
             df[col] = np.nan
 
-    # Standardize column types
-    df["id"] = df["id"].astype(str)
-    df["ra"] = df["ra"].astype(float)
-    df["dec"] = df["dec"].astype(float)
-    df["z"] = df["z"].astype(float)
-    df["z_flag"] = df["z_flag"].astype(str)
-    df["z_err"] = df["z_err"].astype(float)
-    df["type"] = df["type"].astype(str)
-    df["survey"] = df["survey"].astype(str).str.strip().str.upper()
+    # Standardize data types only for columns that were originally present
+    astype_map = {
+        "id": str,
+        "ra": float,
+        "dec": float,
+        "z": float,
+        "z_flag": str,
+        "z_err": float,
+        "type": str,
+        "survey": str,
+    }
+
+    for col, col_type in astype_map.items():
+        if col in original_columns:
+            df[col] = df[col].astype(col_type)
+            if col == "survey":
+                df[col] = df[col].str.strip().str.upper()
 
     # === Generate unique CRD_IDs ===
     counter_path = os.path.join(temp_dir, "crd_id_counter.json")
