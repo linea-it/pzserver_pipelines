@@ -106,8 +106,8 @@ def main(config_path, cwd=".", base_dir_override=None):
 
     catalogs = catalogs_sorted
     tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
-    type_priority = translation_config.get("type_priority", {})
-    combine_type = param_config.get("combine_type", "concatenate_and_mark_duplicates").lower()
+    instrument_type_priority = translation_config.get("instrument_type_priority", {})
+    combine_mode = param_config.get("combine_type", "concatenate_and_mark_duplicates").lower()
     completed = read_completed_steps(log_file)
 
     # === Initialize Dask cluster ===
@@ -130,7 +130,7 @@ def main(config_path, cwd=".", base_dir_override=None):
         filename = os.path.basename(entry["path"])
         logger.info(f"📦 Preparing catalog: {entry['internal_name']} ({filename})")
         if tag not in completed:
-            path_info = prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combine_type)
+            path_info = prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combine_mode)
             log_step(log_file, tag)
         else:
             logger.info(f"⏩ Catalog {entry['internal_name']} already prepared. Skipping.")
@@ -143,13 +143,13 @@ def main(config_path, cwd=".", base_dir_override=None):
     # === Begin combination logic ===
     final_base_path = os.path.join(output_root_dir_and_output_dir, output_name)
 
-    if combine_type == "concatenate":
+    if combine_mode == "concatenate":
         logger.info("🔗 Combining catalogs by simple concatenation (concatenate mode)")
         dfs = [dd.read_parquet(p[0]) for p in prepared_paths]
         df_final = dd.concat(dfs).compute()
 
-    elif combine_type in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
-        logger.info(f"🔍 Combining catalogs with duplicate marking ({combine_type} mode)")
+    elif combine_mode in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
+        logger.info(f"🔍 Combining catalogs with duplicate marking ({combine_mode} mode)")
 
         delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
         if not tiebreaking_priority:
@@ -210,7 +210,7 @@ def main(config_path, cwd=".", base_dir_override=None):
                 logger.info(f"🔄 Crossmatching previous result with: {internal_name}")
                 cat_prev = crossmatch_tiebreak_safe(
                     cat_prev, cat_curr, tiebreaking_priority, temp_dir, i, client,
-                    compared_to_dict, type_priority, translation_config
+                    compared_to_dict, instrument_type_priority, translation_config
                 )
 
                 if delete_temp_files and i > 1:
@@ -241,19 +241,19 @@ def main(config_path, cwd=".", base_dir_override=None):
         df_final = dd.read_parquet(final_merged).compute()
         df_final["compared_to"] = df_final["CRD_ID"].map(lambda x: ",".join(compared_to_dict.get(str(x), [])))
 
-        if combine_type == "concatenate_and_remove_duplicates":
+        if combine_mode == "concatenate_and_remove_duplicates":
             before = len(df_final)
             df_final = df_final[df_final["tie_result"] == 1]
             after = len(df_final)
             logger.info(f"🧹 Removed duplicates: kept {after} of {before} rows (tie_result == 1)")
 
     else:
-        logger.error(f"❌ Unknown combine_type: {combine_type}")
+        logger.error(f"❌ Unknown combine_mode: {combine_mode}")
         client.close(); cluster.close(); return
 
     # === Final cleanup and save ===
-    if combine_type == "concatenate" and "tie_result" in df_final.columns:
-        logger.info("ℹ️ Dropping column 'tie_result' (not needed for combine_type == concatenate)")
+    if combine_mode == "concatenate" and "tie_result" in df_final.columns:
+        logger.info("ℹ️ Dropping column 'tie_result' (not needed for combine_mode == concatenate)")
         df_final = df_final.drop(columns=["tie_result"])
 
     for col in df_final.columns:
