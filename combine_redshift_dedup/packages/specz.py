@@ -157,7 +157,7 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         if "instrument_type_homogenized" not in df.columns:
             df["instrument_type_homogenized"] = df.map_partitions(
                 lambda p: p.apply(lambda row: apply_translation(row, "instrument_type"), axis=1),
-                meta=("instrument_type", "object")
+                meta=("instrument_type_homogenized", "object")
             )
         else:
             logger.warning(f"Column 'instrument_type_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
