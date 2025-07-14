@@ -134,6 +134,16 @@ translation_rules:
     instrument_type_translation:
       default: "s"
 
+  6DFGS:
+    z_flag_translation:
+      "1": 0
+      "2": 1
+      "3": 3
+      "4": 4
+      "6": 6
+    instrument_type_translation:
+      default: "s"
+
   example_survey:
     z_flag_translation:
       "X": 4
