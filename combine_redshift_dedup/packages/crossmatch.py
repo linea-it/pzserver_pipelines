@@ -8,7 +8,7 @@ import lsdb
 
 from combine_redshift_dedup.packages.utils import get_global_logger, log_and_print
 
-def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, step, client, compared_to_dict, type_priority, translation_config):
+def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, step, client, compared_to_dict, instrument_type_priority, translation_config):
 
     logger = get_global_logger()
     
@@ -52,11 +52,11 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
                     f"Tiebreaking column '{col}' is present in both catalogs, but all values are NaN in the crossmatch result."
                 )
         
-            # Check if custom tiebreaking column is numeric (unless it's type_homogenized)
-            if col != "type_homogenized":
+            # Check if custom tiebreaking column is numeric (unless it's instrument_type_homogenized)
+            if col != "instrument_type_homogenized":
                 if not (pd.api.types.is_numeric_dtype(df[col_left].dtype) and pd.api.types.is_numeric_dtype(df[col_right].dtype)):
                     raise ValueError(
-                        f"Tiebreaking column '{col}' must be numeric in both catalogs (except for 'type_homogenized'). "
+                        f"Tiebreaking column '{col}' must be numeric in both catalogs (except for 'instrument_type_homogenized'). "
                         f"Found dtypes: left={df[col_left].dtype}, right={df[col_right].dtype}."
                     )
 
@@ -112,10 +112,10 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
             v1 = row.get(f"{col}left")
             v2 = row.get(f"{col}right")
     
-            # Apply type priority mapping if column is type_homogenized
-            if col == "type_homogenized":
-                v1 = type_priority.get(v1, 0)
-                v2 = type_priority.get(v2, 0)
+            # Apply type priority mapping if column is instrument_type_homogenized
+            if col == "instrument_type_homogenized":
+                v1 = instrument_type_priority.get(v1, 0)
+                v2 = instrument_type_priority.get(v2, 0)
     
             if pd.notnull(v1) and pd.notnull(v2):
                 # If both values are valid, decide immediately
@@ -239,6 +239,42 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
 
     # Combine catalogs and save result
     merged = dd.concat([left_df, right_df])
+    
+    # Ensure stable dtypes before saving to avoid ArrowNotImplementedError
+    expected_types = {
+        "CRD_ID": "string",
+        "id": "string",
+        "ra": "float64",
+        "dec": "float64",
+        "z": "float64",
+        "z_flag": "string",
+        "z_err": "float64",
+        "instrument_type": "string",
+        "survey": "string",
+        "source": "string",
+        "tie_result": "int64",
+        "compared_to": "string",
+        "z_flag_homogenized": "float64",
+        "instrument_type_homogenized": "string",
+    }
+    
+    # Add tiebreaking_priority columns dynamically
+    for col in tiebreaking_priority:
+        if col != "instrument_type_homogenized":
+            expected_types[col] = "float64"
+        else:
+            expected_types[col] = "string"
+    
+    for col, dtype in expected_types.items():
+        if col in merged.columns:
+            try:
+                if dtype == "string":
+                    merged[col] = merged[col].fillna("").astype("string")
+                else:
+                    merged[col] = merged[col].astype(dtype)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to cast column '{col}' to {dtype}: {e}")
+    
     merged_path = os.path.join(temp_dir, f"merged_step{step}")
     merged.to_parquet(merged_path, write_index=False)
 

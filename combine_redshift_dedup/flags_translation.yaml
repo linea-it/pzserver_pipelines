@@ -1,13 +1,13 @@
 # === Tiebreaking and deduplication configuration ===
 
 tiebreaking_priority:
-  - "z_flag_homogenized"    # Priority column 1: homogenized redshift quality flag (higher is better)
-  - "type_homogenized"      # Priority column 2: homogenized object type (e.g., s > g > p based on type_priority)
+  - "z_flag_homogenized"          # Priority column 1: homogenized redshift quality flag (higher is better)
+  - "instrument_type_homogenized" # Priority column 2: homogenized instrument type (e.g., s > g > p based on instrument_type_priority)
 
   # You may specify any column here as a tiebreaking criterion,
   # as long as:
   # - It exists in all catalogs being crossmatched.
-  # - It is numeric (except for 'type_homogenized', which uses a string-to-priority mapping).
+  # - It is numeric (except for 'instrument_type_homogenized', which uses a string-to-priority mapping).
   # - Higher values are considered better; lower values are worse.
   # The columns will be evaluated in the order listed to resolve duplicates.
 
@@ -18,13 +18,13 @@ crossmatch_radius_arcsec: 0.75  # Angular radius (in arcseconds) used to perform
                                # This is NOT used for resolving internal duplicates (within the same catalog), 
                                # which are resolved only when RA and DEC are exactly equal (to 6 decimal places)
 
-type_priority:
+instrument_type_priority:
   s: 3     # Spectroscopic (most reliable type)
   g: 2     # Grism
   p: 1     # Photometric (least reliable)
 
 # === Survey-specific translation rules for z_flag and type ===
-# These are our internal definitions used to harmonize redshift quality and object types across surveys.
+# These are our internal definitions used to harmonize redshift quality and instrument types across surveys.
 # The quality flag system is inspired by the VVDS survey but adapted to our needs:
 #
 # About the quality flag in our VVDS-inspired system:
@@ -37,7 +37,7 @@ type_priority:
 
 # Each block corresponds to a survey name and includes:
 # - z_flag_translation: how to map original quality flags or based on conditions into a standardized quality scale (0-6)
-# - type_translation: how to map original types into a standard label (s, g, p)
+# - instrument_type_translation: how to map original types into a standard label (s, g, p)
 # You can mix value-based mappings and conditional rules (using Python expressions)
 
 translation_rules:
@@ -49,7 +49,7 @@ translation_rules:
       "3": 3
       "4": 4
       "5": 4
-    type_translation:
+    instrument_type_translation:
       default: "s"   # All objects in this survey are considered spectroscopic
 
   2DFLENS:
@@ -59,7 +59,7 @@ translation_rules:
       "3": 3
       "4": 4
       "6": 6         # Special code indicating star
-    type_translation:
+    instrument_type_translation:
       default: "s"
 
   2MRS:
@@ -71,7 +71,7 @@ translation_rules:
           value: 4
         - expr: "z_err >= 0.0005"
           value: 3
-    type_translation:
+    instrument_type_translation:
       default: "s"
 
   JADES:
@@ -81,7 +81,7 @@ translation_rules:
       "C": 2
       "D": 1
       "E": 0
-    type_translation:
+    instrument_type_translation:
       default: "s"
 
   PRIMUS:
@@ -89,7 +89,7 @@ translation_rules:
       "2": 1
       "3": 2
       "4": 3
-    type_translation:
+    instrument_type_translation:
       default: "g"
 
   OZDES:
@@ -99,7 +99,7 @@ translation_rules:
       "3": 3
       "4": 4
       "6": 6
-    type_translation:
+    instrument_type_translation:
       default: "s"
 
   VANDELS:
@@ -110,7 +110,7 @@ translation_rules:
       "3": 4
       "4": 4
       "9": 3
-    type_translation:
+    instrument_type_translation:
       default: "s"
 
   VVDS:
@@ -121,7 +121,7 @@ translation_rules:
       "3": 3
       "4": 4
       "9": 2
-    type_translation:
+    instrument_type_translation:
       default: "s"
 
   DESI:
@@ -131,7 +131,17 @@ translation_rules:
           value: 4
         - expr: "ZWARN == 0 and ZCAT_PRIMARY == True and z_err >= 0.0005"
           value: 3
-    type_translation:
+    instrument_type_translation:
+      default: "s"
+
+  6DFGS:
+    z_flag_translation:
+      "1": 0
+      "2": 1
+      "3": 3
+      "4": 4
+      "6": 6
+    instrument_type_translation:
       default: "s"
 
   example_survey:
@@ -144,7 +154,7 @@ translation_rules:
           value: 4
         - expr: "z_err >= 0.001"
           value: 3
-    type_translation:
+    instrument_type_translation:
       "SPEC": "s"
       "GRISM": "g"
       "PHOTO": "p"
