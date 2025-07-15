@@ -23,8 +23,9 @@ inputs:
     # - path: full path to the file
     # - internal_name: unique label used internally
     # - columns: mapping from standard keys to column names in the file
+
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2dfgrs_final_release.parquet"
-      internal_name: "001_2dfgrs_final_release"
+      internal_name: "2dfgrs_final_release"
       columns:
         id: "name"
         ra: "ra_j2000_deg"
@@ -35,7 +36,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2dflens_final_release.parquet"
-      internal_name: "002_2dflens_final_release"
+      internal_name: "2dflens_final_release"
       columns:
         id: "unique_id"
         ra: "RA"
@@ -46,7 +47,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2mrs_v240.parquet"
-      internal_name: "003_2mrs_v240"
+      internal_name: "2mrs_v240"
       columns:
         id: "TMID"
         ra: "RA"
@@ -56,8 +57,30 @@ inputs:
         z_err: "redshift_err"
         survey: "survey_name"
 
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/6dfgs_dr3.parquet"
+      internal_name: "6dfgs_dr3"
+      columns:
+        id: "SPECID"
+        ra: "RA_deg"
+        dec: "DEC_deg"
+        z: "Z"
+        z_flag: "QUALITY"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/desi_dr1_in_lsst_dp1_fields.parquet"
+      internal_name: "desi_dr1"
+      columns:
+        id: "TARGETID"
+        ra: "TARGET_RA"
+        dec: "TARGET_DEC"
+        z: "Z"
+        z_flag: "ZWARN"
+        z_err: "ZERR"
+        survey: "survey_name"
+
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/jades_dr3.parquet"
-      internal_name: "004_jades_dr3"
+      internal_name: "jades_dr3"
       columns:
         id: "unique_id"
         ra: "RA_TARG"
@@ -67,14 +90,58 @@ inputs:
         z_err: null
         survey: "survey_name"
 
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/mosdef_final_release.parquet"
+      internal_name: "mosdef_final_release"
+      columns:
+        id: "ID"
+        ra: "RA"
+        dec: "DEC"
+        z: "Z_MOSFIRE"
+        z_flag: "Z_QUAL"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/ozdes_dr2.parquet"
+      internal_name: "ozdes_dr2"
+      columns:
+        id: "OzDES_ID"
+        ra: "Alpha_J2000"
+        dec: "Delta_J2000"
+        z: "z"
+        z_flag: "qop"
+        z_err: null
+        survey: "survey_name"
+
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/primus_dr1.parquet"
-      internal_name: "005_primus_dr1"
+      internal_name: "primus_dr1"
       columns:
         id: "OBJNAME"
         ra: "RA"
         dec: "DEC"
         z: "Z"
         z_flag: "ZQUALITY"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/vandels_dr4.parquet"
+      internal_name: "vandels_dr4"
+      columns:
+        id: "id"
+        ra: "alpha"
+        dec: "delta"
+        z: "zspec"
+        z_flag: "zflg"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/vvds_final_release.parquet"
+      internal_name: "vvds_final_release"
+      columns:
+        id: "NUM"
+        ra: "ALPHA"
+        dec: "DELTA"
+        z: "Z"
+        z_flag: "ZFLAGS"
         z_err: null
         survey: "survey_name"
 
