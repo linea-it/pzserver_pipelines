@@ -1,6 +1,7 @@
 # combine_redshift_dedup/packages/specz.py
 
 import os
+import ast
 import glob
 import json
 import warnings
@@ -64,12 +65,27 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     for col in ["id", "z_flag", "instrument_type", "survey"]:
         if col in df.columns:
             try:
-                df[col] = df[col].fillna("").astype(str)
-                if col == "survey":
-                    df[col] = df[col].str.strip().str.upper()
+                if col == "z_flag":
+                    # Clean z_flag: if it's a float like 1.0, convert to "1"; keep letters or valid strings unchanged
+                    def clean_z_flag(val):
+                        if pd.isna(val):
+                            return ""
+                        try:
+                            val_float = float(val)
+                            if val_float.is_integer():
+                                return str(int(val_float))  # e.g., 1.0 → "1"
+                            return str(val_float)          # e.g., 1.3 → "1.3"
+                        except Exception:
+                            return str(val).strip()         # handle string values (e.g., "A", "B")
+                    df[col] = df[col].map(clean_z_flag, meta=(col, str))
+                else:
+                    # Convert to string and strip whitespace; for 'survey', also uppercase
+                    df[col] = df[col].fillna("").astype(str)
+                    if col == "survey":
+                        df[col] = df[col].str.strip().str.upper()
             except Exception as e:
                 logger.warning(f"⚠️ Failed to convert column '{col}' to str: {e}")
-    
+
     # Float columns
     for col in ["ra", "dec", "z", "z_err"]:
         if col in df.columns:
@@ -120,23 +136,103 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         for survey_name, rules in translation_config.get("translation_rules", {}).items()
     }
 
+    def is_z_flag_numeric(expr: str) -> bool:
+        """
+        Checks whether the expression compares z_flag to a numeric value (int/float).
+        Returns True if so; False if compared to a string or not involved.
+        """
+        try:
+            tree = ast.parse(expr, mode="eval")
+        except SyntaxError:
+            return False  # Invalid expression
+    
+        class ZFlagComparisonVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.numeric = False
+    
+            def visit_Compare(self, node):
+                if isinstance(node.left, ast.Name) and node.left.id == "z_flag":
+                    for comp in node.comparators:
+                        if isinstance(comp, (ast.Num, ast.Constant)) and isinstance(comp.value, (int, float)):
+                            self.numeric = True
+                self.generic_visit(node)
+    
+        visitor = ZFlagComparisonVisitor()
+        visitor.visit(tree)
+        return visitor.numeric
+
     def apply_translation(row, key):
         survey = row.get("survey")
-        rules = translation_rules_uc.get(survey, {})
-        rule = rules.get(f"{key}_translation", {})
+        rules = translation_rules_uc.get(survey, {})  # Get translation rules for the current survey
+        rule = rules.get(f"{key}_translation", {})    # Select rules for the requested key (e.g., z_flag or instrument_type)
         val = row.get(key)
-
-        if val in rule:
-            return rule[val]
+    
+        # Normalize the value from the row
+        # - Convert floats like 1.0 to "1"
+        # - Preserve strings like "A", "B", etc.
+        if pd.isna(val):
+            val = ""
+        else:
+            val = str(val).strip()
+            try:
+                val_float = float(val)
+                if val_float.is_integer():
+                    val = str(int(val_float))  # e.g., 1.0 → "1"
+            except Exception:
+                pass  # If not convertible to float, keep as string
+    
+        # Normalize the keys of the translation rule dictionary
+        # This ensures that keys like "1.0" and "1" are treated the same
+        normalized_rule = {}
+        for k, v in rule.items():
+            if k == "conditions" or k == "default":
+                continue  # Skip special keys
+            try:
+                k_float = float(k)
+                if k_float.is_integer():
+                    k_norm = str(int(k_float))  # e.g., "1.0" → "1"
+                else:
+                    k_norm = str(k_float)       # e.g., "1.5" → "1.5"
+            except Exception:
+                k_norm = str(k).strip()         # If not a number, treat as cleaned string
+            normalized_rule[k_norm] = v
+    
+        # Try direct match between the normalized value and normalized keys
+        if val in normalized_rule:
+            return normalized_rule[val]
+    
+        # If no direct match, evaluate conditional expressions if provided
         if "conditions" in rule:
             for cond in rule["conditions"]:
+                expr = cond["expr"]
+                context = row.to_dict()
+        
+                # If z_flag is used in a numeric expression, convert it to float or np.nan
+                if "z_flag" in context and is_z_flag_numeric(expr):
+                    zval = context["z_flag"]
+                    if isinstance(zval, str) and zval.strip() == "":
+                        context["z_flag"] = np.nan
+                    else:
+                        try:
+                            context["z_flag"] = float(zval)
+                        except Exception as e:
+                            raise ValueError(
+                                f"Failed to convert z_flag='{zval}' to float for numeric condition '{expr}' in survey '{survey}': {e}"
+                            )
+        
                 try:
-                    if eval(cond["expr"], {}, row.to_dict()):
+                    if eval(expr, {}, context):
                         return cond["value"]
-                except Exception:
-                    continue
+                except Exception as e:
+                    raise ValueError(
+                        f"Error evaluating condition '{expr}' for survey '{survey}': {e}"
+                    )
+
+        # Fallback: return default value if defined
         if "default" in rule:
             return rule["default"]
+    
+        # If nothing matched, return NaN
         return np.nan
 
     # Check and compute homogenized z_flag and instrument_type only if not present
@@ -344,6 +440,25 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         compute_in_dp1_fields,
         meta=df._meta.assign(is_in_DP1_fields=np.int64())
     )
+
+    def extract_variables_from_expr(expr):
+        """Extracts variable names used in a Python expression string."""
+        try:
+            tree = ast.parse(expr, mode="eval")
+        except Exception:
+            return set()
+        
+        class VariableVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.variables = set()
+    
+            def visit_Name(self, node):
+                self.variables.add(node.id)
+                self.generic_visit(node)
+    
+        visitor = VariableVisitor()
+        visitor.visit(tree)
+        return visitor.variables
     
     # Default required output columns
     final_columns = [
@@ -364,15 +479,35 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     ]
     final_columns += extra_columns
     
+    # Detect additional columns used in conditional expressions (e.g., "ZCAT_PRIMARY")
+    extra_expr_columns = set()
+    for ruleset in translation_rules_uc.values():
+        for key in ["z_flag_translation", "instrument_type_translation"]:
+            rule = ruleset.get(key, {})
+            for cond in rule.get("conditions", []):
+                expr = cond.get("expr", "")
+                variables = extract_variables_from_expr(expr)
+                extra_expr_columns.update(variables)
+    
+    # Exclude standard and already-included columns
+    standard_cols = {"id", "ra", "dec", "z", "z_flag", "z_err", "instrument_type", "survey"}
+    already_included = set(final_columns)
+    needed_expr_cols = [
+        col for col in extra_expr_columns
+        if col not in standard_cols and col in df.columns and col not in already_included
+    ]
+    final_columns += needed_expr_cols
+    
     # Remove duplicates while preserving order
     final_columns = list(dict.fromkeys(final_columns))
     
     # Select only columns that actually exist in the DataFrame
     df = df[[col for col in final_columns if col in df.columns]]
-
+    
+    # Save output Parquet
     out_path = os.path.join(temp_dir, f"prepared_{product_name}")
     df.to_parquet(out_path, write_index=False)
-
+    
     return out_path, "ra", "dec", product_name
 
 def import_catalog(path, ra_col, dec_col, artifact_name, output_path, client):
