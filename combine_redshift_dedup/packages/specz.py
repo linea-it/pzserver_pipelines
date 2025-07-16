@@ -5,6 +5,7 @@ import re
 import ast
 import glob
 import json
+import lsdb
 import warnings
 from collections import defaultdict
 import numpy as np
@@ -510,36 +511,59 @@ def prepare_catalog(entry, translation_config, temp_dir, combine_mode="concatena
     
     return out_path, "ra", "dec", product_name, compared_to_path
 
-def import_catalog(path, ra_col, dec_col, artifact_name, output_path, client):
+def import_catalog(path, ra_col, dec_col, artifact_name, output_path, client, size_threshold_mb=500):
     """
     Import a Parquet catalog into HATS format.
-
+    Uses lightweight method for small catalogs (< size_threshold_mb).
+    
     Args:
-        path (str): Path to input Parquet files.
+        path (str): Path to input Parquet files or directory.
         ra_col (str): RA column name.
         dec_col (str): DEC column name.
-        artifact_name (str): Name for the output HATS artifact.
-        output_path (str): Directory to save output.
-        client (Client): Dask client to run the pipeline.
+        artifact_name (str): Output HATS catalog name.
+        output_path (str): Directory to save HATS output.
+        client (Client): Dask client for large catalog import.
+        size_threshold_mb (int): Threshold to decide method (in MB).
     """
-    if os.path.exists(os.path.join(path, "base")):
-        parquet_files = glob.glob(os.path.join(path, "base", "*.parquet"))
+    logger = get_global_logger()
+
+    # Detect parquet file paths
+    base_path = os.path.join(path, "base")
+    if os.path.exists(base_path):
+        parquet_files = glob.glob(os.path.join(base_path, "*.parquet"))
     else:
         parquet_files = glob.glob(os.path.join(path, "*.parquet"))
 
-    if len(parquet_files) == 0:
+    if not parquet_files:
         raise ValueError(f"No Parquet files found at {path}")
 
-    file_reader = ParquetReader()
-    args = ImportArguments(
-        ra_column=ra_col,
-        dec_column=dec_col,
-        input_file_list=parquet_files,
-        file_reader=file_reader,
-        output_artifact_name=artifact_name,
-        output_path=output_path,
-    )
-    pipeline_with_client(args, client)
+    # Compute total size
+    total_size_mb = sum(os.path.getsize(f) for f in parquet_files) / 1024**2
+
+    hats_path = os.path.join(output_path, artifact_name)
+
+    if total_size_mb <= size_threshold_mb:
+        logger.info(f"⚡ Small catalog detected ({total_size_mb:.1f} MB). Using direct `to_hats()` method.")
+        df = pd.read_parquet(parquet_files)
+        catalog = lsdb.from_dataframe(
+            df,
+            catalog_name=artifact_name,
+            ra_column=ra_col,
+            dec_column=dec_col
+        )
+        catalog.to_hats(hats_path, overwrite=True)
+    else:
+        logger.info(f"🧱 Large catalog detected ({total_size_mb:.1f} MB). Using distributed HATS import.")
+        file_reader = ParquetReader()
+        args = ImportArguments(
+            ra_column=ra_col,
+            dec_column=dec_col,
+            input_file_list=parquet_files,
+            file_reader=file_reader,
+            output_artifact_name=artifact_name,
+            output_path=output_path,
+        )
+        pipeline_with_client(args, client)
 
 def generate_margin_cache_safe(hats_path, output_path, artifact_name, client):
     """
