@@ -1,10 +1,12 @@
 import argparse
 import os
+import re
 import time
 import json
 import shutil
 import pandas as pd
 import numpy as np
+from dask import delayed, compute
 import dask.dataframe as dd
 from pathlib import Path
 from collections import defaultdict
@@ -113,32 +115,62 @@ def main(config_path, cwd=".", base_dir_override=None):
     # === Initialize Dask cluster ===
     cluster = get_executor(config["executor"], logs_dir=logs_dir)
     client = Client(cluster)
-
-    # === Load or initialize comparison state ===
-    if os.path.exists(compared_to_path):
-        with open(compared_to_path, "r") as f:
-            compared_to_dict = json.load(f)
-        compared_to_dict = defaultdict(list, compared_to_dict)
-    else:
-        compared_to_dict = defaultdict(list)
-
-    # === Prepare catalogs ===
+    
+    # === Prepare catalogs in parallel using Dask Delayed ===
     logger.info(f"🧰 Preparing {len(catalogs)} input catalogs")
-    prepared_paths = []
+    
+    delayed_prepared_paths = []
+    
     for entry in catalogs:
         tag = f"prepare_{entry['internal_name']}"
         filename = os.path.basename(entry["path"])
         logger.info(f"📦 Preparing catalog: {entry['internal_name']} ({filename})")
+    
         if tag not in completed:
-            path_info = prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combine_mode)
-            log_step(log_file, tag)
+            result = delayed(prepare_catalog)(entry, translation_config, temp_dir, combine_mode)
+            delayed_prepared_paths.append(result)
         else:
             logger.info(f"⏩ Catalog {entry['internal_name']} already prepared. Skipping.")
-            path_info = (
-                os.path.join(temp_dir, f"prepared_{entry['internal_name']}"),
-                "ra", "dec", entry["internal_name"]
-            )
-        prepared_paths.append(path_info)
+            prepared_path = os.path.join(temp_dir, f"prepared_{entry['internal_name']}")
+            match = re.match(r"(\d+)_", entry["internal_name"])
+            if match:
+                catalog_prefix = match.group(1)
+                compared_path = os.path.join(temp_dir, f"compared_to_dict_{catalog_prefix}.json")
+            else:
+                compared_path = ""
+            delayed_prepared_paths.append(delayed((prepared_path, "ra", "dec", entry["internal_name"], compared_path)))
+    
+    # === Trigger parallel computation ===
+    results = compute(*delayed_prepared_paths)
+    prepared_paths = [r[:4] for r in results]
+    compared_to_paths = [r[4] for r in results]
+    
+    # === Log completed steps
+    for entry in catalogs:
+        tag = f"prepare_{entry['internal_name']}"
+        if tag not in completed:
+            log_step(log_file, tag)
+    
+    # === Merge all individual compared_to_dict files ===
+    final_compared_to_dict = defaultdict(list)
+    for path in compared_to_paths:
+        if not path or not os.path.exists(path):
+            logger.warning(f"⚠️ Missing compared_to_dict file: {path}")
+            continue
+        with open(path, "r") as f:
+            local_dict = json.load(f)
+        for k, v in local_dict.items():
+            final_compared_to_dict[k].extend(v)
+    
+    # Deduplicate entries
+    for k in final_compared_to_dict:
+        final_compared_to_dict[k] = sorted(set(final_compared_to_dict[k]))
+    
+    # Save final dictionary
+    with open(compared_to_path, "w") as f:
+        json.dump(final_compared_to_dict, f)
+    
+    logger.info(f"📝 Saved final merged compared_to_dict to {compared_to_path}")
 
     # === Begin combination logic ===
     final_base_path = os.path.join(output_root_dir_and_output_dir, output_name)
@@ -208,9 +240,10 @@ def main(config_path, cwd=".", base_dir_override=None):
                     cat_curr = lsdb.read_hats(os.path.join(temp_dir, f"cat{i}_hats"))
 
                 logger.info(f"🔄 Crossmatching previous result with: {internal_name}")
+                
                 cat_prev = crossmatch_tiebreak_safe(
                     cat_prev, cat_curr, tiebreaking_priority, temp_dir, i, client,
-                    compared_to_dict, instrument_type_priority, translation_config
+                    final_compared_to_dict, instrument_type_priority, translation_config
                 )
 
                 if delete_temp_files and i > 1:
@@ -232,11 +265,7 @@ def main(config_path, cwd=".", base_dir_override=None):
             logger.error(f"❌ Final merged Parquet folder not found: {final_merged}")
             client.close(); cluster.close(); return
 
-        if os.path.exists(compared_to_path):
-            with open(compared_to_path, "r") as f:
-                compared_to_dict = json.load(f)
-        else:
-            compared_to_dict = {}
+        compared_to_dict = final_compared_to_dict
 
         df_final = dd.read_parquet(final_merged).compute()
         df_final["compared_to"] = df_final["CRD_ID"].map(lambda x: ",".join(compared_to_dict.get(str(x), [])))

@@ -7,15 +7,15 @@ executor:
   name: "slurm"  # Name of the job scheduler
   args:
     instance:
-      cores: 50         # Number of cores per job
+      cores: 28         # Number of cores per job
       processes: 1      # Number of processes per job
-      memory: "120GB"   # Memory allocated per job
+      memory: "64GB"   # Memory allocated per job
       queue: "cpu"      # Queue name
       job_extra_directives:  # Extra directives for Slurm
         - "--propagate"
         - "--time=2:00:00"
-    adapt:
-      maximum_jobs: 10  # Maximum number of jobs that Dask may scale to
+    scale:
+      jobs: 10  # Fixed number of dask jobs
 
 inputs:
   specz:
@@ -25,7 +25,7 @@ inputs:
     # - columns: mapping from standard keys to column names in the file
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2dfgrs_final_release.parquet"
-      internal_name: "2dfgrs_final_release"
+      internal_name: "001_2dfgrs_final_release"
       columns:
         id: "name"
         ra: "ra_j2000_deg"
@@ -36,7 +36,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2dflens_final_release.parquet"
-      internal_name: "2dflens_final_release"
+      internal_name: "002_2dflens_final_release"
       columns:
         id: "unique_id"
         ra: "RA"
@@ -47,7 +47,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2mrs_v240.parquet"
-      internal_name: "2mrs_v240"
+      internal_name: "003_2mrs_v240"
       columns:
         id: "TMID"
         ra: "RA"
@@ -58,7 +58,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/6dfgs_dr3.parquet"
-      internal_name: "6dfgs_dr3"
+      internal_name: "004_6dfgs_dr3"
       columns:
         id: "SPECID"
         ra: "RA_deg"
@@ -69,7 +69,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/desi_dr1_in_lsst_dp1_fields.parquet"
-      internal_name: "desi_dr1"
+      internal_name: "005_desi_dr1"
       columns:
         id: "TARGETID"
         ra: "TARGET_RA"
@@ -80,7 +80,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/jades_dr3.parquet"
-      internal_name: "jades_dr3"
+      internal_name: "006_jades_dr3"
       columns:
         id: "unique_id"
         ra: "RA_TARG"
@@ -91,7 +91,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/mosdef_final_release.parquet"
-      internal_name: "mosdef_final_release"
+      internal_name: "007_mosdef_final_release"
       columns:
         id: "ID"
         ra: "RA"
@@ -102,7 +102,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/ozdes_dr2.parquet"
-      internal_name: "ozdes_dr2"
+      internal_name: "008_ozdes_dr2"
       columns:
         id: "OzDES_ID"
         ra: "Alpha_J2000"
@@ -113,7 +113,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/primus_dr1.parquet"
-      internal_name: "primus_dr1"
+      internal_name: "009_primus_dr1"
       columns:
         id: "OBJNAME"
         ra: "RA"
@@ -124,7 +124,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/vandels_dr4.parquet"
-      internal_name: "vandels_dr4"
+      internal_name: "010_vandels_dr4"
       columns:
         id: "id"
         ra: "alpha"
@@ -135,7 +135,7 @@ inputs:
         survey: "survey_name"
 
     - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/vvds_final_release.parquet"
-      internal_name: "vvds_final_release"
+      internal_name: "011_vvds_final_release"
       columns:
         id: "NUM"
         ra: "ALPHA"
