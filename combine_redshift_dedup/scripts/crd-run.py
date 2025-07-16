@@ -4,6 +4,7 @@ import re
 import time
 import json
 import shutil
+import warnings
 import pandas as pd
 import numpy as np
 from dask import delayed, compute
@@ -76,6 +77,15 @@ def main(config_path, cwd=".", base_dir_override=None):
     set_global_logger(logger)
     log_and_print(f"📄 Loading config from {config_path}", logger)
     configure_warning_handler(logger)
+
+    # Suppress only the "Sending large graph" warnings from Dask
+    warnings.filterwarnings(
+        "ignore",
+        message=".*Sending large graph of size.*",
+        category=UserWarning,
+        module="distributed"
+    )
+    
     configure_exception_hook(logger, process_info, process_info_path)
 
     # === Load translation configuration ===
