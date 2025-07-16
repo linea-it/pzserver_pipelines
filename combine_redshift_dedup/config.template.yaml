@@ -7,9 +7,9 @@ executor:
   name: "slurm"  # Name of the job scheduler
   args:
     instance:
-      cores: 28         # Number of cores per job
+      cores: 25         # Number of cores per job
       processes: 1      # Number of processes per job
-      memory: "64GB"   # Memory allocated per job
+      memory: "50GB"   # Memory allocated per job
       queue: "cpu"      # Queue name
       job_extra_directives:  # Extra directives for Slurm
         - "--propagate"
