@@ -8,7 +8,7 @@ import lsdb
 
 from combine_redshift_dedup.packages.utils import get_global_logger, log_and_print
 
-def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, step, client, compared_to_dict, instrument_type_priority, translation_config):
+def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, step, client, compared_to_dict, instrument_type_priority, translation_config, do_import=True):
 
     logger = get_global_logger()
     
@@ -279,10 +279,12 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
     merged.to_parquet(merged_path, write_index=False)
 
     # Import merged catalog to HATS
-    from combine_redshift_dedup.packages.specz import import_catalog
-    import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, client)
-
-    return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats"))
+    if do_import:
+        from combine_redshift_dedup.packages.specz import import_catalog
+        import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, client)
+        return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats"))
+    else:
+        return merged_path
 
 def crossmatch_tiebreak_safe(*args, **kwargs):
 
@@ -313,9 +315,12 @@ def crossmatch_tiebreak_safe(*args, **kwargs):
             merged_path = os.path.join(temp_dir, f"merged_step{step}")
             merged.to_parquet(merged_path, write_index=False)
 
-            from combine_redshift_dedup.packages.specz import import_catalog
-            import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, client)
-
-            return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats"))
+            # Import merged catalog to HATS
+            if kwargs.get("do_import", True):  # novo controle aqui também
+                from combine_redshift_dedup.packages.specz import import_catalog
+                import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, client)
+                return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats"))
+            else:
+                return merged_path
         else:
             raise
