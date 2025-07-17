@@ -102,7 +102,7 @@ class Runner:
             ra = columns.get("ra", "ra")
             dec = columns.get("dec", "dec")
 
-            specz_df = lsdb.from_dataframe(df, ra_column=ra, dec_column=dec)
+            specz_df = lsdb.from_dataframe(df, use_pyarrow_types=False, ra_column=ra, dec_column=dec)
 
             # dataset_path = self.inputs.get("dataset").get("path")
             # margin_cache_path = self.inputs.get("dataset").get("margin_path", None)
