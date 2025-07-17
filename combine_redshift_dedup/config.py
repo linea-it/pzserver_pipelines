@@ -9,17 +9,18 @@ DATASETS_DIR = os.getenv("DATASETS_DIR", "/datasets")
 class Slurm(BaseModel):
 
     class Instance(BaseModel):
-        cores: int = 54
+        cores: int = 25
         processes: int = 1
-        memory: str = "123GiB"
-        queue: str = "cpu"
+        memory: str = "50GB"
+        queue: str = "lsst_cpu"
+        account: str = "hpc-lsst"
         job_extra_directives: list[str] = ["--propagate", "--time=2:00:00"]
 
-    class Adapt(BaseModel):
-        maximum_jobs: int = 10
+    class Scale(BaseModel):
+        jobs: int = 10
 
     instance: Instance = Instance()
-    adapt: Adapt = Adapt()
+    scale: Scale = Scale()
 
 
 class Local(BaseModel):
