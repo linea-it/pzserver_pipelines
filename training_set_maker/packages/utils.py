@@ -5,7 +5,18 @@ from typing import Any
 import yaml
 
 
-def setup_logger(name="tsm", logdir='.'):
+def create_logdir(cwd: str) -> pathlib.Path:
+    """Create a log directory if it does not exist.
+    Args:
+        cwd (str): Current working directory where the log directory will be created.
+    """
+    logdir = pathlib.Path(cwd, "logs")
+    if not logdir.exists():
+        logdir.mkdir(parents=True, exist_ok=True)
+    return logdir
+
+
+def setup_logger(name="tsm", logdir="."):
     """
     Configures the logger for recording events and messages.
 
@@ -44,12 +55,12 @@ def load_yml(filepath: str) -> Any:
 
 
 def dump_yml(filepath, content, encoding="utf-8"):
-    """ Dump yaml file
+    """Dump yaml file
 
     Args:
         filepath (str): filepath output
         content (dict): yaml content
     """
 
-    with open(filepath, 'w', encoding=encoding) as _file:
+    with open(filepath, "w", encoding=encoding) as _file:
         yaml.dump(content, _file)
