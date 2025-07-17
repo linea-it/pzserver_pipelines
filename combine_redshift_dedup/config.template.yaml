@@ -3,19 +3,20 @@
 # http://docs.ansible.com/ansible/latest/YAMLSyntax.html
 # More general reference: http://www.yaml.org/spec/1.2/spec.html
 
-executor: 
-  name: "slurm"  # Name of the job scheduler
+executor:
+  name: "slurm" # Name of the job scheduler
   args:
     instance:
-      cores: 25         # Number of cores per job
-      processes: 1      # Number of processes per job
-      memory: "50GB"   # Memory allocated per job
-      queue: "cpu"      # Queue name
-      job_extra_directives:  # Extra directives for Slurm
+      cores: 25 # Number of cores per job
+      processes: 1 # Number of processes per job
+      memory: "50GB" # Memory allocated per job
+      queue: "lsst_cpu" # Queue name
+      account: "hpc-lsst"
+      job_extra_directives: # Extra directives for Slurm
         - "--propagate"
         - "--time=2:00:00"
     scale:
-      jobs: 10  # Fixed number of dask jobs
+      jobs: 10 # Fixed number of dask jobs
 
 inputs:
   specz:
@@ -146,10 +147,10 @@ inputs:
         survey: "survey_name"
 
 output_root_dir: "process001"
-output_dir: "outputs"     # Relative directory for final outputs
-output_name: "crd"        # Name prefix for the final output files
-output_format: "parquet"  # Output format: csv, parquet, hdf5, or fits
+output_dir: "outputs" # Relative directory for final outputs
+output_name: "crd" # Name prefix for the final output files
+output_format: "parquet" # Output format: csv, parquet, hdf5, or fits
 
 param:
-    combine_type: "concatenate_and_mark_duplicates"  # Options: "concatenate", "concatenate_and_mark_duplicates", or "concatenate_and_remove_duplicates"
-    flags_translation_file: flags_translation.yaml   # File with homogenization rules for z_flag and type
+  combine_type: "concatenate_and_mark_duplicates" # Options: "concatenate", "concatenate_and_mark_duplicates", or "concatenate_and_remove_duplicates"
+  flags_translation_file: flags_translation.yaml # File with homogenization rules for z_flag and type
