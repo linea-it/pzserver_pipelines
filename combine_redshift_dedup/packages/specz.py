@@ -1,10 +1,13 @@
 # combine_redshift_dedup/packages/specz.py
 
 import os
+import re
 import ast
 import glob
 import json
+import lsdb
 import warnings
+from collections import defaultdict
 import numpy as np
 import pandas as pd
 import dask.dataframe as dd
@@ -20,7 +23,7 @@ from combine_redshift_dedup.packages.utils import (
 )
 
 
-def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combine_mode="concatenate_and_mark_duplicates"):
+def prepare_catalog(entry, translation_config, temp_dir, combine_mode="concatenate_and_mark_duplicates"):
     """
     Load, standardize, and prepare a redshift catalog for combination.
 
@@ -37,7 +40,6 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         entry (dict): Catalog configuration entry.
         translation_config (dict): Config with translation rules and thresholds.
         temp_dir (str): Temporary output directory.
-        compared_to_dict (defaultdict): Tracks pairs of compared objects.
         combine_mode (str): Combine mode (concatenate / mark / remove duplicates).
 
     Returns:
@@ -94,27 +96,30 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
             except Exception as e:
                 logger.warning(f"⚠️ Failed to convert column '{col}' to float: {e}")
 
-    # === Generate unique CRD_IDs ===
-    counter_path = os.path.join(temp_dir, "crd_id_counter.json")
-    if os.path.exists(counter_path):
-        with open(counter_path, "r") as f:
-            last_counter = json.load(f).get("last_id", 0)
-    else:
-        last_counter = 0
+    # === Generate unique CRD_IDs using product_name prefix ===
+    match = re.match(r"(\d+)_", product_name)
+    if not match:
+        raise ValueError(f"❌ Could not extract numeric prefix from internal_name '{product_name}'")
+    catalog_prefix = match.group(1)  # e.g., "001"
 
-    # Determine partition sizes and offsets for ID generation
+    # Define path and initialize dict for all modes
+    compared_to_filename = f"compared_to_dict_{catalog_prefix}.json"
+    compared_to_path = os.path.join(temp_dir, compared_to_filename)
+    compared_to_dict_solo = defaultdict(list)
+    
+    # Get partition sizes and offsets
     sizes = df.map_partitions(len).compute().tolist()
-    offsets = [last_counter]
+    offsets = [0]
     for s in sizes[:-1]:
         offsets.append(offsets[-1] + s)
-
-    # Assign CRD_ID to each row
+    
+    # Assign CRD_IDs: CRD{catalog_prefix}_{i}
     def generate_crd_id(partition, start):
         n = len(partition)
         partition = partition.copy()
-        partition["CRD_ID"] = [f"CRD{start + i + 1}" for i in range(n)]
+        partition["CRD_ID"] = [f"CRD{catalog_prefix}_{start + i + 1}" for i in range(n)]
         return partition
-
+    
     dfs = [
         df.get_partition(i).map_partitions(
             generate_crd_id, offset,
@@ -123,9 +128,6 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
         for i, offset in enumerate(offsets)
     ]
     df = dd.concat(dfs)
-
-    with open(counter_path, "w") as f:
-        json.dump({"last_id": last_counter + sum(sizes)}, f)
 
     # Initialize tie_result to 1 (default: kept)
     df["tie_result"] = 1
@@ -369,12 +371,12 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
 
                 tie_updates.append(group[["CRD_ID", "tie_result"]].copy())
 
-                # Update compared_to_dict for reporting
+                # Update compared_to_dict_solo for reporting
                 ids_all = group["CRD_ID"].tolist()
                 for i, id1 in enumerate(ids_all):
                     for id2 in ids_all[i + 1:]:
-                        compared_to_dict.setdefault(id1, []).append(id2)
-                        compared_to_dict.setdefault(id2, []).append(id1)
+                        compared_to_dict_solo.setdefault(id1, []).append(id2)
+                        compared_to_dict_solo.setdefault(id2, []).append(id1)
 
             # Merge tie updates back to main dataframe
             if tie_updates:
@@ -389,10 +391,9 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
                     tie_update_dd, on="CRD_ID", how="left"
                 ).fillna({"tie_result": 1})
 
-
-            # Save compared_to_dict for debugging / later use
-            with open(os.path.join(temp_dir, "compared_to.json"), "w") as f:
-                json.dump(compared_to_dict, f)
+    # Save compared_to_dict even if it's empty (for concatenate mode)
+    with open(compared_to_path, "w") as f:
+        json.dump(compared_to_dict_solo, f)
 
     # === Flag objects inside any DP1 region ===
     # Hardcoded list of DP1 regions: (RA_center, DEC_center, radius_deg)
@@ -508,38 +509,61 @@ def prepare_catalog(entry, translation_config, temp_dir, compared_to_dict, combi
     out_path = os.path.join(temp_dir, f"prepared_{product_name}")
     df.to_parquet(out_path, write_index=False)
     
-    return out_path, "ra", "dec", product_name
+    return out_path, "ra", "dec", product_name, compared_to_path
 
-def import_catalog(path, ra_col, dec_col, artifact_name, output_path, client):
+def import_catalog(path, ra_col, dec_col, artifact_name, output_path, client, size_threshold_mb=500):
     """
     Import a Parquet catalog into HATS format.
-
+    Uses lightweight method for small catalogs (< size_threshold_mb).
+    
     Args:
-        path (str): Path to input Parquet files.
+        path (str): Path to input Parquet files or directory.
         ra_col (str): RA column name.
         dec_col (str): DEC column name.
-        artifact_name (str): Name for the output HATS artifact.
-        output_path (str): Directory to save output.
-        client (Client): Dask client to run the pipeline.
+        artifact_name (str): Output HATS catalog name.
+        output_path (str): Directory to save HATS output.
+        client (Client): Dask client for large catalog import.
+        size_threshold_mb (int): Threshold to decide method (in MB).
     """
-    if os.path.exists(os.path.join(path, "base")):
-        parquet_files = glob.glob(os.path.join(path, "base", "*.parquet"))
+    logger = get_global_logger()
+
+    # Detect parquet file paths
+    base_path = os.path.join(path, "base")
+    if os.path.exists(base_path):
+        parquet_files = glob.glob(os.path.join(base_path, "*.parquet"))
     else:
         parquet_files = glob.glob(os.path.join(path, "*.parquet"))
 
-    if len(parquet_files) == 0:
+    if not parquet_files:
         raise ValueError(f"No Parquet files found at {path}")
 
-    file_reader = ParquetReader()
-    args = ImportArguments(
-        ra_column=ra_col,
-        dec_column=dec_col,
-        input_file_list=parquet_files,
-        file_reader=file_reader,
-        output_artifact_name=artifact_name,
-        output_path=output_path,
-    )
-    pipeline_with_client(args, client)
+    # Compute total size
+    total_size_mb = sum(os.path.getsize(f) for f in parquet_files) / 1024**2
+
+    hats_path = os.path.join(output_path, artifact_name)
+
+    if total_size_mb <= size_threshold_mb:
+        logger.info(f"⚡ Small catalog detected ({total_size_mb:.1f} MB). Using direct `to_hats()` method.")
+        df = pd.read_parquet(parquet_files)
+        catalog = lsdb.from_dataframe(
+            df,
+            catalog_name=artifact_name,
+            ra_column=ra_col,
+            dec_column=dec_col
+        )
+        catalog.to_hats(hats_path, overwrite=True)
+    else:
+        logger.info(f"🧱 Large catalog detected ({total_size_mb:.1f} MB). Using distributed HATS import.")
+        file_reader = ParquetReader()
+        args = ImportArguments(
+            ra_column=ra_col,
+            dec_column=dec_col,
+            input_file_list=parquet_files,
+            file_reader=file_reader,
+            output_artifact_name=artifact_name,
+            output_path=output_path,
+        )
+        pipeline_with_client(args, client)
 
 def generate_margin_cache_safe(hats_path, output_path, artifact_name, client):
     """

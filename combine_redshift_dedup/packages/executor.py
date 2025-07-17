@@ -28,7 +28,7 @@ def get_executor(executor_config, logs_dir=None):
     
     elif executor_name == "slurm":
         instance_cfg = args.get("instance", {})
-        adapt_cfg = args.get("adapt", {})
+        scale_cfg = args.get("scale", {})
 
         if logs_dir:
             extra_directives = instance_cfg.get("job_extra_directives", [])
@@ -39,7 +39,7 @@ def get_executor(executor_config, logs_dir=None):
             instance_cfg["job_extra_directives"] = extra_directives
 
         cluster = SLURMCluster(**instance_cfg)
-        cluster.adapt(**adapt_cfg)
+        cluster.scale(**scale_cfg)
     
     else:
         logger.warning(f"Unknown executor '{executor_name}'. Falling back to minimal local cluster.")
