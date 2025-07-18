@@ -50,23 +50,15 @@ def setup_logger(name="combine_redshift_dedup", logdir="."):
 _global_logger = None
 
 def set_global_logger(logger):
-    """
-    Store a logger globally so it can be accessed from other modules.
-
-    Args:
-        logger (logging.Logger): The logger instance to store.
-    """
     global _global_logger
     _global_logger = logger
 
 def get_global_logger():
     """
     Retrieve the globally stored logger.
-
-    Returns:
-        logging.Logger or None: The stored logger or None if not set.
+    Falls back to `logging.getLogger(__name__)` if not set.
     """
-    return _global_logger
+    return _global_logger or logging.getLogger(__name__)
 
 def log_and_print(message, logger):
     """

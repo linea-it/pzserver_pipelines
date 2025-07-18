@@ -44,28 +44,27 @@ translation_rules:
 
   2DFGRS:
     z_flag_translation:
-      "1": 0
-      "2": 1
-      "3": 3
-      "4": 4
-      "5": 4
-    instrument_type_translation:
-      default: "s"   # All objects in this survey are considered spectroscopic
-
-  2DFLENS:
-    z_flag_translation:
-      "1": 0
-      "2": 1
-      "3": 3
-      "4": 4
-      "6": 6         # Special code indicating star
+      1: 0
+      2: 1
+      3: 3
+      4: 4
+      5: 4
     instrument_type_translation:
       default: "s"
 
-  # TO BE REVIEWED
+  2DFLENS:
+    z_flag_translation:
+      1: 0
+      2: 1
+      3: 3
+      4: 4
+      6: 6
+    instrument_type_translation:
+      default: "s"
+
   2MRS:
     z_flag_translation:
-      conditions:    # Use redshift error (z_err) to determine flag (preliminary criteria)
+      conditions:
         - expr: "z_err == 0"
           value: 3
         - expr: "0 < z_err < 0.0005"
@@ -77,15 +76,14 @@ translation_rules:
 
   6DFGS:
     z_flag_translation:
-      "1": 0
-      "2": 1
-      "3": 3
-      "4": 4
-      "6": 6
+      1: 0
+      2: 1
+      3: 3
+      4: 4
+      6: 6
     instrument_type_translation:
       default: "s"
 
-  # TO BE REVIEWED
   DESI:
     z_flag_translation:
       conditions:
@@ -102,118 +100,115 @@ translation_rules:
 
   JADES:
     z_flag_translation:
-      "A": 4
-      "B": 3
-      "C": 2
-      "D": 1
-      "E": 0
+      4: 4
+      3: 3
+      2: 2
+      1: 1
+      0: 0
     instrument_type_translation:
       default: "s"
 
-  # TO BE REVIEWED
   MOSDEF:
     z_flag_translation:
-      "7": 4
-      "6": 3
-      "5": 2
-      "4": 2
-      "3": 1
-      "2": 1
-      "1": 0
-      "0": 0
+      7: 4
+      6: 3
+      5: 2
+      4: 2
+      3: 1
+      2: 1
+      1: 0
+      0: 0
     instrument_type_translation:
       default: "s"
 
   OZDES:
     z_flag_translation:
-      "1": 0
-      "2": 1
-      "3": 3
-      "4": 4
-      "6": 6
+      1: 0
+      2: 1
+      3: 3
+      4: 4
+      6: 6
     instrument_type_translation:
       default: "s"
 
   PRIMUS:
     z_flag_translation:
-      "-1": 0
-      "2": 1
-      "3": 2
-      "4": 3
+      -1: 0
+      2: 1
+      3: 2
+      4: 3
     instrument_type_translation:
       default: "g"
 
-  # TO BE REVIEWED
   VANDELS:
     z_flag_translation:
-      "0": 0
-      "1": 1
-      "2": 2
-      "3": 4
-      "4": 4
-      "9": 3
-      "10": 0
-      "11": 1
-      "12": 2
-      "13": 4
-      "14": 4
-      "19": 3
-      "20": 0
-      "21": 1
-      "22": 2
-      "23": 4
-      "24": 4
-      "29": 3
-      "210": 0
-      "211": 1
-      "212": 2
-      "213": 4
-      "214": 4
-      "219": 3
+      0: 0
+      1: 1
+      2: 2
+      3: 4
+      4: 4
+      9: 3
+      10: 0
+      11: 1
+      12: 2
+      13: 4
+      14: 4
+      19: 3
+      20: 0
+      21: 1
+      22: 2
+      23: 4
+      24: 4
+      29: 3
+      210: 0
+      211: 1
+      212: 2
+      213: 4
+      214: 4
+      219: 3
     instrument_type_translation:
       default: "s"
 
-  # TO BE REVIEWED
   VVDS:
     z_flag_translation:
-      "0": 0 
-      "1": 1
-      "2": 2
-      "3": 3
-      "4": 4
-      "9": 2
-      "10": 0
-      "11": 1
-      "12": 2
-      "13": 3
-      "14": 4
-      "19": 2
-      "20": 0
-      "21": 1
-      "22": 2
-      "23": 3
-      "24": 4
-      "29": 2
-      "210": 0
-      "211": 1
-      "212": 2
-      "213": 3
-      "214": 4
-      "219": 2
+      0: 0 
+      1: 1
+      2: 2
+      3: 3
+      4: 4
+      9: 2
+      10: 0
+      11: 1
+      12: 2
+      13: 3
+      14: 4
+      19: 2
+      20: 0
+      21: 1
+      22: 2
+      23: 3
+      24: 4
+      29: 2
+      210: 0
+      211: 1
+      212: 2
+      213: 3
+      214: 4
+      219: 2
     instrument_type_translation:
       default: "s"
 
   example_survey:
     z_flag_translation:
-      "X": 4
-      "Y": 3
-      "Z": 2
+      88: 4
+      77: 3
+      66: 2
       conditions:
         - expr: "z_err < 0.001"
           value: 4
         - expr: "z_err >= 0.001"
           value: 3
     instrument_type_translation:
-      "SPEC": "s"
-      "GRISM": "g"
-      "PHOTO": "p"
+      spec: "s"
+      grism: "g"
+      photo: "p"
