@@ -293,10 +293,7 @@ def main(config_path, cwd=".", base_dir_override=None):
             logger.error(f"❌ Final merged Parquet folder not found: {final_merged}")
             client.close(); cluster.close(); return
 
-        compared_to_dict = final_compared_to_dict
-
         df_final = dd.read_parquet(final_merged).compute()
-        df_final["compared_to"] = df_final["CRD_ID"].map(lambda x: ",".join(compared_to_dict.get(str(x), [])))
 
         if combine_mode == "concatenate_and_remove_duplicates":
             before = len(df_final)

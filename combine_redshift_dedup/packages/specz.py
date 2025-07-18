@@ -6,9 +6,9 @@ import ast
 import glob
 import json
 import lsdb
+import numpy as np
 import warnings
 from collections import defaultdict
-import numpy as np
 import pandas as pd
 import dask.dataframe as dd
 
@@ -47,6 +47,9 @@ def prepare_catalog(entry, translation_config, temp_dir, combine_mode="concatena
     """
 
     logger = get_global_logger()
+    if logger is None:
+        import logging
+        logger = logging.getLogger(__name__)
     
     # === Load catalog and rename columns according to configuration ===
     ph = ProductHandle(entry["path"])
@@ -62,37 +65,53 @@ def prepare_catalog(entry, translation_config, temp_dir, combine_mode="concatena
         if col not in df.columns:
             df[col] = np.nan
 
-    # Standardize column types
-    # String columns
-    for col in ["id", "z_flag", "instrument_type", "survey"]:
+    # === Standardize column types ===
+    
+    # String columns (id, instrument_type, survey)
+    for col in ["id", "instrument_type", "survey"]:
+        if col in df.columns:
+            try:
+                df[col] = df[col].fillna("").astype(str)
+                if col == "survey":
+                    df[col] = df[col].str.strip().str.upper()
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to convert column '{col}' to str: {e}")
+    
+    # Float columns (ra, dec, z, z_err, z_flag)
+    for col in ["ra", "dec", "z", "z_err", "z_flag"]:
         if col in df.columns:
             try:
                 if col == "z_flag":
-                    # Clean z_flag: if it's a float like 1.0, convert to "1"; keep letters or valid strings unchanged
-                    def clean_z_flag(val):
-                        if pd.isna(val):
-                            return ""
-                        try:
-                            val_float = float(val)
-                            if val_float.is_integer():
-                                return str(int(val_float))  # e.g., 1.0 → "1"
-                            return str(val_float)          # e.g., 1.3 → "1.3"
-                        except Exception:
-                            return str(val).strip()         # handle string values (e.g., "A", "B")
-                    df[col] = df[col].map(clean_z_flag, meta=(col, str))
-                else:
-                    # Convert to string and strip whitespace; for 'survey', also uppercase
-                    df[col] = df[col].fillna("").astype(str)
-                    if col == "survey":
-                        df[col] = df[col].str.strip().str.upper()
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to convert column '{col}' to str: {e}")
+                    # Special case: JADES uses letter flags A→4.0, B→3.0, etc.
+                    letter_to_score = {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "E": 0.0}
 
-    # Float columns
-    for col in ["ra", "dec", "z", "z_err"]:
-        if col in df.columns:
-            try:
+                    def map_jades_partition(partition):
+                        partition = partition.copy()
+                        if "survey" not in partition or "z_flag" not in partition:
+                            return partition
+
+                        # Ensure z_flag is treated as string for mapping
+                        z_flag_str = partition["z_flag"].astype(str)
+
+                        # Mask for JADES rows
+                        mask = partition["survey"].str.upper() == "JADES"
+
+                        def map_flag(val):
+                            if pd.isna(val) or val == "":
+                                return np.nan
+                            val_str = str(val).strip().upper()
+                            return letter_to_score.get(val_str, np.nan)
+
+                        # Apply mapping only to JADES
+                        mapped = z_flag_str.where(~mask, z_flag_str.map(map_flag))
+                        partition["z_flag"] = mapped
+                        return partition
+
+                    df = df.map_partitions(map_jades_partition)
+
+                # Now cast to float
                 df[col] = df[col].astype(float)
+
             except Exception as e:
                 logger.warning(f"⚠️ Failed to convert column '{col}' to float: {e}")
 
@@ -138,104 +157,51 @@ def prepare_catalog(entry, translation_config, temp_dir, combine_mode="concatena
         for survey_name, rules in translation_config.get("translation_rules", {}).items()
     }
 
-    def is_z_flag_numeric(expr: str) -> bool:
-        """
-        Checks whether the expression compares z_flag to a numeric value (int/float).
-        Returns True if so; False if compared to a string or not involved.
-        """
-        try:
-            tree = ast.parse(expr, mode="eval")
-        except SyntaxError:
-            return False  # Invalid expression
-    
-        class ZFlagComparisonVisitor(ast.NodeVisitor):
-            def __init__(self):
-                self.numeric = False
-    
-            def visit_Compare(self, node):
-                if isinstance(node.left, ast.Name) and node.left.id == "z_flag":
-                    for comp in node.comparators:
-                        if isinstance(comp, (ast.Num, ast.Constant)) and isinstance(comp.value, (int, float)):
-                            self.numeric = True
-                self.generic_visit(node)
-    
-        visitor = ZFlagComparisonVisitor()
-        visitor.visit(tree)
-        return visitor.numeric
-
     def apply_translation(row, key):
         survey = row.get("survey")
-        rules = translation_rules_uc.get(survey, {})  # Get translation rules for the current survey
-        rule = rules.get(f"{key}_translation", {})    # Select rules for the requested key (e.g., z_flag or instrument_type)
+        rules = translation_rules_uc.get(survey, {})
+        rule = rules.get(f"{key}_translation", {})
         val = row.get(key)
     
-        # Normalize the value from the row
-        # - Convert floats like 1.0 to "1"
-        # - Preserve strings like "A", "B", etc.
+        # === Normalize value ===
         if pd.isna(val):
-            val = ""
+            val_norm = "" if isinstance(val, str) else val
+        elif isinstance(val, (int, float, np.number)):
+            val_norm = val
         else:
-            val = str(val).strip()
-            try:
-                val_float = float(val)
-                if val_float.is_integer():
-                    val = str(int(val_float))  # e.g., 1.0 → "1"
-            except Exception:
-                pass  # If not convertible to float, keep as string
+            val_norm = str(val).strip().lower()
     
-        # Normalize the keys of the translation rule dictionary
-        # This ensures that keys like "1.0" and "1" are treated the same
+        # === Normalize rule keys ===
         normalized_rule = {}
         for k, v in rule.items():
-            if k == "conditions" or k == "default":
-                continue  # Skip special keys
-            try:
-                k_float = float(k)
-                if k_float.is_integer():
-                    k_norm = str(int(k_float))  # e.g., "1.0" → "1"
-                else:
-                    k_norm = str(k_float)       # e.g., "1.5" → "1.5"
-            except Exception:
-                k_norm = str(k).strip()         # If not a number, treat as cleaned string
-            normalized_rule[k_norm] = v
+            if k in {"conditions", "default"}:
+                continue
+            if isinstance(val_norm, (int, float, np.number)):
+                normalized_rule[k] = v
+            else:
+                k_norm = str(k).strip().lower()
+                normalized_rule[k_norm] = v
     
-        # Try direct match between the normalized value and normalized keys
-        if val in normalized_rule:
-            return normalized_rule[val]
+        # === Try direct match ===
+        if val_norm in normalized_rule:
+            return normalized_rule[val_norm]
     
-        # If no direct match, evaluate conditional expressions if provided
+        # === Evaluate conditions ===
         if "conditions" in rule:
-            for cond in rule["conditions"]:
-                expr = cond["expr"]
-                context = row.to_dict()
-        
-                # If z_flag is used in a numeric expression, convert it to float or np.nan
-                if "z_flag" in context and is_z_flag_numeric(expr):
-                    zval = context["z_flag"]
-                    if isinstance(zval, str) and zval.strip() == "":
-                        context["z_flag"] = np.nan
-                    else:
-                        try:
-                            context["z_flag"] = float(zval)
-                        except Exception as e:
-                            raise ValueError(
-                                f"Failed to convert z_flag='{zval}' to float for numeric condition '{expr}' in survey '{survey}': {e}"
-                            )
-        
-                try:
-                    if eval(expr, {}, context):
+            context = row.to_dict()
+            try:
+                for cond in rule["conditions"]:
+                    expr = cond.get("expr")
+                    if expr and eval(expr, {}, context):
                         return cond["value"]
-                except Exception as e:
-                    raise ValueError(
-                        f"Error evaluating condition '{expr}' for survey '{survey}': {e}"
-                    )
-
-        # Fallback: return default value if defined
-        if "default" in rule:
-            return rule["default"]
+            except Exception as e:
+                raise ValueError(
+                    f"Error evaluating condition '{expr}' for survey '{survey}': {e}"
+                )
     
-        # If nothing matched, return NaN
-        return np.nan
+        # === Fallback ===
+        return rule.get("default", "" if isinstance(val_norm, str) else np.nan)
+
 
     # Check and compute homogenized z_flag and instrument_type only if not present
     tiebreaking_priority = translation_config.get("tiebreaking_priority", [])

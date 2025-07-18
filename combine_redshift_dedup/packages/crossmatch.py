@@ -247,7 +247,7 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
         "ra": "float64",
         "dec": "float64",
         "z": "float64",
-        "z_flag": "string",
+        "z_flag": "float64",
         "z_err": "float64",
         "instrument_type": "string",
         "survey": "string",
