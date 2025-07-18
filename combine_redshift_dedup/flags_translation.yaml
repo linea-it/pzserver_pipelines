@@ -62,6 +62,7 @@ translation_rules:
     instrument_type_translation:
       default: "s"
 
+  # TO BE REVIEWED
   2MRS:
     z_flag_translation:
       conditions:
@@ -84,6 +85,7 @@ translation_rules:
     instrument_type_translation:
       default: "s"
 
+  # TO BE REVIEWED
   DESI:
     z_flag_translation:
       conditions:
@@ -209,6 +211,6 @@ translation_rules:
         - expr: "z_err >= 0.001"
           value: 3
     instrument_type_translation:
-      spec: "s"
-      grism: "g"
-      photo: "p"
+      "SPEC": "s"
+      "GRISM": "g"
+      "PHOTO": "p"
