@@ -6,11 +6,27 @@ import pandas as pd
 import dask.dataframe as dd
 import lsdb
 
-from combine_redshift_dedup.packages.utils import get_global_logger, log_and_print
+def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, logs_dir, temp_dir, step, client, compared_to_dict, instrument_type_priority, translation_config, do_import=True):
 
-def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, step, client, compared_to_dict, instrument_type_priority, translation_config, do_import=True):
-
-    logger = get_global_logger()
+    # === Logger setup ===
+    import logging
+    import pathlib
+    from datetime import datetime
+    
+    log_path = pathlib.Path(logs_dir) / "crossmatch_and_merge_all.log"
+    
+    logger_x = logging.getLogger("crossmatch_and_merge_logger")
+    logger_x.setLevel(logging.INFO)
+    
+    # Remove todos os handlers previamente registrados (para evitar duplicação)
+    if logger_x.hasHandlers():
+        logger_x.handlers.clear()
+    
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+    logger_x.addHandler(fh)
+    
+    # ===================
     
     output_xmatch_dir = os.path.join(temp_dir, f"xmatch_step{step}")
 
@@ -32,7 +48,7 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
 
     # Validate tiebreaking_priority configuration
     if not tiebreaking_priority:
-        logger.warning("⚠️ tiebreaking_priority is empty. Proceeding directly to delta_z_threshold tie-breaking.")
+        logger_x.warning("⚠️ tiebreaking_priority is empty. Proceeding directly to delta_z_threshold tie-breaking.")
     else:
         for col in tiebreaking_priority:
             col_left = f"{col}left"
@@ -273,7 +289,7 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
                 else:
                     merged[col] = merged[col].astype(dtype)
             except Exception as e:
-                logger.warning(f"⚠️ Failed to cast column '{col}' to {dtype}: {e}")
+                logger_x.warning(f"⚠️ Failed to cast column '{col}' to {dtype}: {e}")
     
     merged_path = os.path.join(temp_dir, f"merged_step{step}")
     merged.to_parquet(merged_path, write_index=False)
@@ -281,14 +297,39 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, temp_dir, ste
     # Import merged catalog to HATS
     if do_import:
         from combine_redshift_dedup.packages.specz import import_catalog
-        import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, client)
+        import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, logs_dir, client)
+        logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
         return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats"))
     else:
+        logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
         return merged_path
 
 def crossmatch_tiebreak_safe(*args, **kwargs):
 
-    logger = get_global_logger()
+    # === Logger setup ===
+    import logging
+    import pathlib
+    from datetime import datetime
+
+    logs_dir = args[3]
+    step = args[5]
+    
+    log_path = pathlib.Path(logs_dir) / "crossmatch_and_merge_all.log"
+    
+    logger_x = logging.getLogger("crossmatch_and_merge_logger")
+    logger_x.setLevel(logging.INFO)
+    
+    # Remove todos os handlers previamente registrados (para evitar duplicação)
+    if logger_x.hasHandlers():
+        logger_x.handlers.clear()
+    
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+    logger_x.addHandler(fh)
+
+    logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: crossmatch_and_merge id=merged_step{step}")
+
+    # ===================
     
     try:
         return crossmatch_tiebreak(*args, **kwargs)
@@ -297,12 +338,13 @@ def crossmatch_tiebreak_safe(*args, **kwargs):
             "The output catalog is empty" in str(e)
             or "Catalogs do not overlap" in str(e)
         ):
-            log_and_print(f"⚠️ {e} Proceeding by merging left and right without crossmatching.", logger)
+            logger_x.info(f"⚠️ {e} Proceeding by merging left and right without crossmatching.")
             left_cat, right_cat = args[0], args[1]
-            temp_dir = args[3]
-            step = args[4]
-            client = args[5]
-            compared_to_dict = args[6]
+            logs_dir = args[3]
+            temp_dir = args[4]
+            step = args[5]
+            client = args[6]
+            compared_to_dict = args[7]
 
             left_df = left_cat._ddf
             right_df = right_cat._ddf
@@ -318,9 +360,11 @@ def crossmatch_tiebreak_safe(*args, **kwargs):
             # Import merged catalog to HATS
             if kwargs.get("do_import", True):  # novo controle aqui também
                 from combine_redshift_dedup.packages.specz import import_catalog
-                import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, client)
+                import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, logs_dir, client)
+                logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
                 return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats"))
             else:
+                logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
                 return merged_path
         else:
             raise

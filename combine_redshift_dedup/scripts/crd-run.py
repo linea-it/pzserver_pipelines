@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 from dask import delayed, compute
 import dask.dataframe as dd
+from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
 from dask.distributed import Client, performance_report
@@ -75,7 +76,7 @@ def main(config_path, cwd=".", base_dir_override=None):
     # === Setup logger ===
     logger = setup_logger("combine_redshift_dedup", logdir=logs_dir)
     set_global_logger(logger)
-    log_and_print(f"📄 Loading config from {config_path}", logger)
+    logger.info(f"📄 Loading config from {config_path}")
     configure_warning_handler(logger)
 
     # Suppress only the "Sending large graph" warnings from Dask
@@ -125,95 +126,101 @@ def main(config_path, cwd=".", base_dir_override=None):
     # === Initialize Dask cluster ===
     cluster = get_executor(config["executor"], logs_dir=logs_dir)
     client = Client(cluster)
-    
-    # === Prepare catalogs in parallel using Dask Delayed ===
-    logger.info(f"🧰 Preparing {len(catalogs)} input catalogs")
-    
-    delayed_prepared_paths = []
-    
-    for entry in catalogs:
-        tag = f"prepare_{entry['internal_name']}"
-        filename = os.path.basename(entry["path"])
-        logger.info(f"📦 Preparing catalog: {entry['internal_name']} ({filename})")
-    
-        if tag not in completed:
-            result = delayed(prepare_catalog)(entry, translation_config, temp_dir, combine_mode)
-            delayed_prepared_paths.append(result)
-        else:
-            logger.info(f"⏩ Catalog {entry['internal_name']} already prepared. Skipping.")
-            prepared_path = os.path.join(temp_dir, f"prepared_{entry['internal_name']}")
-            match = re.match(r"(\d+)_", entry["internal_name"])
-            if match:
-                catalog_prefix = match.group(1)
-                compared_path = os.path.join(temp_dir, f"compared_to_dict_{catalog_prefix}.json")
-            else:
-                compared_path = ""
-            delayed_prepared_paths.append(delayed((prepared_path, "ra", "dec", entry["internal_name"], compared_path)))
-    
-    # === Trigger parallel computation ===
-    preparation_report_path = os.path.join(logs_dir, "preparation_dask_report.html")
 
-    with performance_report(filename=preparation_report_path):
+    # === Global Dask time profile report ===
+    global_report_path = os.path.join(logs_dir, "main_dask_report.html")
+
+    with performance_report(filename=global_report_path):
+    
+        # === Prepare catalogs in parallel using Dask Delayed ===
+        logger.info(f"🧰 Preparing {len(catalogs)} input catalogs")
+        
+        delayed_prepared_paths = []
+        
+        for entry in catalogs:
+            tag = f"prepare_{entry['internal_name']}"
+            filename = os.path.basename(entry["path"])
+            logger.info(f"📦 Preparing catalog: {entry['internal_name']} ({filename})")
+        
+            if tag not in completed:
+                result = delayed(prepare_catalog)(entry, translation_config, logs_dir, temp_dir, combine_mode)
+                delayed_prepared_paths.append(result)
+            else:
+                logger.info(f"⏩ Catalog {entry['internal_name']} already prepared. Skipping.")
+                prepared_path = os.path.join(temp_dir, f"prepared_{entry['internal_name']}")
+                match = re.match(r"(\d+)_", entry["internal_name"])
+                if match:
+                    catalog_prefix = match.group(1)
+                    compared_path = os.path.join(temp_dir, f"compared_to_dict_{catalog_prefix}.json")
+                else:
+                    compared_path = ""
+                delayed_prepared_paths.append(delayed((prepared_path, "ra", "dec", entry["internal_name"], compared_path)))
+        
+        # === Trigger parallel computation ===
+        preparation_report_path = os.path.join(logs_dir, "preparation_dask_report.html")
+    
+        #with performance_report(filename=preparation_report_path):
         results = compute(*delayed_prepared_paths)
+            
+        prepared_paths = [r[:4] for r in results]
+        compared_to_paths = [r[4] for r in results]
         
-    prepared_paths = [r[:4] for r in results]
-    compared_to_paths = [r[4] for r in results]
-    
-    # === Log completed steps
-    for entry in catalogs:
-        tag = f"prepare_{entry['internal_name']}"
-        if tag not in completed:
-            log_step(log_file, tag)
-    
-    # === Merge all individual compared_to_dict files ===
-    final_compared_to_dict = defaultdict(list)
-    for path in compared_to_paths:
-        if not path or not os.path.exists(path):
-            logger.warning(f"⚠️ Missing compared_to_dict file: {path}")
-            continue
-        with open(path, "r") as f:
-            local_dict = json.load(f)
-        for k, v in local_dict.items():
-            final_compared_to_dict[k].extend(v)
-    
-    # Deduplicate entries
-    for k in final_compared_to_dict:
-        final_compared_to_dict[k] = sorted(set(final_compared_to_dict[k]))
-    
-    # Save final dictionary
-    with open(compared_to_path, "w") as f:
-        json.dump(final_compared_to_dict, f)
-    
-    logger.info(f"📝 Saved final merged compared_to_dict to {compared_to_path}")
-
-    # === Begin combination logic ===
-    final_base_path = os.path.join(output_root_dir_and_output_dir, output_name)
-
-    if combine_mode == "concatenate":
-        logger.info("🔗 Combining catalogs by simple concatenation (concatenate mode)")
-        dfs = [dd.read_parquet(p[0]) for p in prepared_paths]
-        df_final = dd.concat(dfs).compute()
-
-    elif combine_mode in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
-        logger.info(f"🔍 Combining catalogs with duplicate marking ({combine_mode} mode)")
-
-        delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
-        if not tiebreaking_priority:
-            if delta_z_threshold is None or delta_z_threshold == 0.0:
-                logger.error("❌ Cannot deduplicate: tiebreaking_priority is empty and delta_z_threshold is not set or is zero.")
-                client.close(); cluster.close(); return
-            else:
-                logger.warning("⚠️ tiebreaking_priority is empty. Proceeding with delta_z_threshold tie-breaking only.")
+        # === Log completed steps
+        for entry in catalogs:
+            tag = f"prepare_{entry['internal_name']}"
+            if tag not in completed:
+                log_step(log_file, tag)
         
-        crossmatch_report_path = os.path.join(logs_dir, "crossmatch_dask_report.html")
+        # === Merge all individual compared_to_dict files ===
+        final_compared_to_dict = defaultdict(list)
+        for path in compared_to_paths:
+            if not path or not os.path.exists(path):
+                logger.warning(f"⚠️ Missing compared_to_dict file: {path}")
+                continue
+            with open(path, "r") as f:
+                local_dict = json.load(f)
+            for k, v in local_dict.items():
+                final_compared_to_dict[k].extend(v)
         
-        with performance_report(filename=crossmatch_report_path):
+        # Deduplicate entries
+        for k in final_compared_to_dict:
+            final_compared_to_dict[k] = sorted(set(final_compared_to_dict[k]))
+        
+        # Save final dictionary
+        with open(compared_to_path, "w") as f:
+            json.dump(final_compared_to_dict, f)
+        
+        logger.info(f"📝 Saved final merged compared_to_dict to {compared_to_path}")
+    
+        # === Begin combination logic ===
+        final_base_path = os.path.join(output_root_dir_and_output_dir, output_name)
+    
+        if combine_mode == "concatenate":
+            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: finalization id=finalization")
+            logger.info("🔗 Combining catalogs by simple concatenation (concatenate mode)")
+            dfs = [dd.read_parquet(p[0]) for p in prepared_paths]
+            df_final = dd.concat(dfs).compute()
+    
+        elif combine_mode in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
+            logger.info(f"🔍 Combining catalogs with duplicate marking ({combine_mode} mode)")
+    
+            delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
+            if not tiebreaking_priority:
+                if delta_z_threshold is None or delta_z_threshold == 0.0:
+                    logger.error("❌ Cannot deduplicate: tiebreaking_priority is empty and delta_z_threshold is not set or is zero.")
+                    client.close(); cluster.close(); return
+                else:
+                    logger.warning("⚠️ tiebreaking_priority is empty. Proceeding with delta_z_threshold tie-breaking only.")
+            
+            crossmatch_report_path = os.path.join(logs_dir, "crossmatch_dask_report.html")
+            
+            #with performance_report(filename=crossmatch_report_path):
             
             # === Import first catalog ===
             import_tag = f"import_{prepared_paths[0][3]}"
             if import_tag not in completed:
                 logger.info(f"📥 Importing first catalog: {prepared_paths[0][3]}")
-                import_catalog(prepared_paths[0][0], "ra", "dec", "cat0_hats", temp_dir, client)
+                import_catalog(prepared_paths[0][0], "ra", "dec", "cat0_hats", temp_dir, logs_dir, client)
                 log_step(log_file, import_tag)
         
             for j in reversed(range(1, len(prepared_paths))):
@@ -237,14 +244,14 @@ def main(config_path, cwd=".", base_dir_override=None):
                     logger.info(f"📥 Importing catalog: {internal_name} ({filename})")
                     import_tag = f"import_{internal_name}"
                     if import_tag not in completed:
-                        import_catalog(prepared_paths[i][0], "ra", "dec", f"cat{i}_hats", temp_dir, client)
+                        import_catalog(prepared_paths[i][0], "ra", "dec", f"cat{i}_hats", temp_dir, logs_dir, client)
                         log_step(log_file, import_tag)
         
                     margin_tag = f"margin_cache_{internal_name}"
                     if margin_tag not in completed:
                         logger.info(f"🧩 Generating margin cache for: {internal_name}")
                         margin_cache_path = generate_margin_cache_safe(
-                            os.path.join(temp_dir, f"cat{i}_hats"), temp_dir, f"cat{i}_margin", client
+                            os.path.join(temp_dir, f"cat{i}_hats"), temp_dir, f"cat{i}_margin", logs_dir, client
                         )
                         if margin_cache_path:
                             log_step(log_file, margin_tag)
@@ -265,6 +272,7 @@ def main(config_path, cwd=".", base_dir_override=None):
                         cat_prev,
                         cat_curr,
                         tiebreaking_priority,
+                        logs_dir,
                         temp_dir,
                         i,
                         client,
@@ -287,23 +295,24 @@ def main(config_path, cwd=".", base_dir_override=None):
                     log_step(log_file, xmatch_tag)
                 else:
                     logger.info(f"⏩ Skipping already completed step: {xmatch_tag}")
-        
-        final_merged = os.path.join(temp_dir, f"merged_step{len(prepared_paths)-1}")
-        if not os.path.exists(final_merged):
-            logger.error(f"❌ Final merged Parquet folder not found: {final_merged}")
+
+            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: finalization id=finalization")
+            final_merged = os.path.join(temp_dir, f"merged_step{len(prepared_paths)-1}")
+            if not os.path.exists(final_merged):
+                logger.error(f"❌ Final merged Parquet folder not found: {final_merged}")
+                client.close(); cluster.close(); return
+    
+            df_final = dd.read_parquet(final_merged).compute()
+    
+            if combine_mode == "concatenate_and_remove_duplicates":
+                before = len(df_final)
+                df_final = df_final[df_final["tie_result"] == 1]
+                after = len(df_final)
+                logger.info(f"🧹 Removed duplicates: kept {after} of {before} rows (tie_result == 1)")
+    
+        else:
+            logger.error(f"❌ Unknown combine_mode: {combine_mode}")
             client.close(); cluster.close(); return
-
-        df_final = dd.read_parquet(final_merged).compute()
-
-        if combine_mode == "concatenate_and_remove_duplicates":
-            before = len(df_final)
-            df_final = df_final[df_final["tie_result"] == 1]
-            after = len(df_final)
-            logger.info(f"🧹 Removed duplicates: kept {after} of {before} rows (tie_result == 1)")
-
-    else:
-        logger.error(f"❌ Unknown combine_mode: {combine_mode}")
-        client.close(); cluster.close(); return
 
     # === Final cleanup and save ===
     if combine_mode == "concatenate" and "tie_result" in df_final.columns:
@@ -343,6 +352,8 @@ def main(config_path, cwd=".", base_dir_override=None):
             logger.info(f"🧹 Deleted entire temp_dir {temp_dir} after successful pipeline completion")
         except Exception as e:
             logger.warning(f"⚠️ Could not delete temp_dir {temp_dir}: {e}")
+
+    logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: finalization id=finalization")
 
     client.close()
     cluster.close()
