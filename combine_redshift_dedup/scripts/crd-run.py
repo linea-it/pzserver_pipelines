@@ -89,6 +89,8 @@ def main(config_path, cwd=".", base_dir_override=None):
     
     configure_exception_hook(logger, process_info, process_info_path)
 
+    logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: pipeline_init id=pipeline_init")
+
     # === Load translation configuration ===
     path_to_translation_file = param_config.get("flags_translation_file")
     if path_to_translation_file is None:
@@ -158,10 +160,14 @@ def main(config_path, cwd=".", base_dir_override=None):
         
         # === Trigger parallel computation ===
         preparation_report_path = os.path.join(logs_dir, "preparation_dask_report.html")
-    
+
+        logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: pipeline_init id=pipeline_init")
+
+        logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: prepare_catalogs id=prepare_catalogs")
+        
         #with performance_report(filename=preparation_report_path):
         results = compute(*delayed_prepared_paths)
-            
+        
         prepared_paths = [r[:4] for r in results]
         compared_to_paths = [r[4] for r in results]
         
@@ -194,14 +200,18 @@ def main(config_path, cwd=".", base_dir_override=None):
     
         # === Begin combination logic ===
         final_base_path = os.path.join(output_root_dir_and_output_dir, output_name)
-    
+
+        logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: prepare_catalogs id=prepare_catalogs")
+        
         if combine_mode == "concatenate":
-            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: finalization id=finalization")
+            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: consolidate id=consolidate")
             logger.info("🔗 Combining catalogs by simple concatenation (concatenate mode)")
             dfs = [dd.read_parquet(p[0]) for p in prepared_paths]
             df_final = dd.concat(dfs).compute()
     
         elif combine_mode in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
+            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: crossmatch_catalogs id=crossmatch_catalogs")
+            
             logger.info(f"🔍 Combining catalogs with duplicate marking ({combine_mode} mode)")
     
             delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
@@ -296,7 +306,8 @@ def main(config_path, cwd=".", base_dir_override=None):
                 else:
                     logger.info(f"⏩ Skipping already completed step: {xmatch_tag}")
 
-            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: finalization id=finalization")
+            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_catalogs id=crossmatch_catalogs")
+            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: consolidate id=consolidate")
             final_merged = os.path.join(temp_dir, f"merged_step{len(prepared_paths)-1}")
             if not os.path.exists(final_merged):
                 logger.error(f"❌ Final merged Parquet folder not found: {final_merged}")
@@ -353,7 +364,7 @@ def main(config_path, cwd=".", base_dir_override=None):
         except Exception as e:
             logger.warning(f"⚠️ Could not delete temp_dir {temp_dir}: {e}")
 
-    logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: finalization id=finalization")
+    logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: consolidate id=consolidate")
 
     client.close()
     cluster.close()
