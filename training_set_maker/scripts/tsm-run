@@ -11,13 +11,13 @@ from dask.distributed import Client
 from executor import get_executor
 from product_handle import ProductHandle, create_output
 from utils import (
+    copy_directory,
+    copy_file,
+    copy_files_by_extensions,
     create_logdir,
     dump_yml,
     load_yml,
     setup_logger,
-    copy_files_by_extensions,
-    copy_file,
-    copy_directory,
 )
 
 
@@ -43,6 +43,8 @@ class Runner:
             - inputs: Dictionary containing input data specifications.
             - param: Dictionary containing parameters for the pipeline.
         """
+        self.config = config
+
         # Create logs directory
         self.logdir = create_logdir(cwd)
 
@@ -71,7 +73,7 @@ class Runner:
         self.end_time = None
 
         # Loading config
-        pipe_config = load_yml(config)
+        pipe_config = load_yml(self.config)
 
         self.logger.debug("Configurations: %s", pipe_config)
 
@@ -136,8 +138,6 @@ class Runner:
 
             specz_df = lsdb.from_dataframe(df, ra_column=ra, dec_column=dec)
 
-            # dataset_path = self.inputs.get("dataset").get("path")
-            # margin_cache_path = self.inputs.get("dataset").get("margin_path", None)
             dataset_path, margin_cache_path = self.__get_photometric_data_path()
             dataset_id = self.inputs.get("dataset").get("columns", {}).get("id", "id")
 
@@ -150,6 +150,7 @@ class Runner:
             dataset = lsdb.read_hats(dataset_path, margin_cache=margin_cache_path)
             duplicate_criteria = self.param.get("duplicate_criteria", "closest")
             cm_args = self.param.get("crossmatch", {})
+            self.logger.debug("Crossmatch args: %s", cm_args)
 
             try:
                 cross = specz_df.crossmatch(dataset, **cm_args)
@@ -209,7 +210,10 @@ class Runner:
         self.end_time = time.time() - self.start_time
         self.logger.info("Time elapsed: %s", str(self.end_time))
 
-        copy_files_by_extensions(".", self.logdir, [".log", ".err", ".out", ".yml"])
+        copy_files_by_extensions(".", self.logdir, [".log", ".err", ".out"])
+        copy_file(
+            self.config, str(Path(self.output_root_dir, self.output_dir, "config.yml"))
+        )
         copy_directory(
             self.logdir,
             str(Path(self.output_root_dir, self.output_dir, "process_info")),
