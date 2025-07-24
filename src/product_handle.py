@@ -6,6 +6,7 @@ from collections import OrderedDict
 from os import PathLike
 from pathlib import Path
 from typing import List, Union
+import shutil
 
 import pandas as pd
 import tables_io
@@ -32,12 +33,13 @@ def create_output(data, output_root_dir, output_dir, output_name, extension):
 
     outputfile = str(Path(output_dir, f"{output_name}.{extension}"))
     output_full_file = str(Path(output_root_dir, outputfile).resolve())
+    output_temp = f"{output_name}.{extension}"
 
     match extension:
         case "csv":
-            data.to_csv(output_full_file)
+            data.to_csv(output_temp)
         case "fits" | "fit" | "hf5" | "hdf5" | "h5" | "pq" | "parquet":
-            tables_io.write(data, output_full_file, extension)
+            tables_io.write(data, output_temp, extension)
         case "votable":
             raise NotImplementedError("VOTable not implemented")
             # outputfile = str(Path(output_dir, f"{output_name}.xml").resolve())
@@ -48,6 +50,9 @@ def create_output(data, output_root_dir, output_dir, output_name, extension):
             raise ValueError(
                 f"The {extension} extension is not valid for output file from this pipeline."
             )
+
+    # Copy the output temporary to the output full dir
+    shutil.copy2(output_temp, output_full_file)
 
     return outputfile
 
