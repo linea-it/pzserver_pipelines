@@ -28,7 +28,7 @@ inputs:
       id: "id"
   specz:
     - path: "<DATASETS_DIR>/specz.parquet"
-      format: "csv"
+      format: "parquet"
       columns:
         ra: "ra"
         dec: "dec"
@@ -39,10 +39,9 @@ output_name: "tsm.parquet"
 
 param:
   duplicate_criteria: "closest"
-  flux_types: "cmodel"
+  flux_types: "auto"
   convert_flux_to_mag: true
   dereddening: "sfd"
   crossmatch:
-    output_catalog_name: "tsm_cross_001"
     radius_arcsec: 1.0
     n_neighbors: 1
