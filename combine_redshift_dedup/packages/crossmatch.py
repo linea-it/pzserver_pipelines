@@ -297,7 +297,7 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, logs_dir, tem
     # Import merged catalog to HATS
     if do_import:
         from combine_redshift_dedup.packages.specz import import_catalog
-        import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, logs_dir, client)
+        import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, logs_dir, logger_x, client)
         logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
         return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats"))
     else:
@@ -360,7 +360,7 @@ def crossmatch_tiebreak_safe(*args, **kwargs):
             # Import merged catalog to HATS
             if kwargs.get("do_import", True):  # novo controle aqui também
                 from combine_redshift_dedup.packages.specz import import_catalog
-                import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, logs_dir, client)
+                import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, logs_dir, logger_x, client)
                 logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
                 return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats"))
             else:

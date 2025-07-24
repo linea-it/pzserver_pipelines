@@ -492,8 +492,6 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
     out_path = os.path.join(temp_dir, f"prepared_{product_name}")
     df.to_parquet(out_path, write_index=False)
     
-    logger_prep.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: prepare_catalog id={product_name}")
-    
     # =============================
     # HATS IMPORT + MARGIN CACHE
     # =============================
@@ -523,6 +521,7 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
             artifact_name=artifact_hats,
             output_path=temp_dir,
             logs_dir=logs_dir,
+            logger=logger_prep,
             client=client,
         )
     
@@ -532,16 +531,19 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
             output_path=temp_dir,
             artifact_name=artifact_margin,
             logs_dir=logs_dir,
+            logger=logger_prep,
             client=client,
         )
     
         hats_path = os.path.join(temp_dir, artifact_hats)
         margin_cache_path = os.path.join(temp_dir, artifact_margin)
+
+    logger_prep.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: prepare_catalog id={product_name}")
     
     return hats_path, "ra", "dec", product_name, margin_cache_path, compared_to_path
 
 
-def import_catalog(path, ra_col, dec_col, artifact_name, output_path, logs_dir, client, size_threshold_mb=500):
+def import_catalog(path, ra_col, dec_col, artifact_name, output_path, logs_dir, logger, client, size_threshold_mb=500):
     """
     Import a Parquet catalog into HATS format.
     Uses lightweight method for small catalogs (< size_threshold_mb).
@@ -555,28 +557,6 @@ def import_catalog(path, ra_col, dec_col, artifact_name, output_path, logs_dir, 
         client (Client): Dask client for large catalog import.
         size_threshold_mb (int): Threshold to decide method (in MB).
     """
-
-    # === Logger setup ===
-    import logging
-    import pathlib
-    from datetime import datetime
-    
-    log_path = pathlib.Path(logs_dir) / "import_all.log"
-    
-    logger_import = logging.getLogger("import_catalog_logger")
-    logger_import.setLevel(logging.INFO)
-    
-    # Remove todos os handlers previamente registrados (para evitar duplicação)
-    if logger_import.hasHandlers():
-        logger_import.handlers.clear()
-    
-    fh = logging.FileHandler(log_path)
-    fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
-    logger_import.addHandler(fh)
-
-    logger_import.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: import_catalog id={artifact_name}")
-
-    # ===================
     
     # Detect parquet file paths
     base_path = os.path.join(path, "base")
@@ -594,7 +574,7 @@ def import_catalog(path, ra_col, dec_col, artifact_name, output_path, logs_dir, 
     hats_path = os.path.join(output_path, artifact_name)
 
     if total_size_mb <= size_threshold_mb:
-        logger_import.info(f"⚡ Small catalog detected ({total_size_mb:.1f} MB). Using direct `to_hats()` method.")
+        logger.info(f"⚡ Small catalog detected ({total_size_mb:.1f} MB). Using direct `to_hats()` method.")
         df = pd.read_parquet(parquet_files)
         catalog = lsdb.from_dataframe(
             df,
@@ -603,9 +583,9 @@ def import_catalog(path, ra_col, dec_col, artifact_name, output_path, logs_dir, 
             dec_column=dec_col
         )
         catalog.to_hats(hats_path, overwrite=True)
-        logger_import.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: import_catalog id={artifact_name}")
+        logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: import_catalog id={artifact_name}")
     else:
-        logger_import.info(f"🧱 Large catalog detected ({total_size_mb:.1f} MB). Using distributed HATS import.")
+        logger.info(f"🧱 Large catalog detected ({total_size_mb:.1f} MB). Using distributed HATS import.")
         file_reader = ParquetReader()
         args = ImportArguments(
             ra_column=ra_col,
@@ -616,9 +596,9 @@ def import_catalog(path, ra_col, dec_col, artifact_name, output_path, logs_dir, 
             output_path=output_path,
         )
         pipeline_with_client(args, client)
-        logger_import.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: import_catalog id={artifact_name}")
+        logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: import_catalog id={artifact_name}")
 
-def generate_margin_cache_safe(hats_path, output_path, artifact_name, logs_dir, client):
+def generate_margin_cache_safe(hats_path, output_path, artifact_name, logs_dir, logger, client):
     """
     Generate margin cache if partitions > 1; otherwise, skip gracefully.
     If resume fails due to missing critical files, clean and regenerate.
@@ -632,38 +612,18 @@ def generate_margin_cache_safe(hats_path, output_path, artifact_name, logs_dir, 
     Returns:
         str or None: Path to margin cache or None if skipped.
     """
-    # === Logger setup ===
-    import logging
-    import pathlib
-    from datetime import datetime
-    
-    log_path = pathlib.Path(logs_dir) / "margin_cache_all.log"
-    
-    logger_margin = logging.getLogger("margin_cache_logger")
-    logger_margin.setLevel(logging.INFO)
-    
-    # Remove todos os handlers previamente registrados (para evitar duplicação)
-    if logger_margin.hasHandlers():
-        logger_margin.handlers.clear()
-    
-    fh = logging.FileHandler(log_path)
-    fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
-    logger_margin.addHandler(fh)
 
-    logger_margin.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: generate_margin_cache id={artifact_name}")
-
-    # ===================
     margin_dir = os.path.join(output_path, artifact_name)
     intermediate_dir = os.path.join(margin_dir, "intermediate")
     critical_file = os.path.join(intermediate_dir, "margin_pair.csv")
 
     # Check for broken resumption state
     if os.path.exists(intermediate_dir) and not os.path.exists(critical_file):
-        logger_margin.info(f"⚠️ Detected incomplete margin cache at {margin_dir}. Deleting to force regeneration...")
+        logger.info(f"⚠️ Detected incomplete margin cache at {margin_dir}. Deleting to force regeneration...")
         try:
             shutil.rmtree(margin_dir)
         except Exception as e:
-            logger_margin.info(f"❌ Failed to delete corrupted margin cache at {margin_dir}: {e}")
+            logger.info(f"❌ Failed to delete corrupted margin cache at {margin_dir}: {e}")
             raise
 
     try:
@@ -677,16 +637,16 @@ def generate_margin_cache_safe(hats_path, output_path, artifact_name, logs_dir, 
                 output_artifact_name=artifact_name
             )
             pipeline_with_client(args, client)
-            logger_margin.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: generate_margin_cache id={artifact_name}")
+            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: generate_margin_cache id={artifact_name}")
             return margin_dir
         else:
-            logger_margin.info(f"⚠️ Margin cache skipped: single partition for {artifact_name}")
-            logger_margin.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: generate_margin_cache id={artifact_name}")
+            logger.info(f"⚠️ Margin cache skipped: single partition for {artifact_name}")
+            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: generate_margin_cache id={artifact_name}")
             return None
     except ValueError as e:
         if "Margin cache contains no rows" in str(e):
-            logger_margin.info(f"⚠️ {e} Proceeding without margin cache.")
-            logger_margin.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: generate_margin_cache id={artifact_name}")
+            logger.info(f"⚠️ {e} Proceeding without margin cache.")
+            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: generate_margin_cache id={artifact_name}")
             return None
         else:
             raise
