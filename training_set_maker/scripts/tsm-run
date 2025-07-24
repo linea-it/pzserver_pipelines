@@ -10,33 +10,79 @@ import lsdb
 from dask.distributed import Client
 from executor import get_executor
 from product_handle import ProductHandle, create_output
-from utils import dump_yml, load_yml, setup_logger
+from utils import (
+    create_logdir,
+    dump_yml,
+    load_yml,
+    setup_logger,
+    copy_files_by_extensions,
+    copy_file,
+    copy_directory,
+)
 
 
 class Runner:
+    """Runner for TSM pipeline
+    This class handles the execution of the TSM pipeline, including loading configurations,
+    managing inputs and outputs, and executing the cross-matching process.
+    """
 
     def __init__(self, config, cwd=".") -> None:
-        self.logger = setup_logger("tsm", logdir=cwd)
+        """Initialize the Runner with configuration and working directory.
+
+        Args:
+            config (str): Path to the configuration file.
+            cwd (str, optional): Working directory. Defaults to ".".
+
+        Configuration file should contain:
+            - executor: Executor configuration for Dask.
+            - output_name: Name of the output file.
+            - output_format: Format of the output file (e.g., parquet).
+            - output_root_dir: Root directory for outputs.
+            - output_dir: Directory for outputs relative to output_root_dir.
+            - inputs: Dictionary containing input data specifications.
+            - param: Dictionary containing parameters for the pipeline.
+        """
+        # Create logs directory
+        self.logdir = create_logdir(cwd)
+
+        # Setup logger
+        self.logger = setup_logger("tsm", logdir=self.logdir)
+
+        # Set up working directory
         self.cwd = cwd
+
+        # Set up process info
         self.process_info_path = Path(self.cwd, "process.yml")
-        self.process_info = None
-        self.start_time = None
+
+        # Creating process info yaml
+        if not self.process_info_path.is_file():
+            self.process_info_path.touch()
+
+        # Loading process info yaml
+        process_info = load_yml(self.process_info_path)
+        if not process_info:
+            process_info = {}
+        self.process_info = process_info
+
+        # Set up initial time tracking
+        self.add_info("start_time", datetime.datetime.now())
+        self.start_time = time.time()
         self.end_time = None
 
         # Loading config
         pipe_config = load_yml(config)
 
-        self.logger.debug("Configs: %s", pipe_config)
+        self.logger.debug("Configurations: %s", pipe_config)
 
-        # Define output dir and output name
-        self.output_name = pipe_config.get("output_name", "tsm.parquet")
-        self.output_format = pipe_config.get("output_format", None)
+        # Retrieves the output directory to copy the output to at the end of processing.
         self.output_root_dir = pipe_config.get("output_root_dir", ".")
+        self.output_dir = pipe_config.get("output_dir", "out")
+        self.output_name = pipe_config.get("output_name", "tsm")
+        self.output_format = pipe_config.get("output_format", None)
 
         if not Path(self.output_root_dir).is_absolute():
             self.output_root_dir = str(Path(self.cwd, self.output_root_dir))
-
-        self.output_dir = Path(pipe_config.get("output_dir", "out"))
 
         # Loading inputs
         self.inputs = pipe_config.get("inputs")
@@ -58,16 +104,6 @@ class Runner:
         output_full_dir = Path(self.output_root_dir, self.output_dir)
         os.makedirs(output_full_dir, exist_ok=True)
 
-        # Creating process info yaml
-        if not self.process_info_path.is_file():
-            self.process_info_path.touch()
-
-        # Loading process info yaml
-        process_info = load_yml(self.process_info_path)
-        if not process_info:
-            process_info = {}
-        self.process_info = process_info
-
         # Get dask executor
         self.cluster = get_executor(self.executors)
 
@@ -82,10 +118,6 @@ class Runner:
 
     def run(self):
         """Run TSM"""
-
-        # Adding start time
-        self.start_time = time.time()
-        self.add_info("start_time", datetime.datetime.now())
 
         specz = self.inputs.get("specz")
         if len(specz) > 1:
@@ -128,6 +160,7 @@ class Runner:
                         lambda x: x.sort_values("_dist_arcsec").drop_duplicates(_id)
                     )
                 data = cross.compute()
+                client.close()
             except ValueError as err:
                 if "size 0 inputs" in str(err):
                     self.logger.exception("No cross matches were found!")
@@ -175,6 +208,12 @@ class Runner:
 
         self.end_time = time.time() - self.start_time
         self.logger.info("Time elapsed: %s", str(self.end_time))
+
+        copy_files_by_extensions(".", self.logdir, [".log", ".err", ".out", ".yml"])
+        copy_directory(
+            self.logdir,
+            str(Path(self.output_root_dir, self.output_dir, "process_info")),
+        )
 
     def __get_photometric_data_path(self):
         """Get photometric data path and margin cache path
@@ -255,6 +294,11 @@ class Runner:
         else:
             self.add_info("status", "Successful")
 
+        copy_file(
+            self.process_info_path,
+            str(Path(self.output_root_dir, self.output_dir, "process.yml")),
+        )
+
 
 if __name__ == "__main__":
     # Create the parser and add arguments
@@ -266,8 +310,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     config_path = args.config_path
-    cwd = args.cwd
 
     # Run pipeline
-    with Runner(config_path, cwd) as tsmrun:
+    with Runner(config_path, args.cwd) as tsmrun:
         tsmrun.run()
