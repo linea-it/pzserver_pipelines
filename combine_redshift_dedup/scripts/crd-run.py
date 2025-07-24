@@ -128,16 +128,15 @@ def main(config_path, cwd=".", base_dir_override=None):
     # === Initialize Dask cluster ===
     cluster = get_executor(config["executor"], logs_dir=logs_dir)
     client = Client(cluster)
-
+    
     # === Global Dask time profile report ===
     global_report_path = os.path.join(logs_dir, "main_dask_report.html")
-
+    
     with performance_report(filename=global_report_path):
     
-        # === Prepare catalogs in parallel using Dask Delayed ===
         logger.info(f"🧰 Preparing {len(catalogs)} input catalogs")
-        
-        delayed_prepared_paths = []
+    
+        futures = []
         
         for entry in catalogs:
             tag = f"prepare_{entry['internal_name']}"
@@ -145,31 +144,52 @@ def main(config_path, cwd=".", base_dir_override=None):
             logger.info(f"📦 Preparing catalog: {entry['internal_name']} ({filename})")
         
             if tag not in completed:
-                result = delayed(prepare_catalog)(entry, translation_config, logs_dir, temp_dir, combine_mode)
-                delayed_prepared_paths.append(result)
+                future = client.submit(
+                    prepare_catalog,
+                    entry,
+                    translation_config,
+                    logs_dir,
+                    temp_dir,
+                    combine_mode  # ✅ não passe client
+                )
+                futures.append(future)
             else:
                 logger.info(f"⏩ Catalog {entry['internal_name']} already prepared. Skipping.")
-                prepared_path = os.path.join(temp_dir, f"prepared_{entry['internal_name']}")
+                
                 match = re.match(r"(\d+)_", entry["internal_name"])
                 if match:
                     catalog_prefix = match.group(1)
+                    artifact_hats = f"cat{catalog_prefix}_hats"
+                    artifact_margin = f"cat{catalog_prefix}_margin"
+                    hats_path = os.path.join(temp_dir, artifact_hats)
+                    margin_path = os.path.join(temp_dir, artifact_margin)
                     compared_path = os.path.join(temp_dir, f"compared_to_dict_{catalog_prefix}.json")
                 else:
-                    compared_path = ""
-                delayed_prepared_paths.append(delayed((prepared_path, "ra", "dec", entry["internal_name"], compared_path)))
+                    raise ValueError(
+                        f"❌ Could not extract numeric prefix from internal_name '{entry['internal_name']}' "
+                        f"(expected format: '001_catalogname'). Cannot generate HATS/margin/cache paths."
+                    )
         
-        # === Trigger parallel computation ===
+                futures.append(
+                    client.submit(
+                        lambda x: x,
+                        (hats_path, "ra", "dec", entry["internal_name"], margin_path, compared_path)
+                    )
+                )
+    
+        # === Trigger parallel execution and wait for results ===
         preparation_report_path = os.path.join(logs_dir, "preparation_dask_report.html")
-
+        
         logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: pipeline_init id=pipeline_init")
-
         logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: prepare_catalogs id=prepare_catalogs")
         
-        #with performance_report(filename=preparation_report_path):
-        results = compute(*delayed_prepared_paths)
+        results = client.gather(futures)
         
-        prepared_paths = [r[:4] for r in results]
-        compared_to_paths = [r[4] for r in results]
+        # === Unpack returned values
+        prepared_hats_paths = [r[:4] for r in results]          # hats_path, ra, dec, internal_name
+        prepared_cache_paths = [r[4] for r in results]          # margin_cache_path
+        compared_to_paths = [r[5] for r in results]             # compared_to_path
+        prepared_paths = [(os.path.join(temp_dir, f"prepared_{r[3]}"), r[1], r[2], r[3]) for r in results]  # traditional Parquet
         
         # === Log completed steps
         for entry in catalogs:
@@ -197,10 +217,10 @@ def main(config_path, cwd=".", base_dir_override=None):
             json.dump(final_compared_to_dict, f)
         
         logger.info(f"📝 Saved final merged compared_to_dict to {compared_to_path}")
-    
+        
         # === Begin combination logic ===
         final_base_path = os.path.join(output_root_dir_and_output_dir, output_name)
-
+        
         logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: prepare_catalogs id=prepare_catalogs")
         
         if combine_mode == "concatenate":
@@ -208,12 +228,11 @@ def main(config_path, cwd=".", base_dir_override=None):
             logger.info("🔗 Combining catalogs by simple concatenation (concatenate mode)")
             dfs = [dd.read_parquet(p[0]) for p in prepared_paths]
             df_final = dd.concat(dfs).compute()
-    
+        
         elif combine_mode in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
             logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: crossmatch_catalogs id=crossmatch_catalogs")
-            
             logger.info(f"🔍 Combining catalogs with duplicate marking ({combine_mode} mode)")
-    
+        
             delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
             if not tiebreaking_priority:
                 if delta_z_threshold is None or delta_z_threshold == 0.0:
@@ -221,19 +240,25 @@ def main(config_path, cwd=".", base_dir_override=None):
                     client.close(); cluster.close(); return
                 else:
                     logger.warning("⚠️ tiebreaking_priority is empty. Proceeding with delta_z_threshold tie-breaking only.")
-            
-            crossmatch_report_path = os.path.join(logs_dir, "crossmatch_dask_report.html")
-            
-            #with performance_report(filename=crossmatch_report_path):
-            
-            # === Import first catalog ===
-            import_tag = f"import_{prepared_paths[0][3]}"
-            if import_tag not in completed:
-                logger.info(f"📥 Importing first catalog: {prepared_paths[0][3]}")
-                import_catalog(prepared_paths[0][0], "ra", "dec", "cat0_hats", temp_dir, logs_dir, client)
-                log_step(log_file, import_tag)
         
-            for j in reversed(range(1, len(prepared_paths))):
+            # === Load initial catalog
+            initial_hats_path = prepared_hats_paths[0][0]
+            initial_margin_path = prepared_cache_paths[0]
+            
+            if (
+                initial_margin_path
+                and os.path.exists(initial_margin_path)
+                and os.path.exists(os.path.join(initial_margin_path, "properties"))
+            ):
+                cat_prev = lsdb.read_hats(initial_hats_path, margin_cache=initial_margin_path)
+            else:
+                if not os.path.exists(initial_margin_path):
+                    logger.warning(f"⚠️ Margin cache folder not found: {initial_margin_path}")
+                else:
+                    logger.warning(f"⚠️ Margin cache exists but has no 'properties' file: {initial_margin_path}")
+                cat_prev = lsdb.read_hats(initial_hats_path)
+
+            for j in reversed(range(1, len(prepared_hats_paths))):
                 merged_path = os.path.join(temp_dir, f"merged_step{j}_hats")
                 if f"crossmatch_step{j}" in completed and os.path.exists(merged_path):
                     cat_prev = lsdb.read_hats(merged_path)
@@ -241,43 +266,27 @@ def main(config_path, cwd=".", base_dir_override=None):
                     start_i = j + 1
                     break
             else:
-                cat_prev = lsdb.read_hats(os.path.join(temp_dir, "cat0_hats"))
                 start_i = 1
         
             # === Iterative crossmatching ===
-            for i in range(start_i, len(prepared_paths)):
+            for i in range(start_i, len(prepared_hats_paths)):
                 xmatch_tag = f"crossmatch_step{i}"
-                internal_name = prepared_paths[i][3]
-                filename = os.path.basename(prepared_paths[i][0])
-        
+                hats_path = prepared_hats_paths[i][0]
+                margin_path = prepared_cache_paths[i]
+                internal_name = prepared_hats_paths[i][3]
+                filename = os.path.basename(hats_path)
+            
                 if xmatch_tag not in completed:
-                    logger.info(f"📥 Importing catalog: {internal_name} ({filename})")
-                    import_tag = f"import_{internal_name}"
-                    if import_tag not in completed:
-                        import_catalog(prepared_paths[i][0], "ra", "dec", f"cat{i}_hats", temp_dir, logs_dir, client)
-                        log_step(log_file, import_tag)
-        
-                    margin_tag = f"margin_cache_{internal_name}"
-                    if margin_tag not in completed:
-                        logger.info(f"🧩 Generating margin cache for: {internal_name}")
-                        margin_cache_path = generate_margin_cache_safe(
-                            os.path.join(temp_dir, f"cat{i}_hats"), temp_dir, f"cat{i}_margin", logs_dir, client
-                        )
-                        if margin_cache_path:
-                            log_step(log_file, margin_tag)
+                    # === Verifica se margin cache é válido
+                    if margin_path and os.path.exists(margin_path) and os.path.exists(os.path.join(margin_path, "properties")):
+                        cat_curr = lsdb.read_hats(hats_path, margin_cache=margin_path)
                     else:
-                        margin_cache_path = os.path.join(temp_dir, f"cat{i}_margin")
-        
-                    if margin_cache_path and os.path.exists(margin_cache_path):
-                        cat_curr = lsdb.read_hats(os.path.join(temp_dir, f"cat{i}_hats"), margin_cache=margin_cache_path)
-                    else:
-                        logger.warning(f"⚠️ No margin cache found for {internal_name}. Proceeding without it.")
-                        cat_curr = lsdb.read_hats(os.path.join(temp_dir, f"cat{i}_hats"))
-        
+                        logger.warning(f"⚠️ No valid margin cache found for {internal_name}. Proceeding without it.")
+                        cat_curr = lsdb.read_hats(hats_path)
+            
                     logger.info(f"🔄 Crossmatching previous result with: {internal_name}")
-                    
-                    is_last = (i == len(prepared_paths) - 1)
-                    
+                    is_last = (i == len(prepared_hats_paths) - 1)
+            
                     cat_prev = crossmatch_tiebreak_safe(
                         cat_prev,
                         cat_curr,
@@ -289,38 +298,45 @@ def main(config_path, cwd=".", base_dir_override=None):
                         final_compared_to_dict,
                         instrument_type_priority,
                         translation_config,
-                        do_import=not is_last
+                        do_import=not is_last  # necessário para salvar merged_stepN
                     )
-        
+            
+                    # === Deletar temporários se necessário
                     if delete_temp_files and i > 1:
+                        match = re.match(r"(\d+)_", internal_name)
+                        if not match:
+                            raise ValueError(f"❌ Could not extract numeric prefix from internal_name '{internal_name}'")
+                        prefix = match.group(1)
+            
                         for path in [
                             f"merged_step{i-1}", f"merged_step{i-1}_hats",
-                            f"cat{i}_hats", f"cat{i}_margin", f"xmatch_step{i}"
+                            f"cat{prefix}_hats", f"cat{prefix}_margin", f"xmatch_step{i}"
                         ]:
                             full_path = os.path.join(temp_dir, path)
                             if os.path.exists(full_path):
                                 shutil.rmtree(full_path)
                                 logger.info(f"🗑️ Deleted temporary directory {full_path}")
-        
+            
                     log_step(log_file, xmatch_tag)
                 else:
                     logger.info(f"⏩ Skipping already completed step: {xmatch_tag}")
 
             logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_catalogs id=crossmatch_catalogs")
             logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: consolidate id=consolidate")
+        
             final_merged = os.path.join(temp_dir, f"merged_step{len(prepared_paths)-1}")
             if not os.path.exists(final_merged):
                 logger.error(f"❌ Final merged Parquet folder not found: {final_merged}")
                 client.close(); cluster.close(); return
-    
+        
             df_final = dd.read_parquet(final_merged).compute()
-    
+        
             if combine_mode == "concatenate_and_remove_duplicates":
                 before = len(df_final)
                 df_final = df_final[df_final["tie_result"] == 1]
                 after = len(df_final)
                 logger.info(f"🧹 Removed duplicates: kept {after} of {before} rows (tie_result == 1)")
-    
+        
         else:
             logger.error(f"❌ Unknown combine_mode: {combine_mode}")
             client.close(); cluster.close(); return

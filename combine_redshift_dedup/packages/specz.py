@@ -43,6 +43,9 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
     Returns:
         tuple: (output_path, ra_col_name, dec_col_name, internal_catalog_name)
     """
+    from dask.distributed import get_client
+    client = get_client()
+    
     # === Logger setup ===
     import logging
     import pathlib
@@ -488,10 +491,55 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
     # Save output Parquet
     out_path = os.path.join(temp_dir, f"prepared_{product_name}")
     df.to_parquet(out_path, write_index=False)
-
+    
     logger_prep.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: prepare_catalog id={product_name}")
     
-    return out_path, "ra", "dec", product_name, compared_to_path
+    # =============================
+    # HATS IMPORT + MARGIN CACHE
+    # =============================
+    hats_path = ""
+    margin_cache_path = ""
+    
+    if combine_mode != "concatenate":
+        if client is None:
+            raise ValueError(
+                f"❌ Dask client is required for combine_mode='{combine_mode}' "
+                f"(needed to run import_catalog and generate_margin_cache)."
+            )
+    
+        match = re.match(r"(\d+)_", product_name)
+        if not match:
+            raise ValueError(f"❌ Could not extract numeric prefix from internal_name '{product_name}'")
+        prefix_str = match.group(1)  # ✅ mantém o zero à esquerda, ex: "010"
+    
+        artifact_hats = f"cat{prefix_str}_hats"
+        artifact_margin = f"cat{prefix_str}_margin"
+    
+        # === Import to HATS format
+        import_catalog(
+            path=out_path,
+            ra_col="ra",
+            dec_col="dec",
+            artifact_name=artifact_hats,
+            output_path=temp_dir,
+            logs_dir=logs_dir,
+            client=client,
+        )
+    
+        # === Generate margin cache
+        generate_margin_cache_safe(
+            hats_path=os.path.join(temp_dir, artifact_hats),
+            output_path=temp_dir,
+            artifact_name=artifact_margin,
+            logs_dir=logs_dir,
+            client=client,
+        )
+    
+        hats_path = os.path.join(temp_dir, artifact_hats)
+        margin_cache_path = os.path.join(temp_dir, artifact_margin)
+    
+    return hats_path, "ra", "dec", product_name, margin_cache_path, compared_to_path
+
 
 def import_catalog(path, ra_col, dec_col, artifact_name, output_path, logs_dir, client, size_threshold_mb=500):
     """
