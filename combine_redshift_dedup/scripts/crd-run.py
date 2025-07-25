@@ -232,6 +232,61 @@ def main(config_path, cwd=".", base_dir_override=None):
                 data = json.load(f)
             return {k: set(v) for k, v in data.items()}
 
+        def cleanup_previous_step(step, temp_dir, prepared_catalogs_info, logger):
+            """
+            Delete temporary files from the previous step if they exist.
+        
+            Args:
+                step (int): Current step number in crossmatch (i).
+                temp_dir (str): Path to the temporary working directory.
+                prepared_catalogs_info (list of dict): Metadata about each prepared catalog.
+                logger (Logger): Logger instance.
+            """
+            prev_step = step - 1
+        
+            # === Delete merged_step{prev_step} parquet
+            prev_merged = os.path.join(temp_dir, f"merged_step{prev_step}")
+            if os.path.exists(prev_merged):
+                shutil.rmtree(prev_merged)
+                logger.info(f"🗑️ Deleted merged parquet folder: {prev_merged}")
+        
+            # === Delete merged_step{prev_step}_hats
+            prev_merged_hats = os.path.join(temp_dir, f"merged_step{prev_step}_hats")
+            if os.path.exists(prev_merged_hats):
+                shutil.rmtree(prev_merged_hats)
+                logger.info(f"🗑️ Deleted merged HATS folder: {prev_merged_hats}")
+        
+            # === Delete xmatch_step{prev_step} folder (if it exists)
+            prev_xmatch_step = os.path.join(temp_dir, f"xmatch_step{prev_step}")
+            if os.path.exists(prev_xmatch_step):
+                shutil.rmtree(prev_xmatch_step)
+                logger.info(f"🗑️ Deleted xmatch step folder: {prev_xmatch_step}")
+        
+            # === Delete compared_to_xmatch_step{prev_step}.json
+            prev_compared_to_json = os.path.join(temp_dir, f"compared_to_xmatch_step{prev_step}.json")
+            if os.path.exists(prev_compared_to_json):
+                os.remove(prev_compared_to_json)
+                logger.info(f"🗑️ Deleted compared_to JSON: {prev_compared_to_json}")
+        
+            # === Delete artifacts of catalog at index `prev_step`
+            if prev_step < len(prepared_catalogs_info):
+                prev_info = prepared_catalogs_info[prev_step]
+                for path, label in [
+                    (prev_info.get("prepared_path"), "prepared_path"),
+                    (prev_info.get("hats_path"), "hats_path"),
+                    (prev_info.get("margin_cache"), "margin_cache"),
+                    (prev_info.get("compared_to_path"), "compared_to_path")
+                ]:
+                    if path and os.path.exists(path):
+                        try:
+                            if os.path.isdir(path):
+                                shutil.rmtree(path)
+                            else:
+                                os.remove(path)
+                            logger.info(f"🧹 Deleted previous {label}: {path}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Could not delete {label} at {path}: {e}")
+
         if combine_mode == "concatenate":
             logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: consolidate id=consolidate")
             logger.info("🔗 Combining catalogs by simple concatenation (concatenate mode)")
@@ -328,6 +383,10 @@ def main(config_path, cwd=".", base_dir_override=None):
                     final_compared_to_dict = load_compared_to(compared_to_path)
         
                     log_step(log_file, xmatch_tag)
+
+                    # === Clean up previous step only after successful completion
+                    if delete_temp_files:
+                        cleanup_previous_step(i, temp_dir, prepared_catalogs_info, logger)
                 else:
                     logger.info(f"⏩ Skipping already completed step: {xmatch_tag}")
         
