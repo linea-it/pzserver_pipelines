@@ -1,0 +1,68 @@
+##################################################################
+# Parameters file. Should follow the syntax defined in:
+# http://docs.ansible.com/ansible/latest/YAMLSyntax.html
+# More general reference: http://www.yaml.org/spec/1.2/spec.html
+
+executor:
+  name: "slurm" # Name of the job scheduler
+  args:
+    instance:
+      cores: 25 # Number of cores per job
+      processes: 1 # Number of processes per job
+      memory: "50GB" # Memory allocated per job
+      queue: "cpu" # Queue name
+      account: "hpc-bpglsst"
+      job_extra_directives: # Extra directives for Slurm
+        - "--propagate"
+        - "--time=2:00:00"
+    scale:
+      jobs: 10 # Fixed number of dask jobs
+
+inputs:
+  specz:
+    # List of redshift catalogs to combine. Each entry contains:
+    # - path: full path to the file
+    # - internal_name: unique label used internally
+    # - columns: mapping from standard keys to column names in the file
+
+    - path: "data/mock1.parquet"
+      internal_name: "001_mock"
+      columns:
+        id: "id_1"
+        ra: "ra_1"
+        dec: "dec_1"
+        z: "z_1"
+        z_flag: "z_flag_1"
+        z_err: null
+        survey: "survey_1"
+
+    - path: "data/mock2.parquet"
+      internal_name: "002_mock"
+      columns:
+        id: "id_2"
+        ra: "ra_2"
+        dec: "dec_2"
+        z: "z_2"
+        z_flag: "z_flag_2"
+        z_err: null
+        survey: "survey_2"
+
+    - path: "data/mock3.parquet"
+      internal_name: "003_mock"
+      columns:
+        id: "id_3"
+        ra: "ra_3"
+        dec: "dec_3"
+        z: "z_3"
+        z_flag: null
+        z_err: "z_err_3"
+        survey: "survey_3"
+
+output_root_dir: "process001"
+output_dir: "outputs" # Relative directory for final outputs
+output_name: "crd" # Name prefix for the final output files
+output_format: "parquet" # Output format: csv, parquet, hdf5, or fits
+
+param:
+  combine_type: "concatenate" # Options: "concatenate", "concatenate_and_mark_duplicates", or "concatenate_and_remove_duplicates"
+  flags_translation_file: flags_translation.yaml # File with homogenization rules for z_flag and type
