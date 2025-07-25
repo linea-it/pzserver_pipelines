@@ -185,48 +185,41 @@ def main(config_path, cwd=".", base_dir_override=None):
         
         results = client.gather(futures)
         
-        # === Unpack returned values
-        prepared_hats_paths = [r[:4] for r in results]          # hats_path, ra, dec, internal_name
-        prepared_cache_paths = [r[4] for r in results]          # margin_cache_path
-        compared_to_paths = [r[5] for r in results]             # compared_to_path
-        prepared_paths = [(os.path.join(temp_dir, f"prepared_{r[3]}"), r[1], r[2], r[3]) for r in results]  # traditional Parquet
+        # === Unpack into a unified structure per catalog
+        prepared_catalogs_info = [
+            {
+                "hats_path": r[0],
+                "ra": r[1],
+                "dec": r[2],
+                "internal_name": r[3],
+                "margin_cache": r[4],
+                "compared_to_path": r[5],
+                "prepared_path": os.path.join(temp_dir, f"prepared_{r[3]}"),
+            }
+            for r in results
+        ]
         
         # === Log completed steps
         for entry in catalogs:
             tag = f"prepare_{entry['internal_name']}"
             if tag not in completed:
                 log_step(log_file, tag)
-        
-        # === Merge all individual compared_to_dict files ===
-        final_compared_to_dict = defaultdict(list)
-        for path in compared_to_paths:
-            if not path or not os.path.exists(path):
-                logger.warning(f"⚠️ Missing compared_to_dict file: {path}")
-                continue
-            with open(path, "r") as f:
-                local_dict = json.load(f)
-            for k, v in local_dict.items():
-                final_compared_to_dict[k].extend(v)
-        
-        # Deduplicate entries
-        for k in final_compared_to_dict:
-            final_compared_to_dict[k] = sorted(set(final_compared_to_dict[k]))
-        
-        # Save final dictionary
-        with open(compared_to_path, "w") as f:
-            json.dump(final_compared_to_dict, f)
-        
-        logger.info(f"📝 Saved final merged compared_to_dict to {compared_to_path}")
-        
+               
         # === Begin combination logic ===
         final_base_path = os.path.join(output_root_dir_and_output_dir, output_name)
         
         logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: prepare_catalogs id=prepare_catalogs")
-        
+
+        def load_compared_to(path):
+            with open(path) as f:
+                data = json.load(f)
+            return {k: set(v) for k, v in data.items()}
+
         if combine_mode == "concatenate":
             logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: consolidate id=consolidate")
             logger.info("🔗 Combining catalogs by simple concatenation (concatenate mode)")
-            dfs = [dd.read_parquet(p[0]) for p in prepared_paths]
+        
+            dfs = [dd.read_parquet(info["prepared_path"]) for info in prepared_catalogs_info]
             df_final = dd.concat(dfs).compute()
         
         elif combine_mode in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
@@ -241,14 +234,15 @@ def main(config_path, cwd=".", base_dir_override=None):
                 else:
                     logger.warning("⚠️ tiebreaking_priority is empty. Proceeding with delta_z_threshold tie-breaking only.")
         
-            # === Load initial catalog
-            initial_hats_path = prepared_hats_paths[0][0]
-            initial_margin_path = prepared_cache_paths[0]
-            
+            # === Load initial catalog (step 0)
+            initial_info = prepared_catalogs_info[0]
+            initial_hats_path = initial_info["hats_path"]
+            initial_margin_path = initial_info["margin_cache"]
+        
             if (
-                initial_margin_path
-                and os.path.exists(initial_margin_path)
-                and os.path.exists(os.path.join(initial_margin_path, "properties"))
+                initial_margin_path and
+                os.path.exists(initial_margin_path) and
+                os.path.exists(os.path.join(initial_margin_path, "properties"))
             ):
                 cat_prev = lsdb.read_hats(initial_hats_path, margin_cache=initial_margin_path)
             else:
@@ -257,89 +251,119 @@ def main(config_path, cwd=".", base_dir_override=None):
                 else:
                     logger.warning(f"⚠️ Margin cache exists but has no 'properties' file: {initial_margin_path}")
                 cat_prev = lsdb.read_hats(initial_hats_path)
-
-            for j in reversed(range(1, len(prepared_hats_paths))):
+        
+            # === Resume logic: check if any merged step was already completed
+            for j in reversed(range(1, len(prepared_catalogs_info))):
                 merged_path = os.path.join(temp_dir, f"merged_step{j}_hats")
                 if f"crossmatch_step{j}" in completed and os.path.exists(merged_path):
                     cat_prev = lsdb.read_hats(merged_path)
                     logger.info(f"🔁 Resuming from previous merged result: {merged_path}")
                     start_i = j + 1
+        
+                    compared_to_path = os.path.join(temp_dir, f"compared_to_xmatch_step{j}.json")
+                    if not os.path.exists(compared_to_path):
+                        logger.error(f"❌ Expected compared_to_xmatch_step{j}.json not found.")
+                        client.close(); cluster.close(); return
+        
+                    final_compared_to_dict = load_compared_to(compared_to_path)
+
                     break
             else:
                 start_i = 1
-        
-            # === Iterative crossmatching ===
-            for i in range(start_i, len(prepared_hats_paths)):
+                initial_compared_path = initial_info["compared_to_path"]
+                final_compared_to_dict = load_compared_to(initial_compared_path)
+
+            # === Iterative crossmatching
+            for i in range(start_i, len(prepared_catalogs_info)):
                 xmatch_tag = f"crossmatch_step{i}"
-                hats_path = prepared_hats_paths[i][0]
-                margin_path = prepared_cache_paths[i]
-                internal_name = prepared_hats_paths[i][3]
-                filename = os.path.basename(hats_path)
-            
+                curr_info = prepared_catalogs_info[i]
+                hats_path = curr_info["hats_path"]
+                margin_path = curr_info["margin_cache"]
+                internal_name = curr_info["internal_name"]
+                compared_path = curr_info["compared_to_path"]
+        
                 if xmatch_tag not in completed:
-                    # === Verifica se margin cache é válido
                     if margin_path and os.path.exists(margin_path) and os.path.exists(os.path.join(margin_path, "properties")):
                         cat_curr = lsdb.read_hats(hats_path, margin_cache=margin_path)
                     else:
                         logger.warning(f"⚠️ No valid margin cache found for {internal_name}. Proceeding without it.")
                         cat_curr = lsdb.read_hats(hats_path)
-            
+        
                     logger.info(f"🔄 Crossmatching previous result with: {internal_name}")
-                    is_last = (i == len(prepared_hats_paths) - 1)
-            
-                    cat_prev = crossmatch_tiebreak_safe(
-                        cat_prev,
-                        cat_curr,
-                        tiebreaking_priority,
-                        logs_dir,
-                        temp_dir,
-                        i,
-                        client,
-                        final_compared_to_dict,
-                        instrument_type_priority,
-                        translation_config,
-                        do_import=not is_last  # necessário para salvar merged_stepN
+                    is_last = (i == len(prepared_catalogs_info) - 1)
+        
+                    # === Call crossmatch_tiebreak with compared_to from left and right
+                    cat_prev, compared_to_path = crossmatch_tiebreak_safe(
+                        left_cat=cat_prev,
+                        right_cat=cat_curr,
+                        tiebreaking_priority=tiebreaking_priority,
+                        logs_dir=logs_dir,
+                        temp_dir=temp_dir,
+                        step=i,
+                        client=client,
+                        compared_to_left=final_compared_to_dict,
+                        compared_to_right=load_compared_to(compared_path),
+                        instrument_type_priority=instrument_type_priority,
+                        translation_config=translation_config,
+                        do_import=not is_last
                     )
-            
-                    # === Deletar temporários se necessário
-                    if delete_temp_files and i > 1:
-                        match = re.match(r"(\d+)_", internal_name)
-                        if not match:
-                            raise ValueError(f"❌ Could not extract numeric prefix from internal_name '{internal_name}'")
-                        prefix = match.group(1)
-            
-                        for path in [
-                            f"merged_step{i-1}", f"merged_step{i-1}_hats",
-                            f"cat{prefix}_hats", f"cat{prefix}_margin", f"xmatch_step{i}"
-                        ]:
-                            full_path = os.path.join(temp_dir, path)
-                            if os.path.exists(full_path):
-                                shutil.rmtree(full_path)
-                                logger.info(f"🗑️ Deleted temporary directory {full_path}")
-            
+
+                    final_compared_to_dict = load_compared_to(compared_to_path)
+        
                     log_step(log_file, xmatch_tag)
                 else:
                     logger.info(f"⏩ Skipping already completed step: {xmatch_tag}")
-
+        
             logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_catalogs id=crossmatch_catalogs")
             logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: consolidate id=consolidate")
         
-            final_merged = os.path.join(temp_dir, f"merged_step{len(prepared_paths)-1}")
+            final_merged = os.path.join(temp_dir, f"merged_step{len(prepared_catalogs_info)-1}")
             if not os.path.exists(final_merged):
                 logger.error(f"❌ Final merged Parquet folder not found: {final_merged}")
                 client.close(); cluster.close(); return
-        
-            df_final = dd.read_parquet(final_merged).compute()
-        
+    
+            # === Load final compared_to dict (for assigning to Dask before compute)
+            final_step = len(prepared_catalogs_info) - 1
+            final_compared_to_path = os.path.join(temp_dir, f"compared_to_xmatch_step{final_step}.json")
+    
+            if not os.path.exists(final_compared_to_path):
+                logger.error(f"❌ Final compared_to file not found: {final_compared_to_path}")
+                client.close(); cluster.close(); return
+    
+            final_compared_to_dict = load_compared_to(final_compared_to_path)
+    
+            # Convert dict to DataFrame with string-formatted compared_to column
+            compared_to_series = pd.Series({
+                k: ", ".join(sorted(v)) if v else ""
+                for k, v in final_compared_to_dict.items()
+            }).sort_index()
+            
+            compared_to_df = compared_to_series.rename("compared_to").reset_index().rename(columns={"index": "CRD_ID"})
+
+    
+            # === Load merged parquet as Dask dataframe
+            df_final = dd.read_parquet(final_merged)
+    
+            # === Assign compared_to column by merging with CRD_ID before compute
+            df_final = df_final.merge(
+                dd.from_pandas(compared_to_df, npartitions=1),
+                how="left",
+                on="CRD_ID"
+            )
+    
+            # === Compute final DataFrame
+            df_final = df_final.compute()
+    
             if combine_mode == "concatenate_and_remove_duplicates":
                 before = len(df_final)
                 df_final = df_final[df_final["tie_result"] == 1]
                 after = len(df_final)
                 logger.info(f"🧹 Removed duplicates: kept {after} of {before} rows (tie_result == 1)")
-        
+    
         else:
             logger.error(f"❌ Unknown combine_mode: {combine_mode}")
             client.close(); cluster.close(); return
+
 
     # === Final cleanup and save ===
     if combine_mode == "concatenate" and "tie_result" in df_final.columns:

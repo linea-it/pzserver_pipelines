@@ -1,18 +1,24 @@
+# === Built-in modules ===
 import os
 import json
+import logging
+import pathlib
 import warnings
+from datetime import datetime
+from collections import defaultdict
+
+# === Third-party libraries ===
 import numpy as np
 import pandas as pd
 import dask.dataframe as dd
 import lsdb
 
-def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, logs_dir, temp_dir, step, client, compared_to_dict, instrument_type_priority, translation_config, do_import=True):
+# === Local modules ===
+from combine_redshift_dedup.packages.specz import import_catalog
 
-    # === Logger setup ===
-    import logging
-    import pathlib
-    from datetime import datetime
-    
+def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, logs_dir, temp_dir, step, client, compared_to_left, compared_to_right, instrument_type_priority, translation_config, do_import=True):
+
+    # === Logger setup ===   
     log_path = pathlib.Path(logs_dir) / "crossmatch_and_merge_all.log"
     
     logger_x = logging.getLogger("crossmatch_and_merge_logger")
@@ -173,18 +179,45 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, logs_dir, tem
     )
     df = df.assign(tie_left=tie_results[0], tie_right=tie_results[1])
 
-    # Collect pairs for delta_z processing
+    # === Collect pairs for delta_z processing ===
     pairs = df[["CRD_IDleft", "CRD_IDright", "tie_left", "tie_right", "zleft", "zright"]].compute()
-
-    # Update compared_to_dict for all pairs
+    
+    # === NEW: Build dict of new pairs from this crossmatch step ===   
+    compared_to_new = defaultdict(set)
     for _, row in pairs.iterrows():
-        compared_to_dict.setdefault(str(row["CRD_IDleft"]), []).append(str(row["CRD_IDright"]))
-        compared_to_dict.setdefault(str(row["CRD_IDright"]), []).append(str(row["CRD_IDleft"]))
+        left = str(row["CRD_IDleft"])
+        right = str(row["CRD_IDright"])
+        compared_to_new[left].add(right)
+        compared_to_new[right].add(left)
+    
+    logger_x.info(f"🧮 New pairs this step: {sum(len(v) for v in compared_to_new.values())} total links in {len(compared_to_new)} objects")
+    
+    # === Merge with previous compared_to dicts ===
+    logger_x.info(f"📌 Compared_to (left): {sum(len(v) for v in compared_to_left.values())} links in {len(compared_to_left)} objects")
+    logger_x.info(f"📌 Compared_to (right): {sum(len(v) for v in compared_to_right.values())} links in {len(compared_to_right)} objects")
+    
+    compared_to_dict = defaultdict(set)
+    for d in [compared_to_left, compared_to_right]:
+        for k, v in d.items():
+            k_str = str(k)
+            v_str = map(str, v)
+            compared_to_dict[k_str].update(v_str)
+    
+    for k, new_vals in compared_to_new.items():
+        k_str = str(k)
+        compared_to_dict[k_str].update(map(str, new_vals))
+    
+    total_links = sum(len(v) for v in compared_to_dict.values())
+    logger_x.info(f"🔗 Compared_to (merged): {total_links} total links across {len(compared_to_dict)} objects")
 
-    # Save compared_to_dict to file
-    compared_to_path = os.path.join(temp_dir, "compared_to.json")
+    logger_x.info(f"🔢 Step {step}: Compared_to merge completed")
+    
+    # === Convert to sorted lists and save ===
+    compared_to_dict = {k: sorted(v) for k, v in compared_to_dict.items()}
+    compared_to_path = os.path.join(temp_dir, f"compared_to_xmatch_step{step}.json")
     with open(compared_to_path, "w") as f:
         json.dump(compared_to_dict, f)
+
 
     # Apply delta_z tie-breaking on hard ties
     if delta_z_threshold > 0:
@@ -244,10 +277,9 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, logs_dir, tem
     with open(hard_tie_path, "w") as f:
         json.dump(list(hard_tie_cumulative), f)
 
-    # Apply final tie_result and compared_to to original catalogs
+    # Apply final tie_result to original catalogs
     def apply_final(df_part):
         df_part["tie_result"] = df_part["CRD_ID"].map(final_results).fillna(df_part["tie_result"])
-        df_part["compared_to"] = df_part["CRD_ID"].map(lambda x: ",".join(compared_to_dict.get(str(x), [])))
         return df_part
 
     left_df = left_cat._ddf.map_partitions(apply_final)
@@ -269,7 +301,6 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, logs_dir, tem
         "survey": "string",
         "source": "string",
         "tie_result": "int64",
-        "compared_to": "string",
         "z_flag_homogenized": "float64",
         "instrument_type_homogenized": "string",
     }
@@ -296,75 +327,108 @@ def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, logs_dir, tem
 
     # Import merged catalog to HATS
     if do_import:
-        from combine_redshift_dedup.packages.specz import import_catalog
         import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, logs_dir, logger_x, client)
         logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
-        return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats"))
+        return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats")), compared_to_path
     else:
         logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
-        return merged_path
+        return merged_path, compared_to_path
 
-def crossmatch_tiebreak_safe(*args, **kwargs):
-
+def crossmatch_tiebreak_safe(
+    left_cat,
+    right_cat,
+    tiebreaking_priority,
+    logs_dir,
+    temp_dir,
+    step,
+    client,
+    compared_to_left,
+    compared_to_right,
+    instrument_type_priority,
+    translation_config,
+    do_import=True,
+):
     # === Logger setup ===
-    import logging
-    import pathlib
-    from datetime import datetime
-
-    logs_dir = args[3]
-    step = args[5]
-    
     log_path = pathlib.Path(logs_dir) / "crossmatch_and_merge_all.log"
-    
     logger_x = logging.getLogger("crossmatch_and_merge_logger")
     logger_x.setLevel(logging.INFO)
-    
-    # Remove todos os handlers previamente registrados (para evitar duplicação)
+
+    # Clear previous handlers to avoid duplicate log lines
     if logger_x.hasHandlers():
         logger_x.handlers.clear()
-    
+
     fh = logging.FileHandler(log_path)
     fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
     logger_x.addHandler(fh)
 
     logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: crossmatch_and_merge id=merged_step{step}")
 
-    # ===================
-    
+    # === Try main crossmatch logic ===
     try:
-        return crossmatch_tiebreak(*args, **kwargs)
+        return crossmatch_tiebreak(
+            left_cat=left_cat,
+            right_cat=right_cat,
+            tiebreaking_priority=tiebreaking_priority,
+            logs_dir=logs_dir,
+            temp_dir=temp_dir,
+            step=step,
+            client=client,
+            compared_to_left=compared_to_left,
+            compared_to_right=compared_to_right,
+            instrument_type_priority=instrument_type_priority,
+            translation_config=translation_config,
+            do_import=do_import,
+        )
+
+    # === Fallback logic for non-overlapping catalogs or empty result ===
     except RuntimeError as e:
         if (
             "The output catalog is empty" in str(e)
             or "Catalogs do not overlap" in str(e)
         ):
             logger_x.info(f"⚠️ {e} Proceeding by merging left and right without crossmatching.")
-            left_cat, right_cat = args[0], args[1]
-            logs_dir = args[3]
-            temp_dir = args[4]
-            step = args[5]
-            client = args[6]
-            compared_to_dict = args[7]
+    
+            # === Merge input compared_to dicts cumulatively ===
+            compared_to_dict = defaultdict(set)
+            for d in [compared_to_left, compared_to_right]:
+                for k, v in d.items():
+                    k_str = str(k)
+                    v_str = map(str, v)
+                    compared_to_dict[k_str].update(v_str)
+            
+            # === Convert to sorted lists and save ===
+            compared_to_dict = {k: sorted(v) for k, v in compared_to_dict.items()}
+            
+            compared_to_path = os.path.join(temp_dir, f"compared_to_xmatch_step{step}.json")
+            with open(compared_to_path, "w") as f:
+                json.dump(compared_to_dict, f)
 
+            # === Concatenate left and right Dask DataFrames ===
             left_df = left_cat._ddf
             right_df = right_cat._ddf
             merged = dd.concat([left_df, right_df])
 
-            merged = merged.assign(
-                compared_to=merged["id"].map(lambda x: ",".join(compared_to_dict.get(str(x), [])))
-            )
-
+            # === Save merged result to disk ===
             merged_path = os.path.join(temp_dir, f"merged_step{step}")
             merged.to_parquet(merged_path, write_index=False)
 
-            # Import merged catalog to HATS
-            if kwargs.get("do_import", True):  # novo controle aqui também
-                from combine_redshift_dedup.packages.specz import import_catalog
-                import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, logs_dir, logger_x, client)
+            # === Import merged catalog to HATS format if requested ===
+            if do_import:
+                import_catalog(
+                    merged_path,
+                    "ra",
+                    "dec",
+                    f"merged_step{step}_hats",
+                    temp_dir,
+                    logs_dir,
+                    logger_x,
+                    client,
+                )
                 logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
-                return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats"))
+                return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats")), compared_to_path
             else:
                 logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
-                return merged_path
+                return merged_path, compared_to_path
         else:
+            # Re-raise unexpected exceptions
             raise

@@ -141,7 +141,7 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
     # Define path and initialize dict for all modes
     compared_to_filename = f"compared_to_dict_{catalog_prefix}.json"
     compared_to_path = os.path.join(temp_dir, compared_to_filename)
-    compared_to_dict_solo = defaultdict(list)
+    compared_to_dict_solo = defaultdict(set)
     
     # Get partition sizes and offsets
     sizes = df.map_partitions(len).compute().tolist()
@@ -358,8 +358,8 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
                 ids_all = group["CRD_ID"].tolist()
                 for i, id1 in enumerate(ids_all):
                     for id2 in ids_all[i + 1:]:
-                        compared_to_dict_solo.setdefault(id1, []).append(id2)
-                        compared_to_dict_solo.setdefault(id2, []).append(id1)
+                        compared_to_dict_solo[id1].add(id2)
+                        compared_to_dict_solo[id2].add(id1)
 
             # Merge tie updates back to main dataframe
             if tie_updates:
@@ -376,7 +376,7 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
 
     # Save compared_to_dict even if it's empty (for concatenate mode)
     with open(compared_to_path, "w") as f:
-        json.dump(compared_to_dict_solo, f)
+        json.dump({k: sorted(v) for k, v in compared_to_dict_solo.items()}, f)
 
     # === Flag objects inside any DP1 region ===
     # Hardcoded list of DP1 regions: (RA_center, DEC_center, radius_deg)
