@@ -1,34 +1,51 @@
+# =====================
+# Built-in modules
+# =====================
 import argparse
+import json
 import os
 import re
-import time
-import json
 import shutil
+import time
 import warnings
-import pandas as pd
-import numpy as np
-from dask import delayed, compute
-import dask.dataframe as dd
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from collections import defaultdict
-from dask.distributed import Client, performance_report
 
-# === Imports from internal packages ===
-from combine_redshift_dedup.packages.utils import (
-    load_yml, dump_yml, setup_logger, set_global_logger,
-    log_step, read_completed_steps,
-    update_process_info, log_and_print,
-    configure_warning_handler, configure_exception_hook,
-    get_global_logger
-)
-from combine_redshift_dedup.packages.executor import get_executor
-from combine_redshift_dedup.packages.specz import (
-    prepare_catalog, import_catalog, generate_margin_cache_safe
-)
-from combine_redshift_dedup.packages.crossmatch import crossmatch_tiebreak_safe
-from combine_redshift_dedup.packages.product_handle import save_dataframe
+# =====================
+# Third-party libraries
+# =====================
+import dask.dataframe as dd
+import numpy as np
+import pandas as pd
+from dask import compute, delayed
+from dask.distributed import Client, performance_report
 import lsdb
+
+# =====================
+# Project-specific libraries
+# =====================
+from combine_redshift_dedup.packages.crossmatch import crossmatch_tiebreak_safe
+from combine_redshift_dedup.packages.executor import get_executor
+from combine_redshift_dedup.packages.product_handle import save_dataframe
+from combine_redshift_dedup.packages.specz import (
+    generate_margin_cache_safe,
+    import_catalog,
+    prepare_catalog
+)
+from combine_redshift_dedup.packages.utils import (
+    configure_exception_hook,
+    configure_warning_handler,
+    dump_yml,
+    get_global_logger,
+    load_yml,
+    log_and_print,
+    log_step,
+    read_completed_steps,
+    set_global_logger,
+    setup_logger,
+    update_process_info
+)
 
 def main(config_path, cwd=".", base_dir_override=None):
     """

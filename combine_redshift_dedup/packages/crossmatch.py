@@ -1,19 +1,25 @@
-# === Built-in modules ===
-import os
+# =====================
+# Built-in modules
+# =====================
 import json
 import logging
+import os
 import pathlib
 import warnings
-from datetime import datetime
 from collections import defaultdict
+from datetime import datetime
 
-# === Third-party libraries ===
-import numpy as np
-import pandas as pd
+# =====================
+# Third-party libraries
+# =====================
 import dask.dataframe as dd
 import lsdb
+import numpy as np
+import pandas as pd
 
-# === Local modules ===
+# =====================
+# Project-specific libraries
+# =====================
 from combine_redshift_dedup.packages.specz import import_catalog
 
 def crossmatch_tiebreak(left_cat, right_cat, tiebreaking_priority, logs_dir, temp_dir, step, client, compared_to_left, compared_to_right, instrument_type_priority, translation_config, do_import=True):

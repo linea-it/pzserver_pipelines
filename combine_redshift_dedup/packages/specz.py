@@ -1,23 +1,33 @@
-# combine_redshift_dedup/packages/specz.py
-
+# =====================
+# Standard library
+# =====================
 import os
 import re
 import ast
 import glob
 import json
-import lsdb
-from datetime import datetime
-import numpy as np
 import warnings
+import logging
+import pathlib
+from datetime import datetime
 from collections import defaultdict
+
+# =====================
+# Third-party libraries
+# =====================
+import numpy as np
 import pandas as pd
 import dask.dataframe as dd
+from dask.distributed import get_client
 
+# =====================
+# Project-specific libraries
+# =====================
+import lsdb
+import hats
 from hats_import.pipeline import ImportArguments, pipeline_with_client
 from hats_import.catalog.file_readers import ParquetReader
 from hats_import.margin_cache.margin_cache_arguments import MarginCacheArguments
-import hats
-
 from combine_redshift_dedup.packages.product_handle import ProductHandle
 
 
@@ -43,14 +53,9 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
     Returns:
         tuple: (output_path, ra_col_name, dec_col_name, internal_catalog_name)
     """
-    from dask.distributed import get_client
     client = get_client()
     
     # === Logger setup ===
-    import logging
-    import pathlib
-    from datetime import datetime
-    
     product_name = entry["internal_name"]
     log_path = pathlib.Path(logs_dir) / "prepare_all.log"
     
