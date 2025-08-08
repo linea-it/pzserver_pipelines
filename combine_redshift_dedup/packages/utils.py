@@ -6,12 +6,14 @@ import pathlib
 import sys
 import traceback
 import warnings
-import yaml
+
 import pandas as pd
+import yaml
 
 # ============================================================
 # Logger setup and global access
 # ============================================================
+
 
 def setup_logger(name="combine_redshift_dedup", logdir="."):
     """
@@ -30,7 +32,7 @@ def setup_logger(name="combine_redshift_dedup", logdir="."):
 
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-    file_handler = logging.FileHandler(pathlib.Path(logdir, f"{name}.log"))
+    file_handler = logging.FileHandler(pathlib.Path(logdir, "pipeline.log"))
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
 
@@ -49,9 +51,11 @@ def setup_logger(name="combine_redshift_dedup", logdir="."):
 
 _global_logger = None
 
+
 def set_global_logger(logger):
     global _global_logger
     _global_logger = logger
+
 
 def get_global_logger():
     """
@@ -59,6 +63,7 @@ def get_global_logger():
     Falls back to `logging.getLogger(__name__)` if not set.
     """
     return _global_logger or logging.getLogger(__name__)
+
 
 def log_and_print(message, logger):
     """
@@ -71,9 +76,11 @@ def log_and_print(message, logger):
     print(message)
     logger.info(message)
 
+
 # ============================================================
 # YAML utilities
 # ============================================================
+
 
 def load_yml(filepath):
     """
@@ -98,12 +105,14 @@ def dump_yml(filepath, content, encoding="utf-8"):
         content (dict): Data to be saved.
         encoding (str): File encoding.
     """
-    with open(filepath, 'w', encoding=encoding) as f:
+    with open(filepath, "w", encoding=encoding) as f:
         yaml.dump(content, f)
+
 
 # ============================================================
 # Process tracking
 # ============================================================
+
 
 def log_step(log_file, step_name):
     """
@@ -146,9 +155,11 @@ def update_process_info(process_info, process_info_path, key, value):
     process_info[key] = value
     dump_yml(process_info_path, process_info)
 
+
 # ============================================================
 # Error and warning handling
 # ============================================================
+
 
 def configure_warning_handler(logger):
     """
@@ -157,7 +168,10 @@ def configure_warning_handler(logger):
     Args:
         logger (logging.Logger): Logger to handle warnings.
     """
-    def custom_warning_handler(message, category, filename, lineno, file=None, line=None):
+
+    def custom_warning_handler(
+        message, category, filename, lineno, file=None, line=None
+    ):
         warning_msg = f"{category.__name__}: {message} ({filename}:{lineno})"
         logger.warning(warning_msg)
 
@@ -173,17 +187,22 @@ def configure_exception_hook(logger, process_info, process_info_path):
         process_info (dict): Current process info.
         process_info_path (str): Path to process.yml.
     """
+
     def handle_exception(exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):
             sys.__excepthook__(exc_type, exc_value, exc_traceback)
             return
 
         traceback.print_exception(exc_type, exc_value, exc_traceback)
-        logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+        logger.error(
+            "Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback)
+        )
 
         try:
             update_process_info(process_info, process_info_path, "status", "Failed")
-            update_process_info(process_info, process_info_path, "end_time", str(pd.Timestamp.now()))
+            update_process_info(
+                process_info, process_info_path, "end_time", str(pd.Timestamp.now())
+            )
         except Exception as e:
             logger.warning(f"⚠️ Could not update process.yml after failure: {e}")
 
