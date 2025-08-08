@@ -49,7 +49,7 @@ class Runner:
         self.logdir = create_logdir(cwd)
 
         # Setup logger
-        self.logger = setup_logger("tsm", logdir=self.logdir)
+        self.logger, logname = setup_logger(logdir=self.logdir)
 
         # Set up working directory
         self.cwd = cwd
@@ -61,11 +61,11 @@ class Runner:
         if not self.process_info_path.is_file():
             self.process_info_path.touch()
 
-        # Loading process info yaml
-        process_info = load_yml(self.process_info_path)
-        if not process_info:
-            process_info = {}
-        self.process_info = process_info
+        # Initialize process info
+        self.process_info = {}
+
+        # Set logfile in process info
+        self.add_info("log_file", Path(self.logdir.name, logname))
 
         # Set up initial time tracking
         self.add_info("start_time", datetime.datetime.now())
@@ -136,7 +136,9 @@ class Runner:
             ra = columns.get("ra", "ra")
             dec = columns.get("dec", "dec")
 
-            specz_df = lsdb.from_dataframe(df, use_pyarrow_types=False, ra_column=ra, dec_column=dec)
+            specz_df = lsdb.from_dataframe(
+                df, use_pyarrow_types=False, ra_column=ra, dec_column=dec
+            )
 
             dataset_path, margin_cache_path = self.__get_photometric_data_path()
             dataset_id = self.inputs.get("dataset").get("columns", {}).get("id", "id")
