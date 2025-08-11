@@ -98,44 +98,62 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
                     df[col] = df[col].str.strip().str.upper()
             except Exception as e:
                 logger_prep.warning(f"⚠️ {product_name} Failed to convert column '{col}' to str: {e}")
-    
+
     # Float columns (ra, dec, z, z_err, z_flag)
     for col in ["ra", "dec", "z", "z_err", "z_flag"]:
         if col in df.columns:
             try:
                 if col == "z_flag":
-                    # Special case: JADES uses letter flags A→4.0, B→3.0, etc.
-                    letter_to_score = {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "E": 0.0}
-
-                    def map_jades_partition(partition):
+                    # Special case mappings
+                    jades_letter_to_score = {
+                        "A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "E": 0.0
+                    }
+                    vimos_flag_to_score = {
+                        "LRB_X": 0.0, "MR_X": 0.0,
+                        "LRB_B": 1.0, "LRB_C": 1.0, "MR_C": 1.0,
+                        "MR_B": 3.0,
+                        "LRB_A": 4.0, "MR_A": 4.0
+                    }
+    
+                    def map_special_partition(partition):
                         partition = partition.copy()
                         if "survey" not in partition or "z_flag" not in partition:
                             return partition
-
+    
                         # Ensure z_flag is treated as string for mapping
                         z_flag_str = partition["z_flag"].astype(str)
-
-                        # Mask for JADES rows
-                        mask = partition["survey"].str.upper() == "JADES"
-
-                        def map_flag(val):
+    
+                        # Masks for special cases
+                        mask_jades = partition["survey"].str.upper() == "JADES"
+                        mask_vimos = partition["survey"].str.upper() == "VIMOS"
+    
+                        def map_jades(val):
                             if pd.isna(val) or val == "":
                                 return np.nan
                             val_str = str(val).strip().upper()
-                            return letter_to_score.get(val_str, np.nan)
-
-                        # Apply mapping only to JADES
-                        mapped = z_flag_str.where(~mask, z_flag_str.map(map_flag))
-                        partition["z_flag"] = mapped
+                            return jades_letter_to_score.get(val_str, np.nan)
+    
+                        def map_vimos(val):
+                            if pd.isna(val) or val == "":
+                                return np.nan
+                            val_str = str(val).strip().upper()
+                            return vimos_flag_to_score.get(val_str, np.nan)
+    
+                        # Apply mapping only to matching rows
+                        z_flag_str = z_flag_str.where(~mask_jades, z_flag_str.map(map_jades))
+                        z_flag_str = z_flag_str.where(~mask_vimos, z_flag_str.map(map_vimos))
+    
+                        partition["z_flag"] = z_flag_str
                         return partition
-
-                    df = df.map_partitions(map_jades_partition)
-
+    
+                    df = df.map_partitions(map_special_partition)
+    
                 # Now cast to float
                 df[col] = df[col].astype(float)
-
             except Exception as e:
-                logger_prep.warning(f"⚠️ {product_name} Failed to convert column '{col}' to float: {e}")
+                logger_prep.warning(
+                    f"⚠️ {product_name} Failed to convert column '{col}' to float: {e}"
+                )
 
     # === Generate unique CRD_IDs using product_name prefix ===
     match = re.match(r"(\d+)_", product_name)
