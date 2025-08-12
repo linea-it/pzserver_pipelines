@@ -1,7 +1,7 @@
 import logging
 import pathlib
-from typing import Any
 import shutil
+from typing import Any
 
 import yaml
 
@@ -17,7 +17,7 @@ def create_logdir(cwd: str) -> pathlib.Path:
     return logdir
 
 
-def setup_logger(name="tsm", logdir="."):
+def setup_logger(name="training_set_maker", logdir="."):
     """
     Configures the logger for recording events and messages.
 
@@ -27,16 +27,17 @@ def setup_logger(name="tsm", logdir="."):
 
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
+    logname = "pipeline.log"
 
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-
-    file_handler = logging.FileHandler(pathlib.Path(logdir, f"{name}.log"))
+    filename = pathlib.Path(logdir, logname)
+    file_handler = logging.FileHandler(filename)
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
 
     logger.addHandler(file_handler)
 
-    return logger
+    return logger, logname
 
 
 def load_yml(filepath: str) -> Any:
