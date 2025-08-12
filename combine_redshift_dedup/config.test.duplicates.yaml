@@ -4,19 +4,26 @@
 # More general reference: http://www.yaml.org/spec/1.2/spec.html
 
 executor:
-  name: "slurm" # Name of the job scheduler
+  name: "local"
   args:
-    instance:
-      cores: 25 # Number of cores per job
-      processes: 1 # Number of processes per job
-      memory: "50GB" # Memory allocated per job
-      queue: "cpu" # Queue name
-      account: "hpc-bpglsst"
-      job_extra_directives: # Extra directives for Slurm
-        - "--propagate"
-        - "--time=2:00:00"
-    scale:
-      jobs: 10 # Fixed number of dask jobs
+    n_workers: 3
+    threads_per_worker: 2
+    memory_limit: "7GB"
+
+#executor:
+#  name: "slurm" # Name of the job scheduler
+#  args:
+#    instance:
+#      cores: 25 # Number of cores per job
+#      processes: 1 # Number of processes per job
+#      memory: "50GB" # Memory allocated per job
+#      queue: "cpu" # Queue name
+#      account: "hpc-bpglsst"
+#      job_extra_directives: # Extra directives for Slurm
+#        - "--propagate"
+#        - "--time=2:00:00"
+#    scale:
+#      jobs: 10 # Fixed number of dask jobs
 
 inputs:
   specz:
