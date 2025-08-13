@@ -8,7 +8,7 @@ executor:
   args:
     n_workers: 3
     threads_per_worker: 2
-    memory_limit: "7GB"
+    memory_limit: "6GB"
 
 #executor:
 #  name: "slurm" # Name of the job scheduler
