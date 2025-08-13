@@ -1,0 +1,156 @@
+##################################################################
+# Parameters file. Should follow the syntax defined in:
+# http://docs.ansible.com/ansible/latest/YAMLSyntax.html
+# More general reference: http://www.yaml.org/spec/1.2/spec.html
+
+executor:
+  name: "slurm" # Name of the job scheduler
+  args:
+    instance:
+      cores: 25 # Number of cores per job
+      processes: 1 # Number of processes per job
+      memory: "50GB" # Memory allocated per job
+      queue: "lsst_cpu" # Queue name
+      account: "hpc-lsst"
+      job_extra_directives: # Extra directives for Slurm
+        - "--propagate"
+        - "--time=2:00:00"
+    scale:
+      jobs: 10 # Fixed number of dask jobs
+
+inputs:
+  specz:
+    # List of redshift catalogs to combine. Each entry contains:
+    # - path: full path to the file
+    # - internal_name: unique label used internally
+    # - columns: mapping from standard keys to column names in the file
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2dfgrs_final_release.parquet"
+      internal_name: "001_2dfgrs_final_release"
+      columns:
+        id: "name"
+        ra: "ra_j2000_deg"
+        dec: "dec_j2000_deg"
+        z: "z"
+        z_flag: "quality"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2dflens_final_release.parquet"
+      internal_name: "002_2dflens_final_release"
+      columns:
+        id: "unique_id"
+        ra: "RA"
+        dec: "Dec"
+        z: "z"
+        z_flag: "qual"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/2mrs_v240.parquet"
+      internal_name: "003_2mrs_v240"
+      columns:
+        id: "TMID"
+        ra: "RA"
+        dec: "DEC"
+        z: "redshift"
+        z_flag: null
+        z_err: "redshift_err"
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/6dfgs_dr3.parquet"
+      internal_name: "004_6dfgs_dr3"
+      columns:
+        id: "SPECID"
+        ra: "RA_deg"
+        dec: "DEC_deg"
+        z: "Z"
+        z_flag: "QUALITY"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/desi_dr1_in_lsst_dp1_fields.parquet"
+      internal_name: "005_desi_dr1"
+      columns:
+        id: "TARGETID"
+        ra: "TARGET_RA"
+        dec: "TARGET_DEC"
+        z: "Z"
+        z_flag: "ZWARN"
+        z_err: "ZERR"
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/jades_dr3.parquet"
+      internal_name: "006_jades_dr3"
+      columns:
+        id: "unique_id"
+        ra: "RA_TARG"
+        dec: "Dec_TARG"
+        z: "z_Spec"
+        z_flag: "z_Spec_flag"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/mosdef_final_release.parquet"
+      internal_name: "007_mosdef_final_release"
+      columns:
+        id: "ID"
+        ra: "RA"
+        dec: "DEC"
+        z: "Z_MOSFIRE"
+        z_flag: "Z_QUAL"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/ozdes_dr2.parquet"
+      internal_name: "008_ozdes_dr2"
+      columns:
+        id: "OzDES_ID"
+        ra: "Alpha_J2000"
+        dec: "Delta_J2000"
+        z: "z"
+        z_flag: "qop"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/primus_dr1.parquet"
+      internal_name: "009_primus_dr1"
+      columns:
+        id: "OBJNAME"
+        ra: "RA"
+        dec: "DEC"
+        z: "Z"
+        z_flag: "ZQUALITY"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/vandels_dr4.parquet"
+      internal_name: "010_vandels_dr4"
+      columns:
+        id: "id"
+        ra: "alpha"
+        dec: "delta"
+        z: "zspec"
+        z_flag: "zflg"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "/scratch/users/luigi.silva/speczs-catalogs/processed/vvds_final_release.parquet"
+      internal_name: "011_vvds_final_release"
+      columns:
+        id: "NUM"
+        ra: "ALPHA"
+        dec: "DELTA"
+        z: "Z"
+        z_flag: "ZFLAGS"
+        z_err: null
+        survey: "survey_name"
+
+output_root_dir: "process001"
+output_dir: "outputs" # Relative directory for final outputs
+output_name: "crd" # Name prefix for the final output files
+output_format: "parquet" # Output format: csv, parquet, hdf5, or fits
+
+param:
+  combine_type: "concatenate_and_mark_duplicates" # Options: "concatenate", "concatenate_and_mark_duplicates", or "concatenate_and_remove_duplicates"
+  flags_translation_file: flags_translation.yaml # File with homogenization rules for z_flag and type

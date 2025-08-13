@@ -72,8 +72,23 @@ translation_rules:
           value: 4
         - expr: "z_err >= 0.0005"
           value: 3
+      default: 0
     instrument_type_translation:
       default: "s"
+
+  # TO BE REVIEWED
+  3D-HST:
+    z_flag_translation:
+      conditions:
+        - expr: "z_best_s == 0"
+          value: 6
+        - expr: "z_best_s == 1 and z_spec != -1 and flag1 == 0 and flag2 == 0"
+          value: 4
+        - expr: "z_best_s == 2 and use_zgrism == 1 and use_phot == 1 and flag1 == 0 and flag2 == 0"
+          value: 3
+      default: 0
+    instrument_type_translation:
+      default: "g"
 
   6DFGS:
     z_flag_translation:
@@ -97,6 +112,7 @@ translation_rules:
           value: 4
         - expr: "z_flag == 0 and ZCAT_PRIMARY == True and z_err >= 0.0005"
           value: 3
+      default: 0
     instrument_type_translation:
       default: "s"
 
@@ -168,6 +184,16 @@ translation_rules:
       213: 4
       214: 4
       219: 3
+    instrument_type_translation:
+      default: "s"
+
+  VIMOS:
+    z_flag_translation:
+      4: 4
+      3: 3
+      2: 2
+      1: 1
+      0: 0
     instrument_type_translation:
       default: "s"
 

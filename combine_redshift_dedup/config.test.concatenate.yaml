@@ -8,7 +8,7 @@ executor:
   args:
     n_workers: 3
     threads_per_worker: 2
-    memory_limit: "6GB"
+    memory_limit: "7GB"
 
 #executor:
 #  name: "slurm" # Name of the job scheduler
@@ -71,5 +71,5 @@ output_name: "crd" # Name prefix for the final output files
 output_format: "parquet" # Output format: csv, parquet, hdf5, or fits
 
 param:
-  combine_type: "concatenate_and_mark_duplicates" # Options: "concatenate", "concatenate_and_mark_duplicates", or "concatenate_and_remove_duplicates"
+  combine_type: "concatenate" # Options: "concatenate", "concatenate_and_mark_duplicates", or "concatenate_and_remove_duplicates"
   flags_translation_file: flags_translation.yaml # File with homogenization rules for z_flag and type

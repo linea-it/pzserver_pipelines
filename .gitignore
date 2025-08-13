@@ -140,3 +140,6 @@ pipelines.yaml
 pipelines.yml
 config.yaml
 config.yml
+
+# process folders 
+*/process* 
