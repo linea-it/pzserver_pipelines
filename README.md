@@ -69,7 +69,7 @@ mkdir process001
 To validate your test results, use the notebook `validation.ipynb`: 
 
 ```
-conda install -c anaconda ipykernel
+conda install -c conda-forge jupyterlab ipykernel
 python -m ipykernel install --user --name=pipe_crd
 jupyter lab
 ```
