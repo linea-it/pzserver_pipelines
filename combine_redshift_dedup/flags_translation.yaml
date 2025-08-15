@@ -197,6 +197,36 @@ translation_rules:
     instrument_type_translation:
       default: "s"
 
+  VUDS:
+    z_flag_translation:
+      1: 1
+      11: 1
+      21: 1
+      31: 1
+      41: 1
+      2: 2
+      12: 2
+      22: 2
+      32: 2
+      42: 2
+      9: 2
+      19: 2
+      29: 2
+      39: 2
+      49: 2
+      3: 3
+      13: 3
+      23: 3
+      33: 3
+      43: 3
+      4: 4
+      14: 4
+      24: 4
+      34: 4
+      44: 4
+    instrument_type_translation:
+      default: "s"
+
   VVDS:
     z_flag_translation:
       0: 0 
