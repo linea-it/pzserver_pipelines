@@ -48,6 +48,14 @@ set -x
 # Run Python script; if it fails, the ERR trap will trigger
 PYTHONPATH="$PIPELINES_DIR:${PYTHONPATH:-}" \
 python "$PIPE_BASE/scripts/crd-run.py" "$CONFIG_PATH" --base_dir "$BASE_DIR_OVERRIDE"
+PIPE_EXIT=$?
 
 set +x
-echo "Done."
+echo "Pipeline exited with code: $PIPE_EXIT"
+if [ $PIPE_EXIT -eq 0 ]; then
+    echo "✅ Success"
+else
+    echo "❌ Fail"
+fi
+
+exit $PIPE_EXIT
