@@ -7,11 +7,11 @@ training_set_maker:
   schema_config: '<PIPELINES_DIR>/training_set_maker/config.py'
   version: '0.0.1'
 
-combine_specz:
-  display_name: 'Combine Specz Catalogs'
-  path: '<PIPELINES_DIR>/combine_specz'
+combine_redshift_dedup:
+  display_name: 'Combine Redshift Catalogs'
+  path: '<PIPELINES_DIR>/combine_redshift_dedup'
   executor: 'local' # only to orchestration
   runner: 'bash'
   executable: 'run.sh'
-  schema_config: '<PIPELINES_DIR>/combine_specz/config.py'
+  schema_config: '<PIPELINES_DIR>/combine_redshift_dedup/config.py'
   version: '0.0.1'
