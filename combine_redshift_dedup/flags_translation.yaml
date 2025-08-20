@@ -125,6 +125,23 @@ translation_rules:
         - expr: "zspec_survey == '-'"
           value: "p"
       default: "p"
+      
+  # TO BE REVIEWED
+  ASTRODEEP-JWST:
+    z_flag_translation:
+      conditions:
+        - expr: "zspec != -99 and z_flag < 400 and (len(str(int(z_flag))) <= 1 or int(str(int(z_flag))[-2]) <= 3)"
+          value: 4
+        - expr: "zspec == -99 and z_flag < 400 and (len(str(int(z_flag))) <= 1 or int(str(int(z_flag))[-2]) <= 3)"
+          value: 3
+      default: 0
+    instrument_type_translation:
+      conditions:
+        - expr: "zspec != -99"
+          value: "s"
+        - expr: "zspec == -99"
+          value: "p"
+      default: "p"
 
   # TO BE REVIEWED
   DESI:
