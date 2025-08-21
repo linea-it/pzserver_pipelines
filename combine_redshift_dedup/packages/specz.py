@@ -577,7 +577,11 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
         final_columns.append("z_flag_homogenized")
     if "instrument_type_homogenized" in df.columns:
         final_columns.append("instrument_type_homogenized")
-    
+
+    # Include type column, if it exists
+    if "type" in df.columns:
+        final_columns.append("type")
+
     # Ensure all tiebreaking columns are included if present in the DataFrame
     extra_columns = [
         col for col in tiebreaking_priority
