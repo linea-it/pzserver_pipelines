@@ -17,6 +17,7 @@ from collections import defaultdict
 # =====================
 import numpy as np
 import pandas as pd
+import dask
 import dask.dataframe as dd
 from dask.distributed import get_client
 
@@ -62,7 +63,6 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
     logger_prep = logging.getLogger("prepare_catalog_logger")
     logger_prep.setLevel(logging.INFO)
     
-    # Remove todos os handlers previamente registrados (para evitar duplicação)
     if logger_prep.hasHandlers():
         logger_prep.handlers.clear()
     
@@ -78,6 +78,7 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
     ph = ProductHandle(entry["path"])
     df = ph.to_ddf()
 
+    # Apply renaming from YAML
     col_map = {v: k for k, v in entry["columns"].items() if v and v in df.columns}
     df = df.rename(columns=col_map)
     df["source"] = product_name
@@ -99,6 +100,15 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
             except Exception as e:
                 logger_prep.warning(f"⚠️ {product_name} Failed to convert column '{col}' to str: {e}")
 
+    # --- FAST PATH pre-normalization: auxiliary columns ---
+    # NOTE: Pre-normalize optional columns used by fast paths (type only here).
+    if "type" in df.columns:
+        try:
+            # Keep lowercase to make membership checks trivial (s/g/p)
+            df["type"] = df["type"].fillna("").astype(str).str.strip().str.lower()
+        except Exception as e:
+            logger_prep.warning(f"⚠️ {product_name} Failed to convert 'type' to str: {e}")
+
     # Float columns (ra, dec, z, z_err, z_flag)
     for col in ["ra", "dec", "z", "z_err", "z_flag"]:
         if col in df.columns:
@@ -119,33 +129,51 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
                         partition = partition.copy()
                         if "survey" not in partition or "z_flag" not in partition:
                             return partition
-    
-                        # Ensure z_flag is treated as string for mapping
-                        z_flag_str = partition["z_flag"].astype(str)
-    
+                    
                         # Masks for special cases
                         mask_jades = partition["survey"].str.upper() == "JADES"
                         mask_vimos = partition["survey"].str.upper() == "VIMOS"
-    
+                    
+                        # Early return: if neither JADES nor VIMOS present
+                        if not (mask_jades.any() or mask_vimos.any()):
+                            return partition
+
+                        # NOTE: Preserve numeric entries as-is; only map non-numeric ones
+                        zf_num = pd.to_numeric(partition["z_flag"], errors="coerce")
+                        num_mask = zf_num.notna()
+                    
+                        # Ensure z_flag is treated as string for mapping (used only on non-numeric subset)
+                        z_flag_str = partition["z_flag"].astype(str)
+                    
                         def map_jades(val):
                             if pd.isna(val) or val == "":
                                 return np.nan
                             val_str = str(val).strip().upper()
                             return jades_letter_to_score.get(val_str, np.nan)
-    
+                    
                         def map_vimos(val):
                             if pd.isna(val) or val == "":
                                 return np.nan
                             val_str = str(val).strip().upper()
                             return vimos_flag_to_score.get(val_str, np.nan)
-    
-                        # Apply mapping only to matching rows
-                        z_flag_str = z_flag_str.where(~mask_jades, z_flag_str.map(map_jades))
-                        z_flag_str = z_flag_str.where(~mask_vimos, z_flag_str.map(map_vimos))
-    
-                        partition["z_flag"] = z_flag_str
+                    
+                        # Apply mapping only to non-numeric entries where survey matches
+                        nonnum_mask = ~num_mask
+                        idx_jades = nonnum_mask & mask_jades
+                        if idx_jades.any():
+                            z_flag_str.loc[idx_jades] = z_flag_str.loc[idx_jades].map(map_jades)
+                        idx_vimos = nonnum_mask & mask_vimos
+                        if idx_vimos.any():
+                            z_flag_str.loc[idx_vimos] = z_flag_str.loc[idx_vimos].map(map_vimos)
+
+                        # Merge: keep original numeric values; use mapped values for previous non-numerics
+                        mapped_numeric = pd.to_numeric(z_flag_str, errors="coerce")
+                        result = zf_num.copy()
+                        result[nonnum_mask] = mapped_numeric[nonnum_mask]
+                    
+                        partition["z_flag"] = result
                         return partition
-    
+
                     df = df.map_partitions(map_special_partition)
     
                 # Now cast to float
@@ -154,7 +182,7 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
                 logger_prep.warning(
                     f"⚠️ {product_name} Failed to convert column '{col}' to float: {e}"
                 )
-
+            
     # === Generate unique CRD_IDs using product_name prefix ===
     match = re.match(r"(\d+)_", product_name)
     if not match:
@@ -248,21 +276,97 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
     instrument_type_priority = translation_config.get("instrument_type_priority", {})
     
     # Only generate homogenized columns if they are required for tie-breaking
+    # --- FAST PATHS: try deterministic derivations first; if they fail, fallback to YAML translation ---
     if "z_flag_homogenized" in tiebreaking_priority:
         if "z_flag_homogenized" not in df.columns:
-            df["z_flag_homogenized"] = df.map_partitions(
-                lambda p: p.apply(lambda row: apply_translation(row, "z_flag"), axis=1),
-                meta=("z_flag_homogenized", "f8")
-            )
+
+            # Decide if z_flag can be interpreted as quality in [0,1] with at least one fractional value
+            def can_use_zflag_as_quality() -> bool:
+                if "z_flag" not in df.columns:
+                    return False
+                try:
+                    cnt = df["z_flag"].count()
+                    minv = df["z_flag"].min()
+                    maxv = df["z_flag"].max()
+                    frac_cnt = df[(df["z_flag"] > 0.0) & (df["z_flag"] < 1.0)]["z_flag"].count()
+                    cnt, minv, maxv, frac_cnt = dask.compute(cnt, minv, maxv, frac_cnt)  # single round-trip
+                    if cnt == 0 or not np.isfinite(minv) or not np.isfinite(maxv):
+                        return False
+                    if not (minv >= 0.0 and maxv <= 1.0):
+                        return False
+                    return frac_cnt > 0
+                except Exception as e:
+                    logger_prep.warning(f"⚠️ {product_name} Could not validate 'z_flag' as quality-like: {e}")
+                    return False
+
+            # Map [0,1] quality-like z_flag to VVDS-inspired bins
+            def quality_like_to_flag(x):
+                if pd.isna(x):
+                    return np.nan
+                x = float(x)
+                if x == 0.0:
+                    return 0.0
+                if 0.0 < x < 0.7:
+                    return 1.0
+                if 0.7 <= x < 0.9:
+                    return 2.0
+                if 0.9 <= x < 0.99:
+                    return 3.0
+                if 0.99 <= x <= 1.0:
+                    return 4.0
+                return np.nan  # outside expected range
+
+            used_zflag_quality_fastpath = False
+            if can_use_zflag_as_quality():
+                logger_prep.info(f"{product_name} Using 'z_flag' (quality-like) fast path for z_flag_homogenized.")
+                df["z_flag_homogenized"] = df["z_flag"].map_partitions(
+                    lambda s: s.apply(quality_like_to_flag),
+                    meta=("z_flag_homogenized", "f8"),
+                )
+                used_zflag_quality_fastpath = True
+            else:
+                # Fallback to YAML translation as before
+                logger_prep.info(f"{product_name} z_flag not quality-like; falling back to YAML translation for z_flag_homogenized.")
+                df["z_flag_homogenized"] = df.map_partitions(
+                    lambda p: p.apply(lambda row: apply_translation(row, "z_flag"), axis=1),
+                    meta=("z_flag_homogenized", "f8")
+                )
         else:
-            logger_prep.warning(f"{product_name} Column 'z_flag_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
+            logger_prep.warning(
+                f"{product_name} Column 'z_flag_homogenized' already exists in catalog '{product_name}'. Skipping translation."
+            )
     
     if "instrument_type_homogenized" in tiebreaking_priority:
         if "instrument_type_homogenized" not in df.columns:
-            df["instrument_type_homogenized"] = df.map_partitions(
-                lambda p: p.apply(lambda row: apply_translation(row, "instrument_type"), axis=1),
-                meta=("instrument_type_homogenized", "object")
-            )
+            # Fast path from type ∈ {s,g,p}
+            def can_use_type_for_instrument() -> bool:
+                if "type" not in df.columns:
+                    return False
+                try:
+                    allowed = {"s", "g", "p"}
+                    uniques = df["type"].dropna().unique().compute().tolist()
+                    # Filter empty strings that may appear after fillna
+                    uniques = [u for u in uniques if isinstance(u, str) and u != ""]
+                    if len(uniques) == 0:
+                        return False
+                    return all(u in allowed for u in uniques)
+                except Exception as e:
+                    logger_prep.warning(f"⚠️ {product_name} Could not validate 'type' values: {e}")
+                    return False
+
+            used_type_fastpath = False
+            if can_use_type_for_instrument():
+                logger_prep.info(f"{product_name} Using 'type' fast path for instrument_type_homogenized.")
+                # Copy as-is (already normalized to lower-case)
+                df["instrument_type_homogenized"] = df["type"].astype(object)
+                used_type_fastpath = True
+            else:
+                # Fallback to YAML translation as before
+                logger_prep.info(f"{product_name} type column not type-like; falling back to YAML translation for instrument_type_homogenized.")
+                df["instrument_type_homogenized"] = df.map_partitions(
+                    lambda p: p.apply(lambda row: apply_translation(row, "instrument_type"), axis=1),
+                    meta=("instrument_type_homogenized", "object")
+                )
         else:
             logger_prep.warning(f"{product_name} Column 'instrument_type_homogenized' already exists in catalog '{product_name}'. Skipping translation.")
 
@@ -478,7 +582,10 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
         final_columns.append("z_flag_homogenized")
     if "instrument_type_homogenized" in df.columns:
         final_columns.append("instrument_type_homogenized")
-    
+
+    if used_type_fastpath:
+        df["instrument_type"] = df["type"].fillna("").astype(str)
+            
     # Ensure all tiebreaking columns are included if present in the DataFrame
     extra_columns = [
         col for col in tiebreaking_priority
