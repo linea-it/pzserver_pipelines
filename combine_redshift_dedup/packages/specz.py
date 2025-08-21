@@ -109,12 +109,12 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
         except Exception as e:
             logger_prep.warning(f"⚠️ {product_name} Failed to convert 'type' to str: {e}")
 
-    # === Float columns (ra, dec, z, z_err, z_flag) ===
+    # Float columns (ra, dec, z, z_err, z_flag)
     for col in ["ra", "dec", "z", "z_err", "z_flag"]:
         if col in df.columns:
             try:
                 if col == "z_flag":
-                    # --- Special case mappings ---
+                    # Special case mappings
                     jades_letter_to_score = {
                         "A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "E": 0.0
                     }
@@ -129,56 +129,60 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
                         partition = partition.copy()
                         if "survey" not in partition or "z_flag" not in partition:
                             return partition
-    
-                        # --- Early exits if z_flag is already numeric ---
-                        zf_num = pd.to_numeric(partition["z_flag"], errors="coerce")
-                        nonnull = zf_num.notna()
-                        if nonnull.any():
-                            uniq_vals = pd.unique(zf_num[nonnull])
-                            allowed = {0.0, 1.0, 2.0, 3.0, 4.0}
-                            # 1) Already in VVDS-inspired discrete {0..4}
-                            if set(float(v) for v in uniq_vals if pd.notna(v)).issubset(allowed):
-                                partition["z_flag"] = zf_num
-                                return partition
-                            # 2) Confidence-like [0,1] with fractional values
-                            zmin = zf_num[nonnull].min()
-                            zmax = zf_num[nonnull].max()
-                            has_fractional = ((zf_num > 0.0) & (zf_num < 1.0)).any()
-                            if pd.notna(zmin) and pd.notna(zmax) and (zmin >= 0.0) and (zmax <= 1.0) and has_fractional:
-                                partition["z_flag"] = zf_num
-                                return partition
-    
-                        # --- Otherwise, treat as string and apply special mappings ---
-                        z_flag_str = partition["z_flag"].astype(str)
+                    
+                        # Masks for special cases
                         mask_jades = partition["survey"].str.upper() == "JADES"
                         mask_vimos = partition["survey"].str.upper() == "VIMOS"
-    
+                    
+                        # Early return: if neither JADES nor VIMOS present
+                        if not (mask_jades.any() or mask_vimos.any()):
+                            return partition
+
+                        # NOTE: Preserve numeric entries as-is; only map non-numeric ones
+                        zf_num = pd.to_numeric(partition["z_flag"], errors="coerce")
+                        num_mask = zf_num.notna()
+                    
+                        # Ensure z_flag is treated as string for mapping (used only on non-numeric subset)
+                        z_flag_str = partition["z_flag"].astype(str)
+                    
                         def map_jades(val):
                             if pd.isna(val) or val == "":
                                 return np.nan
-                            return jades_letter_to_score.get(str(val).strip().upper(), np.nan)
-    
+                            val_str = str(val).strip().upper()
+                            return jades_letter_to_score.get(val_str, np.nan)
+                    
                         def map_vimos(val):
                             if pd.isna(val) or val == "":
                                 return np.nan
-                            return vimos_flag_to_score.get(str(val).strip().upper(), np.nan)
-    
-                        z_flag_str = z_flag_str.where(~mask_jades, z_flag_str.map(map_jades))
-                        z_flag_str = z_flag_str.where(~mask_vimos, z_flag_str.map(map_vimos))
-    
-                        partition["z_flag"] = z_flag_str
+                            val_str = str(val).strip().upper()
+                            return vimos_flag_to_score.get(val_str, np.nan)
+                    
+                        # Apply mapping only to non-numeric entries where survey matches
+                        nonnum_mask = ~num_mask
+                        idx_jades = nonnum_mask & mask_jades
+                        if idx_jades.any():
+                            z_flag_str.loc[idx_jades] = z_flag_str.loc[idx_jades].map(map_jades)
+                        idx_vimos = nonnum_mask & mask_vimos
+                        if idx_vimos.any():
+                            z_flag_str.loc[idx_vimos] = z_flag_str.loc[idx_vimos].map(map_vimos)
+
+                        # Merge: keep original numeric values; use mapped values for previous non-numerics
+                        mapped_numeric = pd.to_numeric(z_flag_str, errors="coerce")
+                        result = zf_num.copy()
+                        result[nonnum_mask] = mapped_numeric[nonnum_mask]
+                    
+                        partition["z_flag"] = result
                         return partition
-    
+
                     df = df.map_partitions(map_special_partition)
     
-                # --- Finally, cast to float ---
+                # Now cast to float
                 df[col] = df[col].astype(float)
-    
             except Exception as e:
                 logger_prep.warning(
                     f"⚠️ {product_name} Failed to convert column '{col}' to float: {e}"
                 )
-
+            
     # === Generate unique CRD_IDs using product_name prefix ===
     match = re.match(r"(\d+)_", product_name)
     if not match:
@@ -358,6 +362,7 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
                 used_type_fastpath = True
             else:
                 # Fallback to YAML translation as before
+                logger_prep.info(f"{product_name} type column not type-like; falling back to YAML translation for instrument_type_homogenized.")
                 df["instrument_type_homogenized"] = df.map_partitions(
                     lambda p: p.apply(lambda row: apply_translation(row, "instrument_type"), axis=1),
                     meta=("instrument_type_homogenized", "object")
@@ -578,10 +583,9 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
     if "instrument_type_homogenized" in df.columns:
         final_columns.append("instrument_type_homogenized")
 
-    # Include type column, if it exists
-    if "type" in df.columns:
-        final_columns.append("type")
-
+    if used_type_fastpath:
+        df["instrument_type"] = df["type"].fillna("").astype(str)
+            
     # Ensure all tiebreaking columns are included if present in the DataFrame
     extra_columns = [
         col for col in tiebreaking_priority
