@@ -82,12 +82,21 @@ translation_rules:
       conditions:
         - expr: "z_best_s == 0"
           value: 6
-        - expr: "z_best_s == 1 and z_spec != -1 and flag1 == 0 and flag2 == 0"
+        - expr: "z_best_s == 1 and z_spec != -1"
           value: 4
-        - expr: "z_best_s == 2 and use_zgrism == 1 and use_phot == 1 and flag1 == 0 and flag2 == 0"
+        - expr: "z_best_s == 2 and use_zgrism == 1 and flag1 == 0 and flag2 == 0"
+          value: 3
+        - expr: "z_best_s == 3 and use_phot == 1"
           value: 3
       default: 0
     instrument_type_translation:
+      conditions:
+        - expr: "z_best_s == 1"
+          value: "s"
+        - expr: "z_best_s == 2"
+          value: "g"
+        - expr: "z_best_s == 3"
+          value: "p"
       default: "g"
 
   6DFGS:
@@ -99,6 +108,40 @@ translation_rules:
       6: 6
     instrument_type_translation:
       default: "s"
+      
+  # TO BE REVIEWED
+  ASTRODEEP:
+    z_flag_translation:
+      conditions:
+        - expr: "zspec_survey != '-'"
+          value: 4
+        - expr: "zspec_survey == '-'"
+          value: 3
+      default: 0
+    instrument_type_translation:
+      conditions:
+        - expr: "zspec_survey != '-'"
+          value: "s"
+        - expr: "zspec_survey == '-'"
+          value: "p"
+      default: "p"
+      
+  # TO BE REVIEWED
+  ASTRODEEP-JWST:
+    z_flag_translation:
+      conditions:
+        - expr: "zspec != -99 and z_flag < 400 and (len(str(int(z_flag))) <= 1 or int(str(int(z_flag))[-2]) <= 3)"
+          value: 4
+        - expr: "zspec == -99 and z_flag < 400 and (len(str(int(z_flag))) <= 1 or int(str(int(z_flag))[-2]) <= 3)"
+          value: 3
+      default: 0
+    instrument_type_translation:
+      conditions:
+        - expr: "zspec != -99"
+          value: "s"
+        - expr: "zspec == -99"
+          value: "p"
+      default: "p"
 
   # TO BE REVIEWED
   DESI:
