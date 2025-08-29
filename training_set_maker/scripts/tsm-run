@@ -149,7 +149,7 @@ class Runner:
                     f"Dataset path does not exist: {str(dataset_path)}"
                 )
 
-            dataset = lsdb.read_hats(dataset_path, margin_cache=margin_cache_path)
+            dataset = lsdb.open_catalog(path=dataset_path, margin_cache=margin_cache_path)
             duplicate_criteria = self.param.get("duplicate_criteria", "closest")
             cm_args = self.param.get("crossmatch", {})
             self.logger.debug("Crossmatch args: %s", cm_args)
@@ -206,8 +206,6 @@ class Runner:
             )
 
             self.__register_outputs(self.output_root_dir, outputfile, columns_assoc)
-
-            self.logger.debug("--> Object Count: \n%s", str(data.count()))
 
         self.end_time = time.time() - self.start_time
         self.logger.info("Time elapsed: %s", str(self.end_time))

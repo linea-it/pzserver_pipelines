@@ -107,7 +107,7 @@ if __name__ == "__main__":
 
     cfg = Config()
 
-    with open("config.yml", "w", encoding="utf-8") as outfile:
+    with open("config.yaml", "w", encoding="utf-8") as outfile:
         data_json = cfg.model_dump()
         print(data_json)
         yaml.dump(data_json, outfile)

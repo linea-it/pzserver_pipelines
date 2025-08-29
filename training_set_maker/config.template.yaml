@@ -35,11 +35,11 @@ inputs:
 
 output_dir: "outputs"
 output_format: "csv"
-output_name: "tsm.parquet"
+output_name: "tsm"
 
 param:
   duplicate_criteria: "closest"
-  flux_types: "auto"
+  flux_type: "auto"
   convert_flux_to_mag: true
   dereddening: "sfd"
   crossmatch:
