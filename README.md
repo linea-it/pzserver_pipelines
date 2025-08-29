@@ -52,7 +52,7 @@ To execute, simply:
 
 ```bash
 # execute combine redshift catalogs 
-cd $PIPELINES_DIR/combine_redhift_dedup 
+cd $PIPELINES_DIR/combine_redshift_dedup 
 ./run.sh config.yaml process001
 ```
 
