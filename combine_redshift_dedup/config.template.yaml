@@ -32,38 +32,38 @@ inputs:
     # - internal_name: unique label used internally
     # - columns: mapping from standard keys to column names in the file
 
-    - path: "data/mock1.parquet"
-      internal_name: "001_mock"
+    - path: "test_data/2dfgrs_final_release_random_sample.parquet"
+      internal_name: "001_2dfgrs_final_release"
       columns:
-        id: "id_1"
-        ra: "ra_1"
-        dec: "dec_1"
-        z: "z_1"
-        z_flag: "z_flag_1"
+        id: "name"
+        ra: "ra_j2000_deg"
+        dec: "dec_j2000_deg"
+        z: "z"
+        z_flag: "quality"
         z_err: null
-        survey: "survey_1"
+        survey: "survey_name"
 
-    - path: "data/mock2.parquet"
-      internal_name: "002_mock"
+    - path: "test_data/2dflens_final_release_random_sample.parquet"
+      internal_name: "002_2dflens_final_release"
       columns:
-        id: "id_2"
-        ra: "ra_2"
-        dec: "dec_2"
-        z: "z_2"
-        z_flag: "z_flag_2"
+        id: "unique_id"
+        ra: "RA"
+        dec: "Dec"
+        z: "z"
+        z_flag: "qual"
         z_err: null
-        survey: "survey_2"
+        survey: "survey_name"
 
-    - path: "data/mock3.parquet"
-      internal_name: "003_mock"
+    - path: "test_data/2mrs_v240_random_sample.parquet"
+      internal_name: "003_2mrs_v240"
       columns:
-        id: "id_3"
-        ra: "ra_3"
-        dec: "dec_3"
-        z: "z_3"
+        id: "TMID"
+        ra: "RA"
+        dec: "DEC"
+        z: "redshift"
         z_flag: null
-        z_err: "z_err_3"
-        survey: "survey_3"
+        z_err: "redshift_err"
+        survey: "survey_name"
 
 output_root_dir: "process001"
 output_dir: "outputs" # Relative directory for final outputs

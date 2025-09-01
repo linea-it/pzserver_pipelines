@@ -353,18 +353,19 @@ def main(config_path, cwd=".", base_dir_override=None):
                 margin_path = curr_info["margin_cache"]
                 internal_name = curr_info["internal_name"]
                 compared_path = curr_info["compared_to_path"]
-        
+                
                 if xmatch_tag not in completed:
+                    # Load catalog with margin cache if available
                     if margin_path and os.path.exists(margin_path) and os.path.exists(os.path.join(margin_path, "properties")):
                         cat_curr = lsdb.read_hats(hats_path, margin_cache=margin_path)
                     else:
                         logger.warning(f"⚠️ No valid margin cache found for {internal_name}. Proceeding without it.")
                         cat_curr = lsdb.read_hats(hats_path)
-        
+            
                     logger.info(f"🔄 Crossmatching previous result with: {internal_name}")
                     is_last = (i == len(prepared_catalogs_info) - 1)
-        
-                    # === Call crossmatch_tiebreak with compared_to from left and right
+            
+                    # Perform crossmatch with tie-breaking logic
                     cat_prev, compared_to_path = crossmatch_tiebreak_safe(
                         left_cat=cat_prev,
                         right_cat=cat_curr,
@@ -379,63 +380,75 @@ def main(config_path, cwd=".", base_dir_override=None):
                         translation_config=translation_config,
                         do_import=not is_last
                     )
-
+            
+                    # Update compared_to dict
                     final_compared_to_dict = load_compared_to(compared_to_path)
-        
                     log_step(log_file, xmatch_tag)
-
-                    # === Clean up previous step only after successful completion
+            
+                    # Clean temporary files from previous step
                     if delete_temp_files:
                         cleanup_previous_step(i, temp_dir, prepared_catalogs_info, logger)
                 else:
                     logger.info(f"⏩ Skipping already completed step: {xmatch_tag}")
-        
+            
             logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_catalogs id=crossmatch_catalogs")
             logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: consolidate id=consolidate")
-        
+            
             final_merged = os.path.join(temp_dir, f"merged_step{len(prepared_catalogs_info)-1}")
             if not os.path.exists(final_merged):
                 logger.error(f"❌ Final merged Parquet folder not found: {final_merged}")
                 client.close(); cluster.close(); return
-    
-            # === Load final compared_to dict (for assigning to Dask before compute)
+            
+            # === Load final compared_to dict
             final_step = len(prepared_catalogs_info) - 1
             final_compared_to_path = os.path.join(temp_dir, f"compared_to_xmatch_step{final_step}.json")
-    
             if not os.path.exists(final_compared_to_path):
                 logger.error(f"❌ Final compared_to file not found: {final_compared_to_path}")
                 client.close(); cluster.close(); return
-    
+            
             final_compared_to_dict = load_compared_to(final_compared_to_path)
-    
-            # Convert dict to DataFrame with string-formatted compared_to column
+            
+            # Build RHS DataFrame (CRD_ID -> compared_to)
             compared_to_series = pd.Series({
                 k: ", ".join(sorted(v)) if v else ""
                 for k, v in final_compared_to_dict.items()
             }).sort_index()
             
-            compared_to_df = compared_to_series.rename("compared_to").reset_index().rename(columns={"index": "CRD_ID"})
-
-    
-            # === Load merged parquet as Dask dataframe
-            df_final = dd.read_parquet(final_merged)
-    
-            # === Assign compared_to column by merging with CRD_ID before compute
-            df_final = df_final.merge(
-                dd.from_pandas(compared_to_df, npartitions=1),
-                how="left",
-                on="CRD_ID"
+            compared_to_df = (
+                compared_to_series.rename("compared_to")
+                .reset_index()
+                .rename(columns={"index": "CRD_ID"})
             )
-    
-            # === Compute final DataFrame
+            
+            # Coerce RHS to string dtype
+            compared_to_df = compared_to_df.copy()
+            compared_to_df["CRD_ID"] = compared_to_df["CRD_ID"].astype("string")
+            
+            # Convert RHS to Dask
+            rhs = dd.from_pandas(compared_to_df, npartitions=1, sort=False)
+            
+            # Load merged parquet (LHS)
+            df_final = dd.read_parquet(final_merged)
+            
+            # === Option A: cast both sides to object dtype for merge ===
+            df_final = df_final.assign(CRD_ID=df_final["CRD_ID"].astype("object"))
+            rhs = rhs.astype({"CRD_ID": "object"})
+            
+            # Merge without meta
+            df_final = dd.merge(df_final, rhs, how="left", on="CRD_ID")
+            
+            # Compute final DataFrame
             df_final = df_final.compute()
-    
+            
+            # Restore CRD_ID to StringDtype after compute
+            df_final["CRD_ID"] = df_final["CRD_ID"].astype("string")
+            
+            # Remove duplicates if configured
             if combine_mode == "concatenate_and_remove_duplicates":
                 before = len(df_final)
                 df_final = df_final[df_final["tie_result"] == 1]
                 after = len(df_final)
                 logger.info(f"🧹 Removed duplicates: kept {after} of {before} rows (tie_result == 1)")
-    
         else:
             logger.error(f"❌ Unknown combine_mode: {combine_mode}")
             client.close(); cluster.close(); return
