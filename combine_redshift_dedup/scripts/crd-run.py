@@ -29,10 +29,10 @@ from combine_redshift_dedup.packages.crossmatch import crossmatch_tiebreak_safe
 from combine_redshift_dedup.packages.executor import get_executor
 from combine_redshift_dedup.packages.product_handle import save_dataframe
 from combine_redshift_dedup.packages.specz import (
-    generate_margin_cache_safe,
-    import_catalog,
-    prepare_catalog
+    prepare_catalog,
+    USE_ARROW_TYPES, DTYPE_STR, DTYPE_FLOAT, DTYPE_INT, DTYPE_BOOL, DTYPE_INT8,
 )
+
 from combine_redshift_dedup.packages.utils import (
     configure_exception_hook,
     configure_warning_handler,
@@ -46,6 +46,7 @@ from combine_redshift_dedup.packages.utils import (
     setup_logger,
     update_process_info
 )
+
 
 def main(config_path, cwd=".", base_dir_override=None):
     """
@@ -420,28 +421,40 @@ def main(config_path, cwd=".", base_dir_override=None):
                 .rename(columns={"index": "CRD_ID"})
             )
             
-            # Coerce RHS to string dtype
-            compared_to_df = compared_to_df.copy()
-            compared_to_df["CRD_ID"] = compared_to_df["CRD_ID"].astype("string")
+            # Arrow-backed strings
+            compared_to_df["CRD_ID"] = compared_to_df["CRD_ID"].astype(DTYPE_STR)
+            compared_to_df["compared_to"] = compared_to_df["compared_to"].astype(DTYPE_STR)
             
-            # Convert RHS to Dask
+            # To Dask
             rhs = dd.from_pandas(compared_to_df, npartitions=1, sort=False)
-            
+
             # Load merged parquet (LHS)
             df_final = dd.read_parquet(final_merged)
             
             # === Option A: cast both sides to object dtype for merge ===
-            df_final = df_final.assign(CRD_ID=df_final["CRD_ID"].astype("object"))
-            rhs = rhs.astype({"CRD_ID": "object"})
+            try:
+                df_final = df_final.assign(CRD_ID=df_final["CRD_ID"].astype(DTYPE_STR))
+                rhs = rhs.assign(CRD_ID=rhs["CRD_ID"].astype(DTYPE_STR))
+                df_final = dd.merge(df_final, rhs, how="left", on="CRD_ID")
+            except Exception:
+                # Fallback for older Dask/Pandas edge cases.
+                df_final = df_final.assign(CRD_ID=df_final["CRD_ID"].astype("object"))
+                rhs = rhs.astype({"CRD_ID": "object"})
+                df_final = dd.merge(df_final, rhs, how="left", on="CRD_ID")
             
-            # Merge without meta
-            df_final = dd.merge(df_final, rhs, how="left", on="CRD_ID")
-            
-            # Compute final DataFrame
             df_final = df_final.compute()
+
+            if USE_ARROW_TYPES:
+                df_final = df_final.convert_dtypes(dtype_backend="pyarrow")
+
+                for c in df_final.columns:
+                    if pd.api.types.is_string_dtype(df_final[c].dtype):
+                        df_final[c] = df_final[c].astype(DTYPE_STR)
+
+            df_final["CRD_ID"] = df_final["CRD_ID"].astype(DTYPE_STR)
             
-            # Restore CRD_ID to StringDtype after compute
-            df_final["CRD_ID"] = df_final["CRD_ID"].astype("string")
+            if "compared_to" in df_final.columns:
+                df_final["compared_to"] = df_final["compared_to"].astype(DTYPE_STR)
             
             # Remove duplicates if configured
             if combine_mode == "concatenate_and_remove_duplicates":

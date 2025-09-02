@@ -38,6 +38,10 @@ import pandas as pd
 from combine_redshift_dedup.packages.specz import (
     import_catalog,
     _normalize_string_series_to_na,
+    _add_missing_with_dtype,
+    _to_nullable_boolean_strict,
+    _normalize_schema_hints,
+    DTYPE_STR, DTYPE_FLOAT, DTYPE_INT, DTYPE_BOOL, DTYPE_INT8,
 )
 
 if TYPE_CHECKING:
@@ -528,47 +532,103 @@ def crossmatch_tiebreak(
     merged = dd.concat([left_ddf, right_ddf])
 
     # ------------------------------------------------------------------
-    # Stabilize dtypes (nullable) before saving
+    # Stabilize dtypes (nullable/Arrow) before saving
     # ------------------------------------------------------------------
     expected_types = {
-        "CRD_ID": "string",
-        "id": "string",
-        "ra": "Float64",
-        "dec": "Float64",
-        "z": "Float64",
-        "z_flag": "Float64",
-        "z_err": "Float64",
-        "instrument_type": "string",
-        "survey": "string",
-        "source": "string",
-        "tie_result": "Int8",  # align with specz.py
-        "z_flag_homogenized": "Float64",
-        "instrument_type_homogenized": "string",
+        "CRD_ID": DTYPE_STR,
+        "id": DTYPE_STR,
+        "ra": DTYPE_FLOAT,
+        "dec": DTYPE_FLOAT,
+        "z": DTYPE_FLOAT,
+        "z_flag": DTYPE_FLOAT,
+        "z_err": DTYPE_FLOAT,
+        "instrument_type": DTYPE_STR,
+        "survey": DTYPE_STR,
+        "source": DTYPE_STR,
+        "tie_result": DTYPE_INT8,  # align with specz.py
+        "z_flag_homogenized": DTYPE_FLOAT,
+        "instrument_type_homogenized": DTYPE_STR,
     }
     for col in tiebreaking_priority:
-        expected_types[col] = "string" if col == "instrument_type_homogenized" else "Float64"
-
+        expected_types[col] = DTYPE_STR if col == "instrument_type_homogenized" else DTYPE_FLOAT
+    
     for col, dtype in expected_types.items():
         if col not in merged.columns:
             continue
         try:
-            if dtype == "string":
+            if dtype == DTYPE_STR:
                 merged[col] = merged[col].map_partitions(
                     _normalize_string_series_to_na,
-                    meta=pd.Series(pd.array([], dtype="string")),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
                 )
-            elif dtype == "Float64":
+            elif dtype in (DTYPE_FLOAT,):
                 merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
-                    lambda s: s.astype("Float64"),
-                    meta=pd.Series(pd.array([], dtype="Float64")),
+                    lambda s: s.astype(DTYPE_FLOAT),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
                 )
-            elif dtype == "Int8":
+            elif dtype in (DTYPE_INT8,):
                 merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
-                    lambda s: s.astype("Int8"),
-                    meta=pd.Series(pd.array([], dtype="Int8")),
+                    lambda s: s.astype(DTYPE_INT8),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
+                )
+            elif dtype in (DTYPE_INT,):
+                merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
+                    lambda s: s.astype(DTYPE_INT),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
+                )
+            elif dtype == DTYPE_BOOL:
+                merged[col] = merged[col].map_partitions(
+                    lambda s: s.astype(DTYPE_BOOL),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
                 )
         except Exception as e:
             logger.warning("Failed to cast column '%s' to %s: %s", col, dtype, e)
+
+    # ------------------------------------------------------------------
+    # (Optional) Sanitize expr columns types, if requested in YAML
+    # ------------------------------------------------------------------
+    if translation_config.get("save_expr_columns", False):
+        schema_hints_raw = translation_config.get("expr_column_schema", {}) or {}
+        schema_hints = _normalize_schema_hints(schema_hints_raw)
+
+        standard = {"id", "ra", "dec", "z", "z_flag", "z_err", "instrument_type", "survey"}
+
+        for col, kind in schema_hints.items():
+            if col in standard:
+                continue
+
+            if col in merged.columns:
+                if kind == "str":
+                    merged[col] = merged[col].map_partitions(
+                        _normalize_string_series_to_na,
+                        meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
+                    )
+                elif kind == "float":
+                    coerced = dd.to_numeric(merged[col], errors="coerce")
+                    merged[col] = coerced.map_partitions(
+                        lambda s: s.astype(DTYPE_FLOAT),
+                        meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
+                    )
+                elif kind == "int":
+                    coerced = dd.to_numeric(merged[col], errors="coerce")
+                    merged[col] = coerced.map_partitions(
+                        lambda s: s.astype(DTYPE_INT),
+                        meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
+                    )
+                elif kind == "bool":
+                    merged[col] = merged[col].map_partitions(
+                        _to_nullable_boolean_strict,
+                        meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
+                    )
+            else:
+                if kind == "str":
+                    merged = _add_missing_with_dtype(merged, col, DTYPE_STR)
+                elif kind == "float":
+                    merged = _add_missing_with_dtype(merged, col, DTYPE_FLOAT)
+                elif kind == "int":
+                    merged = _add_missing_with_dtype(merged, col, DTYPE_INT)
+                elif kind == "bool":
+                    merged = _add_missing_with_dtype(merged, col, DTYPE_BOOL)
 
     # --- Save merged parquet ---
     merged_path = os.path.join(temp_dir, f"merged_step{step}")

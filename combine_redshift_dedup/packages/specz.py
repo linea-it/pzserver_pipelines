@@ -27,7 +27,7 @@ import re
 import shutil
 from collections import defaultdict
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 # -----------------------
 # Third-party
@@ -51,6 +51,26 @@ from hats_import.pipeline import ImportArguments, pipeline_with_client
 if TYPE_CHECKING:
     # Avoid heavy imports at runtime just for typing
     from dask.distributed import Client  # noqa: F401
+
+# -----------------------
+# Arrow-backed dtypes (pandas >= 2.x)
+# -----------------------
+import pyarrow as pa
+
+USE_ARROW_TYPES = True
+
+if USE_ARROW_TYPES:
+    DTYPE_STR   = pd.ArrowDtype(pa.string())
+    DTYPE_FLOAT = pd.ArrowDtype(pa.float64())
+    DTYPE_INT   = pd.ArrowDtype(pa.int64())
+    DTYPE_BOOL  = pd.ArrowDtype(pa.bool_())
+    DTYPE_INT8  = pd.ArrowDtype(pa.int8())
+else:
+    DTYPE_STR   = "string"
+    DTYPE_FLOAT = "Float64"
+    DTYPE_INT   = "Int64"
+    DTYPE_BOOL  = "boolean"
+    DTYPE_INT8  = "Int8"
 
 # -----------------------
 # Module exports & constants
@@ -205,15 +225,16 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
     df["source"] = product_name
 
     base_schema = {
-        "id": "string",
-        "instrument_type": "string",
-        "survey": "string",
-        "ra": "Float64",
-        "dec": "Float64",
-        "z": "Float64",
-        "z_flag": "Float64",
-        "z_err": "Float64",
+        "id": DTYPE_STR,
+        "instrument_type": DTYPE_STR,
+        "survey": DTYPE_STR,
+        "ra": DTYPE_FLOAT,
+        "dec": DTYPE_FLOAT,
+        "z": DTYPE_FLOAT,
+        "z_flag": DTYPE_FLOAT,
+        "z_err": DTYPE_FLOAT,
     }
+
     for col, pd_dtype in base_schema.items():
         if col not in df.columns:
             df = _add_missing_with_dtype(df, col, pd_dtype)
@@ -224,22 +245,25 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
 # -----------------------
 # Type helpers
 # -----------------------
-def _add_missing_with_dtype(_df: dd.DataFrame, col: str, pd_dtype: str) -> dd.DataFrame:
-    """Add a missing column with a pandas *nullable dtype* and correct meta.
+def _add_missing_with_dtype(_df: dd.DataFrame, col: str, pd_dtype: Any) -> dd.DataFrame:
+    """Add a missing column with a nullable/extension dtype and correct Dask meta.
 
-    The column is filled with ``<NA>`` (including string dtype). This preserves
-    schema consistency across partitions and avoids surprises in downstream
-    computations that assume nullable semantics.
+    If `col` already exists, returns `_df` unchanged.
 
     Args:
-        _df (dd.DataFrame): Input Dask DataFrame.
-        col (str): Column name to add.
-        pd_dtype (str): Pandas extension dtype string (e.g., ``"Float64"``,
-            ``"Int64"``, ``"string"``, ``"boolean"``).
+      _df: Input Dask DataFrame.
+      col: Column name to add if missing.
+      pd_dtype: Target pandas dtype (e.g., "Float64", "Int64", "string", "boolean",
+        or a pandas ExtensionDtype such as `pd.ArrowDtype(pa.float64())`).
 
     Returns:
-        dd.DataFrame: DataFrame with the new column added.
+      dd.DataFrame: `_df` if `col` exists; otherwise a new DataFrame with `col`
+      filled with <NA> and typed as `pd_dtype`.
     """
+    if col in _df.columns:
+        return _df
+
+    # Accurate meta via empty Series of the requested dtype.
     meta_added = _df._meta.assign(**{col: pd.Series(pd.array([], dtype=pd_dtype))})
 
     def _adder(part: pd.DataFrame) -> pd.DataFrame:
@@ -251,39 +275,39 @@ def _add_missing_with_dtype(_df: dd.DataFrame, col: str, pd_dtype: str) -> dd.Da
 
 
 def _normalize_string_series_to_na(s: pd.Series) -> pd.Series:
-    """Normalize a Series to pandas StringDtype and coerce empty/placeholder strings to ``<NA>``.
+    """Normalize to StringDtype and coerce placeholders to <NA>.
 
-    Operations performed:
-      - Cast to ``string`` dtype
-      - Trim leading/trailing whitespace
-      - Map ``''``, ``None``, ``'none'``, ``'null'``, ``'nan'`` (case-insensitive) to ``<NA>``
+    Operations:
+      * cast to string dtype
+      * strip whitespace
+      * map '', None, 'none', 'null', 'nan' (case-insensitive) to <NA>
 
     Args:
-        s (pd.Series): Input Series of any dtype.
+      s: Input Series.
 
     Returns:
-        pd.Series: Normalized StringDtype series with canonical missing values.
+      pd.Series: StringDtype series with canonical missing values.
     """
-    s = s.astype("string").str.strip()
+    s = s.astype(DTYPE_STR).str.strip()
     low = s.fillna("").str.lower()
     mask_empty = (low == "") | low.isin(["none", "null", "nan"])
-    return s.mask(mask_empty, pd.NA).astype("string")
+    return s.mask(mask_empty, pd.NA).astype(DTYPE_STR)
 
 
 def _to_nullable_boolean_strict(s: pd.Series) -> pd.Series:
-    """Convert a Series to pandas nullable ``boolean`` with strict semantics.
+    """Convert to nullable boolean with strict semantics.
 
-    Only ``True`` and ``False`` (bool or numpy.bool_) are preserved. Any other
-    value (including strings like ``"true"``/``"false"``) is converted to ``<NA>``.
+    Only `True`/`False` (bool or numpy.bool_) are preserved. Other values,
+    including string equivalents, become <NA>.
 
     Args:
-        s (pd.Series): Input Series.
+      s: Input Series.
 
     Returns:
-        pd.Series: Series with dtype ``boolean`` and values in {True, False, <NA>}.
+      pd.Series: Boolean nullable series with values in {True, False, <NA>}.
     """
     if s.dtype == object or str(s.dtype).startswith("string"):
-        s = s.astype("string").str.strip()
+        s = s.astype(DTYPE_STR).str.strip()
         low = s.fillna("").str.lower()
         s = s.mask((low == "") | low.isin(["none", "null", "nan"]), pd.NA)
 
@@ -291,30 +315,20 @@ def _to_nullable_boolean_strict(s: pd.Series) -> pd.Series:
     mask_true = vals.apply(lambda v: isinstance(v, (bool, np.bool_)) and v is True)
     mask_false = vals.apply(lambda v: isinstance(v, (bool, np.bool_)) and v is False)
 
-    out = pd.Series(pd.array([pd.NA] * len(vals), dtype="boolean"), index=vals.index)
+    out = pd.Series(pd.array([pd.NA] * len(vals), dtype=DTYPE_BOOL), index=vals.index)
     out[mask_true] = True
     out[mask_false] = False
     return out
 
 
 def _normalize_schema_hints(hints: dict | None) -> dict:
-    """Normalize YAML-provided dtype hints into a compact canonical form.
-
-    Accepts common synonyms and returns a mapping to one of:
-    ``{"int", "float", "str", "bool"}``.
-
-    Examples:
-        - ``"int64"`` → ``"int"``
-        - ``"Float64"``/``"double"`` → ``"float"``
-        - ``"string"`` → ``"str"``
-        - ``"boolean"`` → ``"bool"``
+    """Normalize YAML dtype hints to {'int','float','str','bool'}.
 
     Args:
-        hints (dict | None): Raw hints mapping (column -> dtype string).
+      hints: Mapping column -> dtype string.
 
     Returns:
-        dict: Normalized mapping (column -> {"int","float","str","bool"}). Unknown
-        dtypes are ignored.
+      dict: Normalized mapping; unknown dtypes are ignored.
     """
     if not hints:
         return {}
@@ -332,78 +346,66 @@ def _normalize_schema_hints(hints: dict | None) -> dict:
             norm[k] = "str"
         elif v in {"bool", "boolean"}:
             norm[k] = "bool"
-        # Unknown entries are ignored (caller may choose to warn)
     return norm
 
 
 def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger) -> tuple[dd.DataFrame, bool]:
-    """Normalize dtypes and lightweight-clean values across key columns.
+    """Normalize core dtypes and clean values.
 
-    Steps performed:
-      1) **String-like columns** → pandas ``StringDtype`` with canonical NAs.
-      2) **Optional** ``type`` column → normalized to ``string`` and lower-cased.
-      3) **Special-case**: map survey-specific *string* encodings of ``z_flag``
-         to numeric for JADES and VIMOS (raw ``z_flag`` only).
-      4) **Float-like columns** (``ra``, ``dec``, ``z``, ``z_err``, ``z_flag``,
-         ``z_flag_homogenized``) → coerced to pandas ``Float64`` with failure
-         diagnostics showing a sample of offending values.
-
-    The function assumes :func:`_honor_user_homogenized_mapping` has already
-    run so that user-provided homogenized columns (if any) are present under
-    the canonical names.
+    Steps:
+      1) String-like cols -> normalized string dtype with canonical <NA>.
+      2) Optional `type` -> normalized string, lower-cased.
+      3) z_flag special-cases for JADES/VIMOS (string encodings -> numeric).
+      4) Float-like cols -> numeric, cast to target float dtype with checks.
 
     Args:
-        df (dd.DataFrame): Input Dask DataFrame after YAML rename.
-        product_name (str): Catalog internal name for logging context.
-        logger (logging.Logger): Logger.
+      df: Dask DataFrame after YAML rename.
+      product_name: Catalog identifier for log context.
+      logger: Logger.
 
     Returns:
-        tuple[dd.DataFrame, bool]: The normalized DataFrame and a flag
-        ``type_cast_ok`` indicating whether the ``type`` column was successfully
-        normalized and can be used as a fast-path for instrument type.
+      Tuple[dd.DataFrame, bool]: (normalized df, type_cast_ok).
 
     Raises:
-        ValueError: If conversion to numeric fails with non-numeric entries;
-            message includes a count and a small sample of problematic values.
-        ValueError: On unexpected errors while normalizing string-like columns.
+      ValueError: On string normalization failure or non-numeric residues during
+        float coercion.
 
     Notes:
-        - ``survey`` is upper-cased after normalization to stabilize rule lookups.
-        - Float coercion uses ``dd.to_numeric(errors="coerce")`` and checks for
-          residual non-numeric entries via an invalid mask computed with
-          top-level ``dd.isna`` to sidestep ``dask_expr`` gotchas.
+      - `survey` is upper-cased after normalization to stabilize rule lookups.
+      - Non-numeric residues are detected via `dd.to_numeric(..., errors="coerce")`
+        and reported with a small value sample.
     """
-    # 1) Normalize string-like columns with NA-friendly semantics
+    # 1) Normalize string-like columns
     string_like = ["id", "instrument_type", "survey", "instrument_type_homogenized", "source"]
     for col in string_like:
         if col in df.columns:
             try:
                 df[col] = df[col].map_partitions(
                     _normalize_string_series_to_na,
-                    meta=pd.Series(pd.array([], dtype="string")),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
                 )
                 if col == "survey":
                     df[col] = df[col].str.upper()
             except Exception as e:
                 raise ValueError(
-                    f"[{product_name}] Failed to convert column '{col}' to pandas StringDtype. "
+                    f"[{product_name}] Failed to normalize string column '{col}'. "
                     f"Original error: {e}"
                 ) from e
 
-    # 2) Optional auxiliary 'type' (fast-path support)
+    # 2) Optional auxiliary 'type'
     type_cast_ok = False
     if "type" in df.columns:
         try:
             df["type"] = df["type"].map_partitions(
                 _normalize_string_series_to_na,
-                meta=pd.Series(pd.array([], dtype="string")),
+                meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
             ).str.lower()
             type_cast_ok = True
         except Exception as e:
             logger.warning(f"⚠️ {product_name} Failed to normalize 'type' to lower-case: {e}")
             type_cast_ok = False
 
-    # 3) Map survey-specific string encodings of z_flag → numeric (JADES/VIMOS)
+    # 3) z_flag mapping for JADES/VIMOS
     def _map_special_partition(partition: pd.DataFrame) -> pd.DataFrame:
         p = partition.copy()
         if "survey" not in p or "z_flag" not in p:
@@ -444,7 +446,7 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
     if "z_flag" in df.columns and "survey" in df.columns:
         df = df.map_partitions(_map_special_partition)
 
-    # 4) Coerce float-like columns to pandas Float64 with diagnostics
+    # 4) Coerce float-like columns with diagnostics
     float_like = ["ra", "dec", "z", "z_err", "z_flag", "z_flag_homogenized"]
     for col in float_like:
         if col in df.columns:
@@ -455,24 +457,24 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
                 if invalid_count > 0:
                     sample_vals = df[col].loc[invalid_mask].head(5, compute=True).tolist()
                     raise ValueError(
-                        f"[{product_name}] Failed to convert column '{col}' to float64: "
-                        f"{invalid_count} non-numeric value(s) detected. "
-                        f"Example(s): {sample_vals}. "
+                        f"[{product_name}] Failed to convert '{col}' to numeric: "
+                        f"{invalid_count} non-numeric value(s). Examples: {sample_vals}. "
                         f"Tip: fix or drop non-numeric entries before running."
                     )
                 df[col] = coerced.map_partitions(
-                    lambda s: s.astype("Float64"),
-                    meta=pd.Series(pd.array([], dtype="Float64")),
+                    lambda s: s.astype(DTYPE_FLOAT),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
                 )
             except ValueError:
                 raise
             except Exception as e:
                 raise ValueError(
-                    f"[{product_name}] Unexpected failure converting '{col}' to float64. "
+                    f"[{product_name}] Unexpected failure converting '{col}' to numeric. "
                     f"Original error: {e}"
                 ) from e
 
     return df, type_cast_ok
+
 
 # -----------------------
 # CRD_ID generation
@@ -530,7 +532,7 @@ def _generate_crd_ids(df: dd.DataFrame, product_name: str, temp_dir: str) -> tup
     parts = [
         df.get_partition(i).map_partitions(
             _add_crd, offset,
-            meta=df._meta.assign(CRD_ID=pd.Series(pd.array([], dtype="string")))
+            meta=df._meta.assign(CRD_ID=pd.Series(pd.array([], dtype=DTYPE_STR)))
         )
         for i, offset in enumerate(offsets)
     ]
@@ -620,50 +622,21 @@ def _homogenize(
     logger: logging.Logger,
     type_cast_ok: bool,
 ) -> tuple[dd.DataFrame, bool, list, dict, dict]:
-    """Compute homogenized columns required by the tie-breaking logic.
-
-    This step produces:
-      - ``z_flag_homogenized``: numeric, VVDS-like quality score (0..6)
-      - ``instrument_type_homogenized``: categorical in {``"s"``, ``"g"``, ``"p"``}
-      - the selected ``tiebreaking_priority`` list
-      - the ``instrument_type_priority`` mapping used to score instrument types
-      - an upper-cased copy of ``translation_rules`` for vectorized evaluation
+    """Compute homogenized columns for tie-breaking.
 
     Strategy:
-      1) If the fast-path is possible, reuse pre-existing columns:
-         - For ``z_flag_homogenized``: if raw ``z_flag`` looks quality-like
-           (in [0,1] with fractional values), map it via a piecewise function.
-         - For ``instrument_type_homogenized``: if validated ``type`` exists
-           (only values in {s,g,p} after normalization), reuse it.
-      2) Otherwise, apply YAML translation rules **vectorized per partition**.
-         - Expressions in ``conditions`` are rewritten from boolean Python
-           semantics to **bitwise** semantics for Series via an AST transform,
-           ensuring correct precedence and avoiding ``eval`` on raw strings.
+      1) Fast-paths: reuse quality-like `z_flag` and validated `type` when possible.
+      2) Otherwise, apply YAML translations per partition (vectorized).
 
     Args:
-        df (dd.DataFrame): DataFrame after type normalization.
-        translation_config (dict): Config containing:
-            - ``tiebreaking_priority`` (list[str])
-            - ``instrument_type_priority`` (dict[str, float])
-            - ``translation_rules`` (dict[str, dict]) keyed by survey (case-insensitive)
-            - optional flags like ``delta_z_threshold``, etc.
-        product_name (str): Internal name for logging context.
-        logger (logging.Logger): Logger.
-        type_cast_ok (bool): Whether the ``type`` column was normalized
-            successfully in :func:`_normalize_types`.
+      df: Frame after type normalization.
+      translation_config: Config with priorities and translation rules.
+      product_name: Catalog identifier for log context.
+      logger: Logger.
+      type_cast_ok: Whether `type` was normalized.
 
     Returns:
-        tuple:
-            dd.DataFrame: DataFrame with homogenized columns added (as needed).
-            bool: ``used_type_fastpath`` — whether the ``type`` fast-path was used.
-            list: ``tiebreaking_priority`` as resolved from the config.
-            dict: ``instrument_type_priority`` mapping.
-            dict: ``translation_rules_uc`` (upper-cased survey keys) used later
-                for column selection and optional expression-column exporting.
-
-    Raises:
-        ValueError: If an expression in a translation rule cannot be parsed
-            or evaluated in vectorized form (includes the survey and expr).
+      Tuple[df, used_type_fastpath, tiebreaking_priority, instrument_type_priority, translation_rules_uc].
     """
     tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
     instrument_type_priority = translation_config.get("instrument_type_priority", {})
@@ -673,34 +646,7 @@ def _homogenize(
     # Vectorized translator
     # -----------------------
     def _translate_column_vectorized(df: dd.DataFrame, key: str, out_col: str, out_kind: str) -> dd.DataFrame:
-        """Apply YAML translation rules per partition without row-wise Python loops.
-
-        The evaluator supports:
-          - direct mappings (raw value → output value)
-          - a list of ``conditions`` with small expression language using
-            column names from the partition scope, plus helpers that operate
-            elementwise on Pandas Series (``len``, ``int``, ``float``, ``str``).
-          - safe, explicit globals; **no** built-ins are exposed besides the
-            helper wrappers.
-
-        Args:
-            df (dd.DataFrame): Input.
-            key (str): Input column to translate (``"z_flag"`` or ``"instrument_type"``).
-            out_col (str): Output column name (``"z_flag_homogenized"`` or
-                ``"instrument_type_homogenized"``).
-            out_kind (str): ``"float"`` for numeric or ``"str"`` for string output.
-
-        Returns:
-            dd.DataFrame: DataFrame with the new column added.
-
-        Notes:
-            - Expressions are first parsed to an AST, then boolean ops and chained
-              comparisons are rewritten into bitwise operations to operate on
-              vectorized Series correctly (``and``→``&``, ``or``→``|``, ``not``→``~``,
-              ``a < b < c``→``(a < b) & (b < c)``).
-            - Output is normalized to ``Float64`` (for ``z_flag*``) or
-              ``StringDtype`` lower-cased (for ``instrument_type*``).
-        """
+        """Apply YAML translation rules per partition (no row-wise Python loops)."""
         assert key in {"z_flag", "instrument_type"}
         assert out_col in {"z_flag_homogenized", "instrument_type_homogenized"}
         assert out_kind in {"float", "str"}
@@ -709,37 +655,35 @@ def _homogenize(
             if p.empty or ("survey" not in p.columns) or (key not in p.columns):
                 q = p.copy()
                 if out_kind == "float":
-                    q[out_col] = pd.Series(pd.array([], dtype="Float64")).reindex(q.index)
+                    q[out_col] = pd.Series(pd.array([], dtype=DTYPE_FLOAT)).reindex(q.index)
                 else:
-                    q[out_col] = pd.Series(pd.array([], dtype="string")).reindex(q.index)
+                    q[out_col] = pd.Series(pd.array([], dtype=DTYPE_STR)).reindex(q.index)
                 return q
 
             s = p.copy()
             survey_uc = s["survey"].astype(str).str.upper()
 
-            # Initialize output series for this partition.
+            # Initialize output series.
             if out_kind == "float":
-                out = pd.Series(np.nan, index=s.index, dtype="Float64")
+                out = pd.Series(pd.array([pd.NA] * len(s), dtype=DTYPE_FLOAT), index=s.index)
             else:
-                out = pd.Series(pd.array([pd.NA] * len(s), dtype="string"), index=s.index)
+                out = pd.Series(pd.array([pd.NA] * len(s), dtype=DTYPE_STR), index=s.index)
 
-            # --- helpers for vectorized exprs (Series-aware wrappers) ---
+            # --- helpers for vectorized exprs ---
             class StrSeriesProxy:
-                """Make str(series)[-2] behave elementwise via .str accessors."""
+                """Elementwise string slicing via .str accessors."""
                 def __init__(self, ser: pd.Series):
-                    self._s = ser.astype("string")
+                    self._s = ser.astype(DTYPE_STR)
                 def __getitem__(self, key):
                     if isinstance(key, slice):
                         return self._s.str.slice(key.start, key.stop, key.step)
                     return self._s.str.get(key)
-                def __repr__(self):  # pragma: no cover
-                    return f"StrSeriesProxy({repr(self._s)})"
 
             def v_len(x):
                 if isinstance(x, StrSeriesProxy):
                     return x._s.str.len()
                 if isinstance(x, pd.Series):
-                    return x.astype("string").str.len()
+                    return x.astype(DTYPE_STR).str.len()
                 return builtins.len(x)
 
             def v_str(x):
@@ -753,17 +697,17 @@ def _homogenize(
                 if isinstance(x, StrSeriesProxy):
                     x = x._s
                 if isinstance(x, pd.Series):
-                    return pd.to_numeric(x, errors="coerce").astype("Int64")
+                    return pd.to_numeric(x, errors="coerce").astype(DTYPE_INT)
                 return builtins.int(x)
 
             def v_float(x):
                 if isinstance(x, StrSeriesProxy):
                     x = x._s
                 if isinstance(x, pd.Series):
-                    return pd.to_numeric(x, errors="coerce").astype("Float64")
+                    return pd.to_numeric(x, errors="coerce").astype(DTYPE_FLOAT)
                 return builtins.float(x)
 
-            import ast as _ast  # local to avoid polluting module namespace
+            import ast as _ast
 
             class _BoolToBitwise(_ast.NodeTransformer):
                 """Rewrite boolean ops and chained comparisons to bitwise equivalents."""
@@ -789,7 +733,7 @@ def _homogenize(
                         expr = _ast.BinOp(left=expr, op=_ast.BitAnd(), right=cmp_i)
                     return expr
 
-            # Iterate rules per survey and materialize results into `out`.
+            # Apply rules per survey.
             for sname, ruleset in translation_rules_uc.items():
                 rule = (ruleset.get(f"{key}_translation") or {})
                 if not isinstance(rule, dict) or not len(rule):
@@ -801,14 +745,14 @@ def _homogenize(
 
                 default_val = rule.get("default", (np.nan if out_kind == "float" else ""))
 
-                # Apply default where still NA under this survey
+                # Default fill.
                 if out_kind == "float":
                     out.loc[mask_s] = out.loc[mask_s].fillna(default_val)
                 else:
-                    fill_vals = pd.Series([default_val] * int(mask_s.sum()), index=out.index[mask_s], dtype="string")
+                    fill_vals = pd.Series([default_val] * int(mask_s.sum()), index=out.index[mask_s], dtype=DTYPE_STR)
                     out.loc[mask_s] = out.loc[mask_s].fillna(fill_vals)
 
-                # Direct mappings (constant maps not based on conditions)
+                # Direct mappings.
                 direct = {k: v for k, v in rule.items() if k not in {"conditions", "default"}}
                 if direct:
                     col = s.loc[mask_s, key]
@@ -831,20 +775,19 @@ def _homogenize(
                         mapped = col_str.map(str_map)
 
                     if out_kind == "float":
-                        out.loc[mask_s] = mapped.fillna(out.loc[mask_s]).astype("Float64")
+                        out.loc[mask_s] = mapped.fillna(out.loc[mask_s]).astype(DTYPE_FLOAT)
                     else:
                         mapped = mapped.astype("object")
-                        mapped_str = pd.Series(pd.array(mapped.where(mapped.notna(), None), dtype="string"), index=mapped.index)
+                        mapped_str = pd.Series(pd.array(mapped.where(mapped.notna(), None), dtype=DTYPE_STR), index=mapped.index)
                         take = mapped_str.notna()
                         out.loc[take.index] = out.loc[take.index].where(~take, mapped_str)
 
-                # Vectorized conditional rules
+                # Conditional rules.
                 for cond in (rule.get("conditions") or []):
                     expr = cond.get("expr")
                     if not expr:
                         continue
 
-                    # Build a safe eval environment scoped to the partition.
                     ctx = {c: s[c] for c in s.columns if c in s.columns}
                     safe_globals = {
                         "__builtins__": {},
@@ -866,7 +809,6 @@ def _homogenize(
                     except Exception as e:
                         raise ValueError(f"Error evaluating condition '{expr}' for survey '{sname}': {e}")
 
-                    # Normalize mask → boolean Series aligned to s.index; restrict to this survey.
                     if isinstance(mlocal, pd.Series):
                         mlocal = mlocal.reindex(s.index)
                     elif hasattr(mlocal, "__len__") and not np.isscalar(mlocal) and len(mlocal) == len(s):
@@ -884,20 +826,20 @@ def _homogenize(
                     else:
                         out.loc[mlocal] = (pd.NA if pd.isna(val) else str(val))
 
-            # Finalize dtype/normalization
+            # Finalize dtype.
             if out_col == "z_flag_homogenized":
-                s[out_col] = pd.to_numeric(out, errors="coerce").astype("Float64")
+                s[out_col] = pd.to_numeric(out, errors="coerce").astype(DTYPE_FLOAT)
             else:
-                s[out_col] = pd.Series(out, dtype="string").str.lower()
+                s[out_col] = pd.Series(out, dtype=DTYPE_STR).str.lower()
 
             return s
 
-        # Provide accurate meta for the new column.
+        # Accurate meta for new column.
         meta = df._meta.copy()
         if out_kind == "float":
-            meta[out_col] = pd.Series(pd.array([], dtype="Float64"))
+            meta[out_col] = pd.Series(pd.array([], dtype=DTYPE_FLOAT))
         else:
-            meta[out_col] = pd.Series(pd.array([], dtype="string"))
+            meta[out_col] = pd.Series(pd.array([], dtype=DTYPE_STR))
 
         return df.map_partitions(_partition, meta=meta)
 
@@ -905,7 +847,7 @@ def _homogenize(
     # z_flag_homogenized
     # -----------------------
     def can_use_zflag_as_quality() -> bool:
-        """Return True if raw z_flag appears to be a [0,1] quality score with fractional values."""
+        """Return True if `z_flag` looks like a [0,1] quality score with fractional values."""
         if "z_flag" not in df.columns:
             return False
         try:
@@ -945,8 +887,8 @@ def _homogenize(
             if can_use_zflag_as_quality():
                 logger.info(f"{product_name} Using 'z_flag' (quality-like) fast path for z_flag_homogenized.")
                 df["z_flag_homogenized"] = df["z_flag"].map_partitions(
-                    lambda s: s.apply(quality_like_to_flag).astype("Float64"),
-                    meta=pd.Series(pd.array([], dtype="Float64")),
+                    lambda s: s.apply(quality_like_to_flag).astype(DTYPE_FLOAT),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
                 )
             else:
                 logger.info(f"{product_name} z_flag not quality-like; using YAML translation for z_flag_homogenized.")
@@ -960,7 +902,7 @@ def _homogenize(
     used_type_fastpath = False
 
     def can_use_type_for_instrument() -> bool:
-        # Reuse normalized `type` only if it contains a subset of {s, g, p}.
+        """Reuse normalized `type` only if values are a subset of {s,g,p}."""
         if not type_cast_ok or "type" not in df.columns:
             return False
         try:
@@ -980,22 +922,20 @@ def _homogenize(
                 logger.info(f"{product_name} Using 'type' fast path for instrument_type_homogenized.")
                 df["instrument_type_homogenized"] = df["type"].map_partitions(
                     _normalize_string_series_to_na,
-                    meta=pd.Series(pd.array([], dtype="string")),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
                 ).str.lower()
                 used_type_fastpath = True
             else:
                 logger.info(f"{product_name} 'type' not suitable; using YAML translation for instrument_type_homogenized.")
                 df = _translate_column_vectorized(df, key="instrument_type", out_col="instrument_type_homogenized", out_kind="str")
-                # Normalize and ensure StringDtype with NA semantics
                 df["instrument_type_homogenized"] = df["instrument_type_homogenized"].map_partitions(
                     _normalize_string_series_to_na,
-                    meta=pd.Series(pd.array([], dtype="string")),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
                 ).str.lower()
         else:
             logger.warning(f"{product_name} Column 'instrument_type_homogenized' already exists. Skipping recompute.")
 
     return df, used_type_fastpath, tiebreaking_priority, instrument_type_priority, translation_rules_uc
-
 
 # -----------------------
 # Tie-breaking / duplicates
@@ -1012,67 +952,47 @@ def _apply_tiebreaking_and_collect(
     """Resolve duplicates via prioritized tie-breaking and collect pair links.
 
     Pipeline:
-      1) Build a *stable collision key* by rounding RA/DEC to 1e-6 deg.
-      2) Repartition by the collision key (shuffle) so equal keys co-locate.
-      3) Within each partition (pure Pandas), apply tie-breaking in priority
-         order; survivors get ``tie_result=1`` (or ``2`` during resolution),
-         eliminated rows get ``tie_result=0``.
-      4) Merge the per-partition decisions back into the Dask DataFrame.
-      5) Emit undirected edges for all rows that collided under the same key
-         and fold them into ``compared_to_dict_solo`` (driver side).
-
-    Special rules:
-      - ``z_flag_homogenized==6`` (stars) are eliminated earlier when this
-        column appears in ``tiebreaking_priority``.
-      - ``delta_z_threshold`` (if > 0) is used to break ties among survivors.
+      1) Build collision key from RA/DEC rounded to 1e-6 deg.
+      2) Shuffle by key.
+      3) Per-partition tie-break; survivors get 1 (or 2 during resolution), losers 0.
+      4) Merge decisions.
+      5) Emit undirected edges for items sharing a key.
 
     Args:
-        df (dd.DataFrame): Input DataFrame with ``CRD_ID`` present.
-        translation_config (dict): Full translation config (reads ``delta_z_threshold``).
-        tiebreaking_priority (list): Ordered list of columns to prioritize.
-        instrument_type_priority (dict): Scores for instrument types (used when
-            ``instrument_type_homogenized`` is in the priority list).
-        compared_to_dict_solo (dict[str, set[str]]): Mutable dict of undirected
-            links; updated in-place with pairwise collisions.
-        product_name (str): Internal catalog name for logging/context.
-        logger (logging.Logger): Logger.
+      df: Input with CRD_ID.
+      translation_config: Full config (uses delta_z_threshold).
+      tiebreaking_priority: Ordered columns to prioritize.
+      instrument_type_priority: Score map for instrument types.
+      compared_to_dict_solo: Accumulator of pairwise links (driver).
+      product_name: Catalog id for logging.
+      logger: Logger.
 
     Returns:
-        dd.DataFrame: DataFrame with ``tie_result`` (Int8) merged in.
+      dd.DataFrame: With tie_result (nullable Int8) merged in.
 
     Raises:
-        ValueError: If any tie-break column is missing or entirely empty, or
-            if all criteria are absent and ``delta_z_threshold`` is 0/None.
-
-    Notes:
-        - The collision key uses *rounded* floats to reduce false negatives
-          due to tiny coordinate jitter while keeping deterministic grouping.
-        - Updates are merged via ``CRD_ID``; if a row appears multiple times
-          due to edge cases, the *last* decision is kept (drop_duplicates).
+      ValueError: On missing/empty priority columns or no criteria.
     """
     delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
 
-    # Validate presence and basic sanity of priority columns
+    # Validate priority columns.
     if not tiebreaking_priority:
-        logger.warning(
-            f"⚠️ {product_name} tiebreaking_priority is empty. Will rely on delta_z_threshold only."
-        )
+        logger.warning(f"⚠️ {product_name} tiebreaking_priority is empty. Using delta_z_threshold only.")
     else:
         for col in tiebreaking_priority:
             if col not in df.columns:
                 raise ValueError(f"Tiebreaking column '{col}' is missing in catalog '{product_name}'.")
-            # Treat empty strings as empty for string-typed columns.
             col_dtype = df[col].dtype
-            is_str = pd.api.types.is_string_dtype(col_dtype)
+            # Treat empty strings as empty for string-typed columns (and instrument_type_homogenized).
+            is_str = (col == "instrument_type_homogenized") or pd.api.types.is_string_dtype(col_dtype)
             empty_mask = df[col].isna()
             if is_str:
                 empty_mask = empty_mask | (df[col] == "")
             if empty_mask.all().compute():
                 raise ValueError(
-                    f"Tiebreaking column '{col}' is invalid in catalog '{product_name}' "
-                    f"(all values are NaN/empty)."
+                    f"Tiebreaking column '{col}' is invalid in catalog '{product_name}' (all NaN/empty)."
                 )
-            # All columns except instrument_type_homogenized must be numeric.
+            # All except instrument_type_homogenized must be numeric.
             if col != "instrument_type_homogenized" and not pd.api.types.is_numeric_dtype(col_dtype):
                 try:
                     df[col] = dd.to_numeric(df[col], errors="coerce").astype("float64")
@@ -1080,43 +1000,41 @@ def _apply_tiebreaking_and_collect(
                 except Exception as e:
                     raise ValueError(
                         f"Tiebreaking column '{col}' must be numeric (except 'instrument_type_homogenized'). "
-                        f"Attempted cast to float but failed. Error: {e}"
+                        f"Attempted cast failed: {e}"
                     )
 
     if not tiebreaking_priority and (delta_z_threshold is None or float(delta_z_threshold) == 0.0):
         raise ValueError(
-            f"Cannot deduplicate catalog '{product_name}': tiebreaking_priority is empty and "
-            f"delta_z_threshold is not set or is zero. Please provide at least one criterion."
+            f"Cannot deduplicate '{product_name}': no tiebreaking_priority and delta_z_threshold unset/zero."
         )
 
-    # Only valid coordinates participate in tie-breaking.
+    # Valid coordinates only. Cast to float64 to avoid extension-NA rounding issues.
     valid_coord_mask = df["ra"].notnull() & df["dec"].notnull()
     df_valid = df[valid_coord_mask].assign(
-        # Cast to float64 to avoid extension-NA rounding issues; stringify for deterministic keys.
-        ra_dec_key=(df["ra"].astype("float64").round(6).astype(str) + "_" +
-                    df["dec"].astype("float64").round(6).astype(str))
+        ra_dec_key=(
+            df["ra"].astype("float64").round(6).astype(str) + "_" +
+            df["dec"].astype("float64").round(6).astype(str)
+        )
     )
 
-    # Co-locate equal keys into the same partition to run pure-Pandas logic.
+    # Shuffle by key.
     df_shuf = df_valid.set_index("ra_dec_key", shuffle="tasks")
 
     def _tiebreak_partition(p: pd.DataFrame) -> pd.DataFrame:
-        """Per-partition tie-breaking. Input index: ra_dec_key."""
+        """Per-partition tie-breaking (index: ra_dec_key)."""
         if p.empty:
             return pd.DataFrame({
-                "CRD_ID": pd.Series(pd.array([], dtype="string")),
-                "tie_result": pd.Series(pd.array([], dtype="Int8")),
+                "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
+                "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
             })
 
         updates: list[pd.DataFrame] = []
 
-        # Group by collision key (current index).
         for _, group_raw in p.groupby(level=0, sort=False):
             group = group_raw.copy()
-            group["tie_result"] = 0  # start eliminated
+            group["tie_result"] = 0
             surviving = group.copy()
 
-            # Apply priority columns in order.
             for priority_col in tiebreaking_priority:
                 if priority_col == "instrument_type_homogenized":
                     pr = surviving["instrument_type_homogenized"].map(instrument_type_priority).astype("float64")
@@ -1124,7 +1042,7 @@ def _apply_tiebreaking_and_collect(
                 else:
                     surviving["_priority_value"] = surviving[priority_col].astype("float64").fillna(-np.inf)
 
-                # Early elimination: stars (flag 6) when z_flag_homogenized is in use.
+                # Early elimination: stars (flag 6) if z_flag_homogenized is used.
                 if priority_col == "z_flag_homogenized":
                     ids_to_eliminate = surviving.loc[
                         surviving["z_flag_homogenized"] == 6, "CRD_ID"
@@ -1136,17 +1054,16 @@ def _apply_tiebreaking_and_collect(
                 if surviving.empty:
                     break
 
-                # Keep the rows that maximize the current priority score.
                 max_val = surviving["_priority_value"].max()
                 surviving = surviving[surviving["_priority_value"] == max_val].drop(columns=["_priority_value"], errors="ignore")
 
                 if len(surviving) == 1:
-                    break  # single survivor found
+                    break
 
-            # Mark survivors of the priority pass as ties to resolve (2).
+            # Mark priority survivors as ties to resolve.
             group.loc[group["CRD_ID"].astype(str).isin(surviving["CRD_ID"].astype(str)), "tie_result"] = 2
 
-            # Optionally disambiguate by |Δz| among survivors.
+            # Optional |Δz| disambiguation.
             if len(surviving) > 1 and (delta_z_threshold or 0) > 0:
                 z_vals = pd.to_numeric(surviving["z"], errors="coerce").to_numpy(dtype=float, copy=False)
                 ids = surviving["CRD_ID"].astype(str).to_numpy(copy=False)
@@ -1163,12 +1080,11 @@ def _apply_tiebreaking_and_collect(
                         if not (np.isfinite(zi) and np.isfinite(zj)):
                             continue
                         if abs(zi - zj) <= thr:
-                            # Prefer i, eliminate j.
                             group.loc[group["CRD_ID"].astype(str) == ids[i], "tie_result"] = 2
                             group.loc[group["CRD_ID"].astype(str) == ids[j], "tie_result"] = 0
                             remaining.discard(ids[j])
 
-            # Finalize: convert a single “2” survivor to “1”.
+            # Convert a single “2” survivor to “1”.
             survivors = group[group["tie_result"] == 2]
             if len(survivors) == 1:
                 group.loc[group["tie_result"] == 2, "tie_result"] = 1
@@ -1181,24 +1097,23 @@ def _apply_tiebreaking_and_collect(
             updates.append(group[["CRD_ID", "tie_result"]].copy())
 
         out = pd.concat(updates, ignore_index=True) if updates else pd.DataFrame(columns=["CRD_ID", "tie_result"])
-        out["CRD_ID"] = out["CRD_ID"].astype("string")
-        out["tie_result"] = out["tie_result"].astype("Int8")
+        out["CRD_ID"] = out["CRD_ID"].astype(DTYPE_STR)
+        out["tie_result"] = out["tie_result"].astype(DTYPE_INT8)
         return out
 
-    # Metadata for the tie updates.
+    # Meta for updates.
     meta_updates = pd.DataFrame({
-        "CRD_ID": pd.Series(pd.array([], dtype="string")),
-        "tie_result": pd.Series(pd.array([], dtype="Int8")),
+        "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
+        "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
     })
-    tie_update_dd = df_shuf.map_partitions(_tiebreak_partition, meta=meta_updates)
-    tie_update_dd = tie_update_dd.drop_duplicates(subset=["CRD_ID"], keep="last")
+    tie_update_dd = df_shuf.map_partitions(_tiebreak_partition, meta=meta_updates).drop_duplicates(subset=["CRD_ID"], keep="last")
 
-    # Edges for compared_to accumulation (undirected CRD_ID pairs per key).
+    # Edge emission.
     def _edges_partition(p: pd.DataFrame) -> pd.DataFrame:
         if p.empty:
             return pd.DataFrame({
-                "CRD_ID_A": pd.Series(pd.array([], dtype="string")),
-                "CRD_ID_B": pd.Series(pd.array([], dtype="string")),
+                "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
+                "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
             })
         edges = []
         for _, group in p.groupby(level=0, sort=False):
@@ -1215,30 +1130,30 @@ def _apply_tiebreaking_and_collect(
                     edges.append((a_norm, b_norm))
         if not edges:
             return pd.DataFrame({
-                "CRD_ID_A": pd.Series(pd.array([], dtype="string")),
-                "CRD_ID_B": pd.Series(pd.array([], dtype="string")),
+                "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
+                "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
             })
         out = pd.DataFrame(edges, columns=["CRD_ID_A", "CRD_ID_B"])
-        out["CRD_ID_A"] = out["CRD_ID_A"].astype("string")
-        out["CRD_ID_B"] = out["CRD_ID_B"].astype("string")
+        out["CRD_ID_A"] = out["CRD_ID_A"].astype(DTYPE_STR)
+        out["CRD_ID_B"] = out["CRD_ID_B"].astype(DTYPE_STR)
         return out
 
     meta_edges = pd.DataFrame({
-        "CRD_ID_A": pd.Series(pd.array([], dtype="string")),
-        "CRD_ID_B": pd.Series(pd.array([], dtype="string")),
+        "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
+        "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
     })
     edges_dd = df_shuf.map_partitions(_edges_partition, meta=meta_edges).drop_duplicates()
 
-    # Merge tie results back to the original Dask DataFrame.
-    df["CRD_ID"] = df["CRD_ID"].astype("string")
+    # Merge decisions.
+    df["CRD_ID"] = df["CRD_ID"].astype(DTYPE_STR)
     df = (
         df.drop("tie_result", axis=1, errors="ignore")
           .merge(tie_update_dd, on="CRD_ID", how="left")
           .fillna({"tie_result": 1})
     )
-    df["tie_result"] = df["tie_result"].astype("Int8")
+    df["tie_result"] = df["tie_result"].astype(DTYPE_INT8)
 
-    # Accumulate edges in the driver-side dict of sets.
+    # Accumulate edges.
     edges = edges_dd.compute()
     for a, b in zip(edges.get("CRD_ID_A", []), edges.get("CRD_ID_B", [])):
         compared_to_dict_solo.setdefault(a, set()).add(b)
@@ -1250,27 +1165,23 @@ def _apply_tiebreaking_and_collect(
 # RA/DEC strict validation (fail fast)
 # -----------------------
 def _validate_ra_dec_or_fail(df: dd.DataFrame, product_name: str) -> None:
-    """Validate RA/DEC for finiteness and allowed ranges; fail fast with details.
+    """Validate RA/DEC for finiteness and range; fail fast with details.
 
-    Checks performed (on float64 views of the columns):
-      - Missing values (NaN / <NA>)
-      - Non-finite values (±inf)
-      - Out-of-range RA (<0 or >=360)
-      - Out-of-range DEC (<-90 or >90)
-
-    If any invalid rows are found, raises a ValueError containing aggregate
-    counts and a small sample of offending records with a few identifying
-    columns (``CRD_ID``, ``id``, ``source``, ``survey``, ``ra``, ``dec``).
+    Checks (using float64 views):
+      * missing values (NaN / <NA>)
+      * non-finite values (±inf)
+      * RA out of [0, 360)
+      * DEC out of [-90, 90]
 
     Args:
-        df (dd.DataFrame): DataFrame with columns ``ra`` and ``dec``.
-        product_name (str): Internal catalog name for context in the message.
+      df: DataFrame with columns 'ra' and 'dec'.
+      product_name: Catalog identifier for error context.
 
     Raises:
-        ValueError: If any invalid RA/DEC entries are detected.
+      ValueError: If any invalid RA/DEC entries are detected.
     """
     def _isfinite_series(s: pd.Series) -> pd.Series:
-        arr = s.astype("float64")  # Float64 extension -> float64 (NaN where <NA>)
+        arr = s.astype("float64")  # Extension -> float64 (NaN where <NA>)
         return pd.Series(np.isfinite(arr), index=s.index)
 
     isfinite_ra  = df["ra"].map_partitions(_isfinite_series,  meta=("ra", "bool"))
@@ -1309,26 +1220,20 @@ def _validate_ra_dec_or_fail(df: dd.DataFrame, product_name: str) -> None:
             f"  - Sample of bad rows (up to 5): {sample_records}"
         )
 
+
 # -----------------------
 # DP1 flagging
 # -----------------------
 def _flag_dp1(df: dd.DataFrame) -> dd.DataFrame:
-    """Flag rows that fall within predefined DP1 circular fields.
+    """Flag rows within predefined DP1 circular fields.
 
-    For each row, compute great-circle angular separation to each DP1 region
-    center (given in degrees) and mark ``is_in_DP1_fields`` as 1 if the row
-    lies within **any** of the listed radii; otherwise, 0.
-
-    Geometry:
-        Uses the spherical law of cosines with explicit clipping to handle
-        rounding at the domain boundaries of ``arccos``.
+    Geometry: spherical law of cosines with clipping before arccos.
 
     Args:
-        df (dd.DataFrame): DataFrame with columns ``ra`` and ``dec`` (degrees).
+      df: DataFrame with columns 'ra' and 'dec' in degrees.
 
     Returns:
-        dd.DataFrame: Same shape as input with an added ``is_in_DP1_fields``
-        integer column (0/1), computed per-partition.
+      dd.DataFrame: Input plus 'is_in_DP1_fields' (0/1) as nullable int dtype.
     """
     ra_centers  = np.deg2rad([r[0] for r in DP1_REGIONS])
     dec_centers = np.deg2rad([r[1] for r in DP1_REGIONS])
@@ -1344,10 +1249,13 @@ def _flag_dp1(df: dd.DataFrame) -> dd.DataFrame:
                        np.cos(dec_c) * np.cos(dec_rad) * np.cos(ra_rad - ra_c))
             ang_deg = np.rad2deg(np.arccos(np.clip(cos_ang, -1.0, 1.0)))
             in_any |= (ang_deg <= rdeg)
-        p["is_in_DP1_fields"] = in_any.astype(np.int64)
+        # Use Arrow/int nullable dtype if configured.
+        p["is_in_DP1_fields"] = pd.Series(in_any, index=p.index, dtype=DTYPE_INT)
         return p
 
-    return df.map_partitions(_compute, meta=df._meta.assign(is_in_DP1_fields=np.int64()))
+    # Accurate meta with desired dtype for the new column.
+    meta = df._meta.assign(is_in_DP1_fields=pd.Series(pd.array([], dtype=DTYPE_INT)))
+    return df.map_partitions(_compute, meta=meta)
 
 # -----------------------
 # Column selection
@@ -1355,16 +1263,11 @@ def _flag_dp1(df: dd.DataFrame) -> dd.DataFrame:
 def _extract_variables_from_expr(expr: str) -> set[str]:
     """Extract variable names referenced in a boolean/arithmetic expression.
 
-    Parses ``expr`` as a Python expression and walks the AST to collect all
-    identifier names (``ast.Name``). This is used to discover which input
-    columns are referenced by YAML ``conditions``, so they can be optionally
-    persisted in the output when ``save_expr_columns=True``.
-
     Args:
-        expr (str): Expression string (e.g., ``"0 < z_err < 5e-4 and len(flag) > 1"``).
+      expr: Expression string (e.g., "0 < z_err < 5e-4 and len(flag) > 1").
 
     Returns:
-        set[str]: Unique variable names referenced in the expression.
+      Set of identifier names referenced in the expression.
     """
     try:
         tree = ast.parse(expr, mode="eval")
@@ -1391,39 +1294,18 @@ def _select_output_columns(
     save_expr_columns: bool = False,
     schema_hints: dict | None = None,
 ) -> dd.DataFrame:
-    """Assemble the final output schema and coerce optional expr columns.
-
-    Base columns are always included when present, with nullable dtypes:
-    ``["CRD_ID","id","ra","dec","z","z_flag","z_err","instrument_type","survey",
-    "source","tie_result","is_in_DP1_fields"]`` plus any available
-    ``z_flag_homogenized`` / ``instrument_type_homogenized``.
-
-    Optionally, when ``save_expr_columns=True``, variables referenced in YAML
-    ``conditions`` are also included (except for the standard base fields). If
-    ``schema_hints`` is provided (normalized via ``_normalize_schema_hints``),
-    those extra columns are coerced to the hinted nullable dtype.
+    """Assemble final output schema and coerce optional expr columns.
 
     Args:
-        df (dd.DataFrame): Input frame after tie-breaking and DP1 flagging.
-        translation_rules_uc (dict): Upper-cased translation rules; used only to
-            discover variables from ``conditions`` when persisting expr columns.
-        tiebreaking_priority (list): Priority columns; any of these present but
-            not already in the base set are appended to the output.
-        used_type_fastpath (bool): If True, copy normalized ``type`` into
-            ``instrument_type`` with ``StringDtype`` semantics to preserve NA.
-        save_expr_columns (bool, optional): Whether to persist variables used
-            in YAML expressions. Defaults to False.
-        schema_hints (dict | None, optional): Normalized hints
-            ``{col: "int"|"float"|"str"|"bool"}`` for expr columns.
+      df: Frame after tie-breaking and DP1 flagging.
+      translation_rules_uc: Upper-cased translation rules (for expr var discovery).
+      tiebreaking_priority: Priority columns to append if present.
+      used_type_fastpath: If True, copy normalized `type` into `instrument_type`.
+      save_expr_columns: Whether to keep variables used in YAML expressions.
+      schema_hints: Normalized hints {'int','float','str','bool'} for expr cols.
 
     Returns:
-        dd.DataFrame: Subset of ``df`` with deterministic column order and
-        coerced dtypes for optional expr columns when hints are provided.
-
-    Notes:
-        - Only columns that exist in ``df`` are selected; missing ones are ignored.
-        - For hinted expr columns not present in ``df``, a new column is created
-          filled with ``<NA>`` using the hinted dtype to stabilize downstream IO.
+      Subset of `df` with deterministic column order and coerced dtypes.
     """
     final_cols = [
         "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err",
@@ -1434,11 +1316,11 @@ def _select_output_columns(
     if "instrument_type_homogenized" in df.columns:
         final_cols.append("instrument_type_homogenized")
 
-    # If fast-path used, keep instrument_type as normalized string with NA semantics.
+    # Preserve normalized string semantics when fast-path was used.
     if used_type_fastpath and "type" in df.columns:
-        df["instrument_type"] = df["type"].astype("string")
+        df["instrument_type"] = df["type"].astype(DTYPE_STR)
 
-    # Include tie-breaking columns that are not already in the base set.
+    # Include tiebreaking columns if present.
     extra = [c for c in tiebreaking_priority if c not in final_cols and c in df.columns]
     final_cols += extra
 
@@ -1459,45 +1341,51 @@ def _select_output_columns(
     if save_expr_columns:
         final_cols += needed
 
-    # Coerce hinted expr columns to the requested nullable dtypes.
+    # Coerce hinted expr columns to requested dtypes.
     schema_hints = schema_hints or {}
-    pandas_dtype = {"int": "Int64", "float": "Float64", "str": "string", "bool": "boolean"}
     if save_expr_columns and schema_hints:
         target_cols = [c for c in needed if c in schema_hints]
         for col in target_cols:
             kind = schema_hints[col]
-            pd_dtype = pandas_dtype[kind]
             if col in df.columns:
                 if kind == "str":
                     df[col] = df[col].map_partitions(
                         _normalize_string_series_to_na,
-                        meta=pd.Series(pd.array([], dtype="string")),
+                        meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
                     )
                 elif kind == "float":
                     coerced = dd.to_numeric(df[col], errors="coerce")
                     df[col] = coerced.map_partitions(
-                        lambda s: s.astype("Float64"),
-                        meta=pd.Series(pd.array([], dtype="Float64")),
+                        lambda s: s.astype(DTYPE_FLOAT),
+                        meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
                     )
                 elif kind == "int":
                     coerced = dd.to_numeric(df[col], errors="coerce")
                     df[col] = coerced.map_partitions(
-                        lambda s: s.astype("Int64"),
-                        meta=pd.Series(pd.array([], dtype="Int64")),
+                        lambda s: s.astype(DTYPE_INT),
+                        meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
                     )
                 elif kind == "bool":
                     df[col] = df[col].map_partitions(
                         _to_nullable_boolean_strict,
-                        meta=pd.Series(pd.array([], dtype="boolean")),
+                        meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
                     )
             else:
-                # Create a hinted column with <NA> to lock schema/dtype.
-                df = _add_missing_with_dtype(df, col, pd_dtype)
+                # Create hinted column with <NA> to stabilize schema.
+                if kind == "str":
+                    df = _add_missing_with_dtype(df, col, DTYPE_STR)
+                elif kind == "float":
+                    df = _add_missing_with_dtype(df, col, DTYPE_FLOAT)
+                elif kind == "int":
+                    df = _add_missing_with_dtype(df, col, DTYPE_INT)
+                elif kind == "bool":
+                    df = _add_missing_with_dtype(df, col, DTYPE_BOOL)
 
     # Deduplicate while preserving order, then subset.
     final_cols = list(dict.fromkeys(final_cols))
     df = df[[c for c in final_cols if c in df.columns]]
     return df
+
 
 # -----------------------
 # Save parquet + HATS/margin
