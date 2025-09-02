@@ -65,7 +65,7 @@ class Runner:
         self.process_info = {}
 
         # Set logfile in process info
-        self.add_info("log_file", Path(self.logdir.name, logname))
+        self.add_info("log_file", str(Path(self.logdir.name, logname)))
 
         # Set up initial time tracking
         self.add_info("start_time", datetime.datetime.now())
