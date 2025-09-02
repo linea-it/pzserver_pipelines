@@ -1,30 +1,108 @@
-# =====================
-# Built-in modules
-# =====================
+# crossmatch.py
+from __future__ import annotations
+"""
+Crossmatch and merge logic for Combine Redshift Catalogs (CRC).
+
+This module performs a spatial crossmatch between two catalogs, applies a
+priority-based tie-breaker (with optional Δz disambiguation), accumulates
+pairwise links for diagnostics, and outputs a merged artifact. Optionally,
+it imports the merged catalog into HATS.
+
+Public API:
+    - crossmatch_tiebreak(...)
+    - crossmatch_tiebreak_safe(...)
+"""
+
+# -----------------------
+# Standard library
+# -----------------------
 import json
 import logging
 import os
 import pathlib
-import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
+from typing import TYPE_CHECKING
 
-# =====================
-# Third-party libraries
-# =====================
+# -----------------------
+# Third-party
+# -----------------------
 import dask.dataframe as dd
 import lsdb
 import numpy as np
 import pandas as pd
 
-# =====================
-# Project-specific libraries
-# =====================
+# -----------------------
+# Project
+# -----------------------
 from combine_redshift_dedup.packages.specz import (
     import_catalog,
     _normalize_string_series_to_na,
 )
 
+if TYPE_CHECKING:
+    # from dask.distributed import Client  # Not strictly needed for hints here
+    pass
+
+# -----------------------
+# Module exports & constants
+# -----------------------
+__all__ = ["crossmatch_tiebreak", "crossmatch_tiebreak_safe"]
+
+LOGGER_NAME = "crossmatch_and_merge_logger"
+LOG_FILE = "crossmatch_and_merge_all.log"
+
+
+# -----------------------
+# Logging utilities
+# -----------------------
+def _build_logger(logs_dir: str, name: str, file_name: str) -> logging.Logger:
+    """Create and configure a file-based logger.
+
+    Args:
+        logs_dir (str): Directory where the log file will be written.
+        name (str): Logger name (e.g., ``LOGGER_NAME``).
+        file_name (str): Log file name (e.g., ``"crossmatch_and_merge_all.log"``).
+
+    Returns:
+        logging.Logger: Configured logger (single FileHandler, INFO level).
+    """
+    log_dir = pathlib.Path(logs_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    fh = logging.FileHandler(log_dir / file_name, encoding="utf-8", delay=True)
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+    logger.addHandler(fh)
+    return logger
+
+# -----------------------
+# Saving utilities
+# -----------------------
+def _safe_to_parquet(ddf, path, **kwargs):
+    """Write parquet robustly across dd.DataFrame and nested_dask frames.
+
+    Tries with engine='pyarrow'. If the backend already injects 'engine'
+    (nested_dask), fall back to calling without 'engine'.
+    """
+    try:
+        ddf.to_parquet(path, engine="pyarrow", **kwargs)
+    except TypeError as e:
+        if "multiple values for keyword argument 'engine'" in str(e):
+            ddf.to_parquet(path, **kwargs)  # nested_dask path
+        else:
+            raise
+
+# =======================
+# Main logic
+# =======================
 def crossmatch_tiebreak(
     left_cat,
     right_cat,
@@ -37,134 +115,73 @@ def crossmatch_tiebreak(
     compared_to_right,
     instrument_type_priority,
     translation_config,
-    do_import=True,
+    do_import: bool = True,
 ):
+    """Crossmatch two catalogs and resolve duplicates using prioritized rules.
 
-    # === Logger setup ===
-    log_path = pathlib.Path(logs_dir) / "crossmatch_and_merge_all.log"
-    logger_x = logging.getLogger("crossmatch_and_merge_logger")
-    logger_x.setLevel(logging.INFO)
-    if logger_x.hasHandlers():
-        logger_x.handlers.clear()
-    fh = logging.FileHandler(log_path)
-    fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
-    logger_x.addHandler(fh)
+    Workflow:
+      1) Filter out eliminated rows (``tie_result == 0``) from both sides.
+      2) Spatial crossmatch within ``crossmatch_radius_arcsec`` (default 0.75).
+      3) Row-wise tie decision using ``tiebreaking_priority``; stars (flag 6)
+         are eliminated early when both sides provide homogenized flags.
+      4) Collect pair links (for diagnostics) and persist as JSON.
+      5) Optional Δz disambiguation for hard ties (both sides remain ``2``).
+      6) Collapse left/right results into a single ``tie_result`` per ``CRD_ID``
+         per connected component: one survivor → 1; ≥2 survivors → 2.
+      7) Apply final decisions back to left/right catalogs and merge.
+      8) Normalize dtypes (nullable), save Parquet, and optionally import HATS.
 
-    output_xmatch_dir = os.path.join(temp_dir, f"xmatch_step{step}")
-    crossmatch_radius = translation_config.get("crossmatch_radius_arcsec", 1.0)
+    Args:
+        left_cat: Left catalog (lsdb catalog-like; must support ``query``,
+            ``crossmatch``, and expose a Dask DataFrame via ``._ddf``).
+        right_cat: Right catalog (same requirements as left).
+        tiebreaking_priority (list[str]): Ordered criteria; may include
+            ``"z_flag_homogenized"`` and/or ``"instrument_type_homogenized"``.
+        logs_dir (str): Directory for log files.
+        temp_dir (str): Directory for temporary/merged outputs.
+        step (int | str): Step identifier to name output artifacts.
+        client: Dask client (used only when importing to HATS via ``import_catalog``).
+        compared_to_left (dict): Pre-existing compared_to links for the left set.
+        compared_to_right (dict): Pre-existing compared_to links for the right set.
+        instrument_type_priority (dict[str, float]): Priority map for instrument types.
+        translation_config (dict): Config with keys like
+            ``crossmatch_radius_arcsec`` and ``delta_z_threshold``.
+        do_import (bool, optional): If True, import merged catalog to HATS and
+            return an lsdb handle; otherwise return the merged Parquet path.
 
-    # Run spatial crossmatch (within radius) and persist as HATS
-    xmatched = left_cat.crossmatch(
-        right_cat,
-        radius_arcsec=crossmatch_radius,
-        n_neighbors=1,
-        suffixes=("left", "right"),
-    )
-    xmatched.to_hats(output_xmatch_dir, overwrite=True)
+    Returns:
+        tuple[object, str]: ``(merged_handle_or_path, compared_to_path)``, where
+        the first element is an lsdb catalog if ``do_import`` is True, else a str.
 
-    # Bring crossmatched HATS to Dask DataFrame
-    df = lsdb.read_hats(output_xmatch_dir)._ddf
+    Raises:
+        ValueError: If both ``tiebreaking_priority`` is empty and
+            ``delta_z_threshold`` is 0/None (no way to deduplicate).
+    """
+    # --- Logger ---
+    logger = _build_logger(logs_dir, LOGGER_NAME, LOG_FILE)
 
-    # ------------------------------------------------------------------
-    # 1) HARD TYPE NORMALIZATION to match specz.py (nullable dtypes)
-    # ------------------------------------------------------------------
-    # Float-like columns → Float64 (nullable)
-    float_bases = ["ra", "dec", "z", "z_flag", "z_err", "z_flag_homogenized"]
-    for base in float_bases:
-        for side in ("left", "right"):
-            col = f"{base}{side}"
-            if col in df.columns:
-                coerced = dd.to_numeric(df[col], errors="coerce")
-                df[col] = coerced.map_partitions(
-                    lambda s: s.astype("Float64"),
-                    meta=pd.Series(pd.array([], dtype="Float64")),
-                )
-
-    # String-like columns → StringDtype("string") with NA (never "")
-    str_bases = [
-        "CRD_ID",
-        "id",
-        "instrument_type",
-        "instrument_type_homogenized",
-        "survey",
-        "source",
-    ]
-    for base in str_bases:
-        for side in ("left", "right"):
-            col = f"{base}{side}"
-            if col in df.columns:
-                df[col] = df[col].map_partitions(
-                    _normalize_string_series_to_na,
-                    meta=pd.Series(pd.array([], dtype="string")),
-                )
-
-    # Tie result columns can be nullable ints; we keep whatever is there but
-    # it's useful to stabilize as Int64 for robust comparisons/join later.
-    for col in ("tie_resultleft", "tie_resultright"):
-        if col in df.columns:
-            df[col] = dd.to_numeric(df[col], errors="coerce").map_partitions(
-                lambda s: s.astype("Int64"),
-                meta=pd.Series(pd.array([], dtype="Int64")),
-            )
-
-    # ------------------------------------------------------------------
-    # 2) VALIDATE tiebreaking_priority configuration (post-normalization)
-    # ------------------------------------------------------------------
-    if not tiebreaking_priority:
-        logger_x.warning("⚠️ tiebreaking_priority is empty. Proceeding directly to delta_z_threshold tie-breaking.")
-    else:
-        for col in tiebreaking_priority:
-            col_left = f"{col}left"
-            col_right = f"{col}right"
-
-            if col_left not in df.columns or col_right not in df.columns:
-                raise ValueError(
-                    f"Tiebreaking column '{col}' is not present in both catalogs. "
-                    f"Missing: {'left' if col_left not in df.columns else 'right'}."
-                )
-
-            # Fail if both sides are entirely NA/empty
-            left_all_na = df[col_left].isna().all().compute()
-            right_all_na = df[col_right].isna().all().compute()
-            if left_all_na and right_all_na:
-                raise ValueError(
-                    f"Tiebreaking column '{col}' is present in both catalogs, but all values are NaN in the crossmatch result."
-                )
-
-            # All tiebreak columns (except instrument_type_homogenized) must be numeric.
-            if col != "instrument_type_homogenized":
-                # If dtype isn't numeric (rare after coercion), try to coerce now
-                if not (pd.api.types.is_numeric_dtype(df[col_left].dtype) and
-                        pd.api.types.is_numeric_dtype(df[col_right].dtype)):
-                    try:
-                        for c in (col_left, col_right):
-                            coerced = dd.to_numeric(df[c], errors="coerce")
-                            df[c] = coerced.map_partitions(
-                                lambda s: s.astype("Float64"),
-                                meta=pd.Series(pd.array([], dtype="Float64")),
-                            )
-                        logger_x.info(f"ℹ️ Cast '{col}' (left/right) to Float64 for tie-breaking.")
-                    except Exception as e:
-                        raise ValueError(
-                            f"Tiebreaking column '{col}' must be numeric in both catalogs (except 'instrument_type_homogenized'). "
-                            f"Found dtypes: left={df[col_left].dtype}, right={df[col_right].dtype}. Error coercing: {e}"
-                        )
-
-    # Remove pairs where either source was already rejected
-    # (works fine with Int64, comparisons broadcast)
-    if "tie_resultleft" in df.columns and "tie_resultright" in df.columns:
-        df = df[(df["tie_resultleft"] != 0) & (df["tie_resultright"] != 0)]
-
-    # Threshold for delta-z secondary disambiguation
+    # --- Config ---
+    crossmatch_radius = translation_config.get("crossmatch_radius_arcsec", 0.75)
     delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
-
     if not tiebreaking_priority and (delta_z_threshold is None or float(delta_z_threshold) == 0.0):
         raise ValueError(
             "Cannot deduplicate: tiebreaking_priority is empty and delta_z_threshold is not set or is zero. "
             "Please define at least one deduplication criterion."
         )
 
-    # Load hard-tie accumulator
+    # --- Pre-filter eliminated rows ---
+    left_alive = left_cat.query("tie_result != 0")
+    right_alive = right_cat.query("tie_result != 0")
+
+    # --- Spatial crossmatch (within radius) ---
+    xmatched = left_alive.crossmatch(
+        right_alive,
+        radius_arcsec=crossmatch_radius,
+        n_neighbors=10,
+        suffixes=("left", "right"),
+    )
+
+    # --- Hard tie accumulator (persisted across steps) ---
     hard_tie_path = os.path.join(temp_dir, "hard_tie_ids.json")
     if os.path.exists(hard_tie_path):
         with open(hard_tie_path, "r") as f:
@@ -173,16 +190,27 @@ def crossmatch_tiebreak(
         hard_tie_cumulative = set()
 
     # ------------------------------------------------------------------
-    # 3) ROW-WISE TIE DECISION
+    # Row-wise tie decision on crossmatched pairs
     # ------------------------------------------------------------------
-    def decide_tie(row):
+    def decide_tie(row: pd.Series) -> tuple[int, int]:
+        """Return (tie_left, tie_right) for a pair, using priority criteria.
+
+        Semantics:
+          - If both sides are stars (z_flag_homogenized==6) → drop both (0,0).
+          - Else if exactly one is star → keep the other (2/1 vs 0).
+          - Else iterate over priority columns:
+              * If both sides have values: pick the larger.
+              * Track the first column where only one side has value; if all
+                comparisons tie, prefer that side.
+          - If no information: (2,2) -> hard tie.
+        """
         left_was_tie = row.get("tie_resultleft", 1) == 2
         right_was_tie = row.get("tie_resultright", 1) == 2
 
         zflag_left = row.get("z_flag_homogenizedleft")
         zflag_right = row.get("z_flag_homogenizedright")
 
-        # Star rule: if z_flag_homogenized == 6, prefer the non-star or drop both if both stars
+        # Early star rule
         if pd.notna(zflag_left) and zflag_left == 6 and pd.notna(zflag_right) and zflag_right == 6:
             return (0, 0)
         elif pd.notna(zflag_left) and zflag_left == 6:
@@ -191,8 +219,7 @@ def crossmatch_tiebreak(
             return (2 if left_was_tie else 1, 0)
 
         if not tiebreaking_priority:
-            # Defer to delta-z (hard tie for now)
-            return (2, 2)
+            return (2, 2)  # defer to Δz
 
         first_non_nan_side = None
 
@@ -201,11 +228,9 @@ def crossmatch_tiebreak(
             v2 = row.get(f"{col}right")
 
             if col == "instrument_type_homogenized":
-                # Map categorical to numeric priority; NA -> 0
                 v1 = instrument_type_priority.get(v1, 0)
                 v2 = instrument_type_priority.get(v2, 0)
 
-            # Both present → decide immediately
             if pd.notna(v1) and pd.notna(v2):
                 if v1 > v2:
                     return (2 if left_was_tie else 1, 0)
@@ -214,7 +239,6 @@ def crossmatch_tiebreak(
                 else:
                     continue  # equal → next criterion
 
-            # Track the first criterion where only one side has value
             if pd.notna(v1) and pd.isna(v2) and first_non_nan_side is None:
                 first_non_nan_side = "left"
             elif pd.isna(v1) and pd.notna(v2) and first_non_nan_side is None:
@@ -225,19 +249,18 @@ def crossmatch_tiebreak(
         elif first_non_nan_side == "right":
             return (0, 2 if right_was_tie else 1)
         else:
-            # No information to break tie
-            return (2, 2)
+            return (2, 2)  # no info
 
-    tie_results = df.map_partitions(
+    tie_results = xmatched.map_partitions(
         lambda p: p.apply(decide_tie, axis=1, result_type="expand"),
         meta={0: "i8", 1: "i8"},
     )
-    df = df.assign(tie_left=tie_results[0], tie_right=tie_results[1])
+    xmatched = xmatched.assign(tie_left=tie_results[0], tie_right=tie_results[1])
 
     # ------------------------------------------------------------------
-    # 4) COLLECT PAIRS FOR DELTA-Z PROCESSING (work in pandas)
+    # Collect pairs for Δz processing and compared_to accumulation
     # ------------------------------------------------------------------
-    pairs = df[["CRD_IDleft", "CRD_IDright", "tie_left", "tie_right", "zleft", "zright"]].compute()
+    pairs = xmatched[["CRD_IDleft", "CRD_IDright", "tie_left", "tie_right", "zleft", "zright"]].compute()
 
     # Build new compared_to links from this step
     compared_to_new = defaultdict(set)
@@ -247,7 +270,11 @@ def crossmatch_tiebreak(
         compared_to_new[left_id].add(right_id)
         compared_to_new[right_id].add(left_id)
 
-    logger_x.info(f"🧮 New pairs this step: {sum(len(v) for v in compared_to_new.values())} total links in {len(compared_to_new)} objects")
+    logger.info(
+        "New pairs this step: %d total links in %d objects",
+        sum(len(v) for v in compared_to_new.values()),
+        len(compared_to_new),
+    )
 
     # Merge with previous compared_to dicts
     compared_to_dict = defaultdict(set)
@@ -258,95 +285,250 @@ def crossmatch_tiebreak(
         compared_to_dict[str(k)].update(map(str, new_vals))
 
     total_links = sum(len(v) for v in compared_to_dict.values())
-    logger_x.info(f"🔗 Compared_to (merged): {total_links} total links across {len(compared_to_dict)} objects")
-    logger_x.info(f"🔢 Step {step}: Compared_to merge completed")
+    logger.info("Compared_to (merged): %d total links across %d objects", total_links, len(compared_to_dict))
+    logger.info("Step %s: Compared_to merge completed", step)
 
     # Persist compared_to
-    compared_to_dict = {k: sorted(v) for k, v in compared_to_dict.items()}
+    compared_to_serializable = {k: sorted(v) for k, v in compared_to_dict.items()}
     compared_to_path = os.path.join(temp_dir, f"compared_to_xmatch_step{step}.json")
     with open(compared_to_path, "w") as f:
-        json.dump(compared_to_dict, f)
+        json.dump(compared_to_serializable, f)
 
     # ------------------------------------------------------------------
-    # 5) DELTA-Z TIE RESOLUTION ON HARD TIES
+    # Δz tie resolution (hard ties only)
     # ------------------------------------------------------------------
+    # Stable order helps debugging
+    pairs = pairs.sort_values(["CRD_IDleft", "CRD_IDright"], kind="mergesort").reset_index(drop=True)
+    
     if float(delta_z_threshold) > 0.0:
+        thr = float(delta_z_threshold)
+    
         def apply_delta_z_fix(pairs_df: pd.DataFrame) -> pd.DataFrame:
+            """
+            Δz disambiguation in two phases driven by the Δz threshold:
+    
+            Phase 1) One-to-one resolution inside the subgraph |Δz| <= thr:
+              - Consider only pairs that are still hard ties (2,2).
+              - If a hard-tie pair is isolated (degree==1 on both sides within the
+                thresholded subgraph), drop the side with fewer `compared_to` links
+                (break ties lexicographically by CRD_ID).
+              - If exactly one node of the pair belongs to the cumulative hard-tie
+                set, keep that node and drop the other.
+    
+            Phase 2) Component collapse inside the same thresholded subgraph:
+              - After phase (1), for any connected component (within |Δz| <= thr)
+                that still has >= 2 survivors, deterministically pick a single
+                winner and mark all other nodes in that component as losers by
+                setting at least one of their ties to 0.
+              - Winner selection priority:
+                  a) If exactly one survivor is in `hard_tie_cumulative` → pick it.
+                  b) Otherwise, pick the node with the largest `compared_to` degree.
+                  c) Remaining ties → pick by CRD_ID (lexicographic ascending).
+            """
             pairs_df = pairs_df.copy()
-            mask = (pairs_df["tie_left"] == 2) & (pairs_df["tie_right"] == 2)
-            for idx, row in pairs_df[mask].iterrows():
-                z1 = row["zleft"]
-                z2 = row["zright"]
-                # Skip if any side is NA
-                if pd.isna(z1) or pd.isna(z2):
-                    continue
-                if abs(float(z1) - float(z2)) <= float(delta_z_threshold):
-                    left_crd_id = str(row["CRD_IDleft"])
-                    right_crd_id = str(row["CRD_IDright"])
-                    left_in_hard = left_crd_id in hard_tie_cumulative
-                    right_in_hard = right_crd_id in hard_tie_cumulative
-
-                    if left_in_hard and not right_in_hard:
-                        pairs_df.at[idx, "tie_right"] = 0
-                    elif right_in_hard and not left_in_hard:
+    
+            # Build the |Δz| <= thr mask on the current rows
+            both_tie = (pairs_df["tie_left"] == 2) & (pairs_df["tie_right"] == 2)
+            z_ok = pairs_df["zleft"].notna() & pairs_df["zright"].notna()
+            within = both_tie & z_ok & (
+                (pairs_df["zleft"].astype(float) - pairs_df["zright"].astype(float)).abs() <= thr
+            )
+            if not within.any():
+                return pairs_df
+    
+            # ---------------------------
+            # Phase 1: isolated 1–to–1s
+            # ---------------------------
+            W1 = pairs_df.loc[within, ["CRD_IDleft", "CRD_IDright"]]
+            degL = W1["CRD_IDleft"].value_counts()
+            degR = W1["CRD_IDright"].value_counts()
+    
+            for idx, row in pairs_df.loc[within].iterrows():
+                L = str(row["CRD_IDleft"])
+                R = str(row["CRD_IDright"])
+                # Only handle isolated 1–to–1 hard ties inside the Δz-threshold subgraph
+                if degL.get(L, 0) == 1 and degR.get(R, 0) == 1:
+                    left_in_hard  = L in hard_tie_cumulative
+                    right_in_hard = R in hard_tie_cumulative
+                    n_left  = len(compared_to_dict.get(L, []))
+                    n_right = len(compared_to_dict.get(R, []))
+    
+                    drop = "right"  # default: keep left
+                    if right_in_hard and not left_in_hard:
+                        drop = "left"
+                    elif (not left_in_hard) and (not right_in_hard):
+                        # Drop the node with fewer links; tie → lexicographic
+                        if n_left < n_right:
+                            drop = "left"
+                        elif n_left == n_right and R < L:
+                            drop = "left"
+    
+                    if drop == "left":
                         pairs_df.at[idx, "tie_left"] = 0
                     else:
-                        n_left = len(compared_to_dict.get(left_crd_id, []))
-                        n_right = len(compared_to_dict.get(right_crd_id, []))
-                        if n_left > n_right:
-                            pairs_df.at[idx, "tie_right"] = 0
-                            pairs_df.at[idx, "tie_left"] = 1
-                        elif n_right > n_left:
-                            pairs_df.at[idx, "tie_left"] = 0
-                            pairs_df.at[idx, "tie_right"] = 1
-                        else:
-                            pairs_df.at[idx, "tie_right"] = 0
-                            pairs_df.at[idx, "tie_left"] = 1
+                        pairs_df.at[idx, "tie_right"] = 0
+    
+            # ---------------------------------------------------------
+            # Phase 2: collapse multi–multi components (|Δz| <= thr)
+            # ---------------------------------------------------------
+            W = pairs_df.loc[within, ["CRD_IDleft", "CRD_IDright"]].astype(str)
+            if not W.empty:
+                # Adjacency only from edges within the threshold
+                adj: dict[str, set[str]] = defaultdict(set)
+                nodes = set()
+                for L, R in W.itertuples(index=False):
+                    adj[L].add(R); adj[R].add(L)
+                    nodes.add(L); nodes.add(R)
+    
+                # Helpers to check if a node has already been marked as a loser in any pair
+                left_is_loser  = (pairs_df["tie_left"]  == 0)
+                right_is_loser = (pairs_df["tie_right"] == 0)
+    
+                def node_is_loser(n: str) -> bool:
+                    n = str(n)
+                    return (
+                        ((pairs_df["CRD_IDleft"].astype(str) == n)  & left_is_loser).any()
+                        or
+                        ((pairs_df["CRD_IDright"].astype(str) == n) & right_is_loser).any()
+                    )
+    
+                # BFS over connected components inside the Δz subgraph
+                seen: set[str] = set()
+                for start in nodes:
+                    if start in seen:
+                        continue
+                    comp: list[str] = []
+                    dq = deque([start]); seen.add(start)
+                    while dq:
+                        u = dq.popleft()
+                        comp.append(u)
+                        for v in adj[u]:
+                            if v not in seen:
+                                seen.add(v); dq.append(v)
+    
+                    # Nodes that haven't been eliminated by phase (1)
+                    survivors = [n for n in comp if not node_is_loser(n)]
+                    if len(survivors) <= 1:
+                        continue  # nothing left to resolve in this component
+    
+                    # Determine a single winner by the stated priority
+                    def degree(n: str) -> int:
+                        return len(compared_to_dict.get(str(n), []))
+    
+                    hard_in_comp = [n for n in survivors if n in hard_tie_cumulative]
+                    if len(hard_in_comp) == 1:
+                        winner = hard_in_comp[0]
+                    else:
+                        # Highest compared_to degree; tie-break by CRD_ID (ascending)
+                        winner = sorted(survivors, key=lambda n: (-degree(n), str(n)))[0]
+    
+                    # Mark all other survivors as losers by setting at least one tie to 0
+                    for n in survivors:
+                        if n == winner:
+                            continue
+                        maskL = within & (pairs_df["CRD_IDleft"].astype(str)  == n)
+                        maskR = within & (pairs_df["CRD_IDright"].astype(str) == n)
+    
+                        # A single 0 is enough to classify the node as a loser
+                        if maskL.any():
+                            first_idx = pairs_df.index[maskL][0]
+                            pairs_df.at[first_idx, "tie_left"] = 0
+                        elif maskR.any():
+                            first_idx = pairs_df.index[maskR][0]
+                            pairs_df.at[first_idx, "tie_right"] = 0
+    
             return pairs_df
-
+    
+        # Apply the Δz disambiguation
         pairs = apply_delta_z_fix(pairs)
-
+    
     # ------------------------------------------------------------------
-    # 6) COLLAPSE LEFT/RIGHT TIE RESULTS → SINGLE tie_result PER CRD_ID
+    # Collapse per-pair decisions to a single tie_result per CRD_ID
+    # Component rule: ≥2 survivors → 2; exactly 1 → 1; losers → 0
     # ------------------------------------------------------------------
-    expanded = pd.concat([
-        pairs[["CRD_IDleft", "tie_left"]].rename(columns={"CRD_IDleft": "CRD_ID", "tie_left": "tie_result"}),
-        pairs[["CRD_IDright", "tie_right"]].rename(columns={"CRD_IDright": "CRD_ID", "tie_right": "tie_result"}),
-    ])
-
-    def consolidate_results(series: pd.Series) -> int:
-        if (series == 0).any():
-            return 0
-        if (series == 2).any():
-            return 2
-        return 1
-
-    expanded["CRD_ID"] = expanded["CRD_ID"].astype(str)
-    final_results = expanded.groupby("CRD_ID")["tie_result"].apply(consolidate_results)
-
-    # Update hard ties set and persist
-    hard_tie_ids = final_results[final_results == 2].index.tolist()
+    pairs = pairs.sort_values(["CRD_IDleft", "CRD_IDright"], kind="mergesort").reset_index(drop=True)
+    
+    if pairs.empty:
+        final_map: dict[str, int] = {}
+    else:
+        # Bipartite edges (L–R)
+        W = pairs[["CRD_IDleft", "CRD_IDright"]].astype(str)
+    
+        # Universe of nodes
+        all_nodes = pd.Index(pd.unique(pd.concat([W["CRD_IDleft"], W["CRD_IDright"]], ignore_index=True)))
+    
+        # Losers (0) — if a node lost in any pair, it's a loser
+        losers = (
+            pd.Index(pairs.loc[pairs["tie_left"] == 0, "CRD_IDleft"].astype(str))
+            .union(pairs.loc[pairs["tie_right"] == 0, "CRD_IDright"].astype(str))
+        )
+    
+        # Build adjacency for the full graph (all crossmatched edges, not only within thr)
+        adj: dict[str, set[str]] = defaultdict(set)
+        for L, R in W.itertuples(index=False):
+            adj[L].add(R)
+            adj[R].add(L)
+    
+        # Traverse connected components and assign final decisions
+        final_map = {}
+        seen: set[str] = set()
+    
+        for start in all_nodes:
+            if start in seen:
+                continue
+    
+            # BFS to gather component nodes
+            comp: list[str] = []
+            dq = deque([start]); seen.add(start)
+            while dq:
+                u = dq.popleft()
+                comp.append(u)
+                for v in adj[u]:
+                    if v not in seen:
+                        seen.add(v); dq.append(v)
+    
+            comp_set = set(comp)
+            comp_losers = comp_set & set(losers)
+            comp_survivors = [n for n in comp if n not in comp_losers]
+    
+            # Mark losers
+            for n in comp_losers:
+                final_map[n] = 0
+    
+            # Survivors: ≥2 -> 2, exactly 1 -> 1
+            if len(comp_survivors) >= 2:
+                for n in comp_survivors:
+                    final_map[n] = 2
+            elif len(comp_survivors) == 1:
+                final_map[comp_survivors[0]] = 1
+            # If no survivors, all were marked 0 above
+    
+    # Persist/extend hard ties (those kept as 2)
+    hard_tie_ids = [k for k, v in final_map.items() if v == 2]
     hard_tie_cumulative.update(hard_tie_ids)
     with open(hard_tie_path, "w") as f:
         json.dump(list(hard_tie_cumulative), f)
 
     # ------------------------------------------------------------------
-    # 7) APPLY FINAL RESULTS BACK TO LEFT/RIGHT AND MERGE
+    # Apply final decisions back to left/right and merge
     # ------------------------------------------------------------------
     def apply_final(df_part: pd.DataFrame) -> pd.DataFrame:
-        # Preserve dtype; map may insert NaN → fill with existing value
         out = df_part.copy()
-        mapped = out["CRD_ID"].map(final_results)
-        out["tie_result"] = mapped.fillna(out["tie_result"])
+        if final_map:
+            mapped = out["CRD_ID"].astype(str).map(final_map)
+            # Only overwrite where a final decision exists
+            out["tie_result"] = mapped.fillna(out["tie_result"])
         return out
 
-    left_df = left_cat._ddf.map_partitions(apply_final, meta=left_cat._ddf._meta)
-    right_df = right_cat._ddf.map_partitions(apply_final, meta=right_cat._ddf._meta)
+    left_cat = left_cat.map_partitions(apply_final, meta=left_cat._ddf._meta)
+    right_cat = right_cat.map_partitions(apply_final, meta=right_cat._ddf._meta)
 
-    merged = dd.concat([left_df, right_df])
+    left_ddf = left_cat._ddf
+    right_ddf = right_cat._ddf
+    merged = dd.concat([left_ddf, right_ddf])
 
     # ------------------------------------------------------------------
-    # 8) STABILIZE DTYPES (nullable) BEFORE SAVING
+    # Stabilize dtypes (nullable) before saving
     # ------------------------------------------------------------------
     expected_types = {
         "CRD_ID": "string",
@@ -359,15 +541,13 @@ def crossmatch_tiebreak(
         "instrument_type": "string",
         "survey": "string",
         "source": "string",
-        "tie_result": "Int64",
+        "tie_result": "Int8",  # align with specz.py
         "z_flag_homogenized": "Float64",
         "instrument_type_homogenized": "string",
     }
-    # Include any custom tiebreaking columns in the output type map
     for col in tiebreaking_priority:
         expected_types[col] = "string" if col == "instrument_type_homogenized" else "Float64"
 
-    # Cast using the same semantics as specz.py (no fillna("") for strings!)
     for col, dtype in expected_types.items():
         if col not in merged.columns:
             continue
@@ -382,25 +562,25 @@ def crossmatch_tiebreak(
                     lambda s: s.astype("Float64"),
                     meta=pd.Series(pd.array([], dtype="Float64")),
                 )
-            elif dtype == "Int64":
+            elif dtype == "Int8":
                 merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
-                    lambda s: s.astype("Int64"),
-                    meta=pd.Series(pd.array([], dtype="Int64")),
+                    lambda s: s.astype("Int8"),
+                    meta=pd.Series(pd.array([], dtype="Int8")),
                 )
         except Exception as e:
-            logger_x.warning(f"⚠️ Failed to cast column '{col}' to {dtype}: {e}")
+            logger.warning("Failed to cast column '%s' to %s: %s", col, dtype, e)
 
-    # Save merged parquet
+    # --- Save merged parquet ---
     merged_path = os.path.join(temp_dir, f"merged_step{step}")
-    merged.to_parquet(merged_path, write_index=False)
+    _safe_to_parquet(merged, merged_path, write_index=False)
 
-    # Optionally import merged to HATS
+    # --- Optional HATS import ---
     if do_import:
-        import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, logs_dir, logger_x, client)
-        logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
+        import_catalog(merged_path, "ra", "dec", f"merged_step{step}_hats", temp_dir, logs_dir, logger, client)
+        logger.info("%s: Finished: crossmatch_and_merge id=merged_step%s", datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"), step)
         return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats")), compared_to_path
     else:
-        logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
+        logger.info("%s: Finished: crossmatch_and_merge id=merged_step%s", datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"), step)
         return merged_path, compared_to_path
 
 
@@ -416,24 +596,27 @@ def crossmatch_tiebreak_safe(
     compared_to_right,
     instrument_type_priority,
     translation_config,
-    do_import=True,
+    do_import: bool = True,
 ):
-    # === Logger setup ===
-    log_path = pathlib.Path(logs_dir) / "crossmatch_and_merge_all.log"
-    logger_x = logging.getLogger("crossmatch_and_merge_logger")
-    logger_x.setLevel(logging.INFO)
+    """Wrapper around :func:`crossmatch_tiebreak` with graceful fallback.
 
-    # Clear previous handlers to avoid duplicate log lines
-    if logger_x.hasHandlers():
-        logger_x.handlers.clear()
+    If the crossmatch raises a known runtime error indicating no overlap or an
+    empty output, this function concatenates the inputs, merges the compared_to
+    dicts, and proceeds with saving and optional HATS import.
 
-    fh = logging.FileHandler(log_path)
-    fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
-    logger_x.addHandler(fh)
+    Args:
+        (same as :func:`crossmatch_tiebreak`)
 
-    logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: crossmatch_and_merge id=merged_step{step}")
+    Returns:
+        tuple[object, str]: ``(merged_handle_or_path, compared_to_path)``.
+    """
+    logger = _build_logger(logs_dir, LOGGER_NAME, LOG_FILE)
+    logger.info(
+        "%s: Starting: crossmatch_and_merge id=merged_step%s",
+        datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
+        step,
+    )
 
-    # === Try main crossmatch logic ===
     try:
         return crossmatch_tiebreak(
             left_cat=left_cat,
@@ -450,39 +633,34 @@ def crossmatch_tiebreak_safe(
             do_import=do_import,
         )
 
-    # === Fallback logic for non-overlapping catalogs or empty result ===
     except RuntimeError as e:
-        if (
-            "The output catalog is empty" in str(e)
-            or "Catalogs do not overlap" in str(e)
-        ):
-            logger_x.info(f"⚠️ {e} Proceeding by merging left and right without crossmatching.")
-    
-            # === Merge input compared_to dicts cumulatively ===
+        # Known conditions: non-overlapping catalogs / empty crossmatch result
+        msg = str(e)
+        if ("The output catalog is empty" in msg) or ("Catalogs do not overlap" in msg):
+            logger.info("%s Proceeding by merging left and right without crossmatching.", msg)
+
+            # Merge input compared_to dicts cumulatively
             compared_to_dict = defaultdict(set)
             for d in [compared_to_left, compared_to_right]:
                 for k, v in d.items():
-                    k_str = str(k)
-                    v_str = map(str, v)
-                    compared_to_dict[k_str].update(v_str)
-            
-            # === Convert to sorted lists and save ===
-            compared_to_dict = {k: sorted(v) for k, v in compared_to_dict.items()}
-            
+                    compared_to_dict[str(k)].update(map(str, v))
+
+            # Persist compared_to
+            compared_to_serializable = {k: sorted(v) for k, v in compared_to_dict.items()}
             compared_to_path = os.path.join(temp_dir, f"compared_to_xmatch_step{step}.json")
             with open(compared_to_path, "w") as f:
-                json.dump(compared_to_dict, f)
+                json.dump(compared_to_serializable, f)
 
-            # === Concatenate left and right Dask DataFrames ===
+            # Concatenate left and right Dask DataFrames
             left_df = left_cat._ddf
             right_df = right_cat._ddf
             merged = dd.concat([left_df, right_df])
 
-            # === Save merged result to disk ===
+            # Save merged result
             merged_path = os.path.join(temp_dir, f"merged_step{step}")
-            merged.to_parquet(merged_path, write_index=False)
+            _safe_to_parquet(merged, merged_path, write_index=False)
 
-            # === Import merged catalog to HATS format if requested ===
+            # Optional HATS import
             if do_import:
                 import_catalog(
                     merged_path,
@@ -491,14 +669,22 @@ def crossmatch_tiebreak_safe(
                     f"merged_step{step}_hats",
                     temp_dir,
                     logs_dir,
-                    logger_x,
+                    logger,
                     client,
                 )
-                logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
+                logger.info(
+                    "%s: Finished: crossmatch_and_merge id=merged_step%s",
+                    datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
+                    step,
+                )
                 return lsdb.read_hats(os.path.join(temp_dir, f"merged_step{step}_hats")), compared_to_path
             else:
-                logger_x.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: crossmatch_and_merge id=merged_step{step}")
+                logger.info(
+                    "%s: Finished: crossmatch_and_merge id=merged_step%s",
+                    datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
+                    step,
+                )
                 return merged_path, compared_to_path
-        else:
-            # Re-raise unexpected exceptions
-            raise
+
+        # Unexpected exceptions are re-raised
+        raise
