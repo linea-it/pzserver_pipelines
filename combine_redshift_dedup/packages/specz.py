@@ -77,6 +77,26 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
             f"Available columns (sample): {sorted(input_cols)[:30]} ..."
         )
 
+    # --- NEW: pre-resolve target collisions ---
+    # If a target (std) already exists in df and its source (src) is different,
+    # move the existing target aside to <target>__orig, <target>__orig1, ...
+    for std, src in non_null_map.items():
+        tgt = std
+        if src != tgt and tgt in df.columns:
+            # pick a non-conflicting parking name
+            base = f"{tgt}__orig"
+            parked = base
+            i = 1
+            existing = set(map(str, df.columns))
+            while parked in existing:
+                parked = f"{base}{i}"
+                i += 1
+            logger.info(
+                f"{product_name} Resolving rename collision: target '{tgt}' already exists; "
+                f"renaming existing '{tgt}' → '{parked}' so '{src}' can become '{tgt}'."
+            )
+            df = df.rename(columns={tgt: parked})
+
     # Build rename map: source -> standard
     col_map = {src: std for std, src in non_null_map.items()}
     if col_map:
@@ -91,6 +111,31 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
         if col not in df.columns:
             df[col] = np.nan
     return df
+
+def _normalize_schema_hints(hints: dict | None) -> dict:
+    """
+    Normaliza dtypes descritos no YAML para {col: 'int'|'float'|'str'|'bool'}.
+    Aceita sinônimos (int64/Int64, float64/Float64/double, bool/boolean, str/string).
+    Ignora entradas com dtype desconhecido (logicamente você pode logar se quiser).
+    """
+    if not hints:
+        return {}
+    norm = {}
+    for col, dt in hints.items():
+        if dt is None:
+            continue
+        k = str(col)
+        v = str(dt).strip().lower()
+        if v in {"int", "int64"}:
+            norm[k] = "int"
+        elif v in {"float", "float64", "double"}:
+            norm[k] = "float"
+        elif v in {"str", "string"}:
+            norm[k] = "str"
+        elif v in {"bool", "boolean"}:
+            norm[k] = "bool"
+        # else: desconhecido → ignora (ou faça um logger.warning aqui)
+    return norm
 
 # -----------------------
 # Type normalization
@@ -254,35 +299,38 @@ def _honor_user_homogenized_mapping(
     logger: logging.Logger,
 ) -> dd.DataFrame:
     """
-    If the YAML maps standard columns to already-homogenized sources (e.g.,
-    z_flag <- z_flag_homogenized, instrument_type <- instrument_type_homogenized),
-    recreate the canonical homogenized columns so downstream logic can detect them.
+    If YAML maps standard columns to already-homogenized sources, recreate the canonical
+    homogenized columns so downstream logic can detect them.
     """
-    cols_cfg = (entry.get("columns") or {})
 
-    def norm(x):
-        return str(x).strip().lower() if x is not None else None
+    def _ensure_single_series(df: dd.DataFrame, name: str):
+        if list(df.columns).count(name) > 1:
+            raise ValueError(
+                f"[{product_name}] Detected duplicate '{name}' columns after YAML rename. "
+                f"This typically happens when the file already had '{name}' and you also mapped "
+                f"another source to '{name}'. The pipeline expects unique column names. "
+                f"Tip: let the pipeline resolve collisions (see logs) or adjust the YAML."
+            )
+        return df[name]
+
+    cols_cfg = (entry.get("columns") or {})
+    norm = lambda x: (str(x).strip().lower() if x is not None else None)
 
     # z_flag <- z_flag_homogenized ?
     if norm(cols_cfg.get("z_flag")) == "z_flag_homogenized":
         if "z_flag" in df.columns:
-            # alias canonical homogenized name
-            df["z_flag_homogenized"] = df["z_flag"]
-            logger.info(f"{product_name} YAML maps 'z_flag' <- 'z_flag_homogenized'; "
-                        "using user-provided homogenized z_flag.")
+            df["z_flag_homogenized"] = _ensure_single_series(df, "z_flag")
+            logger.info(f"{product_name} YAML maps 'z_flag' <- 'z_flag_homogenized'; using user-provided homogenized z_flag.")
         else:
-            logger.warning(f"⚠️ {product_name} YAML claims 'z_flag' comes from 'z_flag_homogenized', "
-                           "but 'z_flag' is missing after rename.")
+            logger.warning(f"⚠️ {product_name} YAML claims 'z_flag' comes from 'z_flag_homogenized', but 'z_flag' is missing after rename.")
 
     # instrument_type <- instrument_type_homogenized ?
     if norm(cols_cfg.get("instrument_type")) == "instrument_type_homogenized":
         if "instrument_type" in df.columns:
-            df["instrument_type_homogenized"] = df["instrument_type"]
-            logger.info(f"{product_name} YAML maps 'instrument_type' <- 'instrument_type_homogenized'; "
-                        "using user-provided homogenized instrument_type.")
+            df["instrument_type_homogenized"] = _ensure_single_series(df, "instrument_type")
+            logger.info(f"{product_name} YAML maps 'instrument_type' <- 'instrument_type_homogenized'; using user-provided homogenized instrument_type.")
         else:
-            logger.warning(f"⚠️ {product_name} YAML claims 'instrument_type' comes from "
-                           "'instrument_type_homogenized', but 'instrument_type' is missing after rename.")
+            logger.warning(f"⚠️ {product_name} YAML claims 'instrument_type' comes from 'instrument_type_homogenized', but 'instrument_type' is missing after rename.")
 
     return df
 
@@ -705,10 +753,14 @@ def _extract_variables_from_expr(expr: str):
     v.visit(tree)
     return v.vars
 
-def _select_output_columns(df: dd.DataFrame,
-                           translation_rules_uc: dict,
-                           tiebreaking_priority: list,
-                           used_type_fastpath: bool) -> dd.DataFrame:
+def _select_output_columns(
+    df: dd.DataFrame,
+    translation_rules_uc: dict,
+    tiebreaking_priority: list,
+    used_type_fastpath: bool,
+    save_expr_columns: bool = False,
+    schema_hints: dict | None = None,   # <--- novo
+) -> dd.DataFrame:
     final_cols = [
         "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err",
         "instrument_type", "survey", "source", "tie_result", "is_in_DP1_fields"
@@ -724,19 +776,89 @@ def _select_output_columns(df: dd.DataFrame,
     extra = [c for c in tiebreaking_priority if c not in final_cols and c in df.columns]
     final_cols += extra
 
-    # Columns referenced in YAML conditions
+    # --- expr columns só se save_expr_columns == True ---
     extra_expr_cols = set()
-    for ruleset in translation_rules_uc.values():
-        for key in ["z_flag_translation", "instrument_type_translation"]:
-            rule = ruleset.get(key, {})
-            for cond in rule.get("conditions", []):
-                expr = cond.get("expr", "")
-                extra_expr_cols.update(_extract_variables_from_expr(expr))
+    if save_expr_columns:
+        for ruleset in translation_rules_uc.values():
+            for key in ["z_flag_translation", "instrument_type_translation"]:
+                rule = ruleset.get(key, {})
+                for cond in rule.get("conditions", []):
+                    expr = cond.get("expr", "")
+                    extra_expr_cols.update(_extract_variables_from_expr(expr))
 
     standard = {"id", "ra", "dec", "z", "z_flag", "z_err", "instrument_type", "survey"}
     already = set(final_cols)
-    needed = [c for c in extra_expr_cols if c not in standard and c in df.columns and c not in already]
-    final_cols += needed
+    needed = [c for c in extra_expr_cols if c not in standard and c not in already]
+    if save_expr_columns:
+        final_cols += needed
+
+    # ----- usar os hints vindos do YAML -----
+    schema_hints = schema_hints or {}  # se não vier no YAML, não força nada
+    pandas_dtype = {"int": "Int64", "float": "Float64", "str": "string", "bool": "boolean"}
+
+    def _add_missing_with_dtype(_df: dd.DataFrame, col: str, pd_dtype: str) -> dd.DataFrame:
+        if pd_dtype == "string":
+            meta_added = _df._meta.assign(**{col: pd.Series(pd.array([], dtype="string"))})
+            def _adder(part: pd.DataFrame) -> pd.DataFrame:
+                p = part.copy()
+                p[col] = pd.Series([""] * len(p), index=p.index, dtype="string")
+                return p
+        else:
+            meta_added = _df._meta.assign(**{col: pd.Series(pd.array([], dtype=pd_dtype))})
+            def _adder(part: pd.DataFrame) -> pd.DataFrame:
+                p = part.copy()
+                p[col] = pd.Series(pd.NA, index=p.index, dtype=pd_dtype)
+                return p
+        return _df.map_partitions(_adder, meta=meta_added)
+
+    def _normalize_string_series(s: pd.Series) -> pd.Series:
+        s = s.astype("string").str.strip()
+        low = s.fillna("").str.lower()
+        mask_empty = (low == "") | low.isin(["none", "null", "nan"])
+        return s.mask(mask_empty, "").astype("string")
+
+    def _to_nullable_boolean(s: pd.Series) -> pd.Series:
+        if s.dtype == object or str(s.dtype).startswith("string"):
+            s = s.astype("string").str.strip()
+            low = s.fillna("").str.lower()
+            s = s.mask((low == "") | low.isin(["none", "null", "nan"]), pd.NA)
+        vals = s.astype("object")
+        mask_true  = vals.apply(lambda v: isinstance(v, (bool, np.bool_)) and v is True)
+        mask_false = vals.apply(lambda v: isinstance(v, (bool, np.bool_)) and v is False)
+        out = pd.Series(pd.array([pd.NA] * len(vals), dtype="boolean"), index=vals.index)
+        out[mask_true] = True
+        out[mask_false] = False
+        return out
+
+    if save_expr_columns and schema_hints:
+        # só normaliza/coage as colunas que vamos salvar e que têm hint
+        target_cols = [c for c in needed if c in schema_hints]
+        for col in target_cols:
+            kind = schema_hints[col]
+            pd_dtype = pandas_dtype[kind]
+            if col in df.columns:
+                if kind == "str":
+                    df[col] = df[col].map_partitions(
+                        _normalize_string_series, meta=pd.Series(pd.array([], dtype="string"))
+                    )
+                elif kind == "float":
+                    coerced = dd.to_numeric(df[col], errors="coerce")
+                    df[col] = coerced.map_partitions(
+                        lambda s: s.astype("Float64"),
+                        meta=pd.Series(pd.array([], dtype="Float64")),
+                    )
+                elif kind == "int":
+                    coerced = dd.to_numeric(df[col], errors="coerce")
+                    df[col] = coerced.map_partitions(
+                        lambda s: s.astype("Int64"),
+                        meta=pd.Series(pd.array([], dtype="Int64")),
+                    )
+                elif kind == "bool":
+                    df[col] = df[col].map_partitions(
+                        _to_nullable_boolean, meta=pd.Series(pd.array([], dtype="boolean"))
+                    )
+            else:
+                df = _add_missing_with_dtype(df, col, pd_dtype)
 
     final_cols = list(dict.fromkeys(final_cols))
     df = df[[c for c in final_cols if c in df.columns]]
@@ -931,7 +1053,14 @@ def prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode=
     df = _flag_dp1(df)
 
     # Column selection and save
-    df = _select_output_columns(df, translation_rules_uc, tiebreaking_priority, used_type_fastpath)
+    df = _select_output_columns(
+        df,
+        translation_rules_uc,
+        tiebreaking_priority,
+        used_type_fastpath,
+        save_expr_columns=translation_config.get("save_expr_columns", False),
+        schema_hints=_normalize_schema_hints(translation_config.get("expr_column_schema")),
+    )
     out_path = _save_parquet(df, temp_dir, product_name)
 
     # HATS + margin cache (optional)

@@ -230,6 +230,17 @@ inputs:
         z_err: null
         survey: "source"
 
+    - path: "test_data/pipeline_generated_sample.parquet"
+      internal_name: "019_pipeline_sample"
+      columns:
+        id: "CRD_ID"
+        ra: "ra"
+        dec: "dec"
+        z: "z"
+        z_flag: "z_flag_homogenized"
+        z_err: "z_err"
+        survey: "survey"
+
 output_root_dir: "process001"
 output_dir: "outputs" # Relative directory for final outputs
 output_name: "crd" # Name prefix for the final output files
