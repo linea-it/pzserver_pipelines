@@ -5,6 +5,7 @@ import ast
 import glob
 import json
 import math
+import shutil
 import logging
 import pathlib
 import difflib
@@ -105,12 +106,72 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
     else:
         logger.info(f"{product_name} no non-null column mappings; proceeding without renaming.")
 
-    # Tag source and ensure required standard columns exist
+    # Tag source e garanta colunas padrão com dtypes anuláveis
     df["source"] = product_name
-    for col in ["id", "ra", "dec", "z", "z_flag", "z_err", "instrument_type", "survey"]:
+    
+    base_schema = {
+        "id": "string",
+        "instrument_type": "string",
+        "survey": "string",
+        "ra": "Float64",
+        "dec": "Float64",
+        "z": "Float64",
+        "z_flag": "Float64",
+        "z_err": "Float64",
+    }
+    for col, pd_dtype in base_schema.items():
         if col not in df.columns:
-            df[col] = np.nan
+            df = _add_missing_with_dtype(df, col, pd_dtype)
+    
     return df
+
+# -----------------------
+# Type Helpers
+# -----------------------
+
+def _add_missing_with_dtype(_df: dd.DataFrame, col: str, pd_dtype: str) -> dd.DataFrame:
+    """
+    Cria coluna faltante com dtype anulável do pandas e meta correto.
+    Preenche com <NA> (inclusive strings).
+    """
+    meta_added = _df._meta.assign(**{col: pd.Series(pd.array([], dtype=pd_dtype))})
+
+    def _adder(part: pd.DataFrame) -> pd.DataFrame:
+        p = part.copy()
+        p[col] = pd.Series(pd.NA, index=p.index, dtype=pd_dtype)
+        return p
+
+    return _df.map_partitions(_adder, meta=meta_added)
+
+
+def _normalize_string_series_to_na(s: pd.Series) -> pd.Series:
+    """
+    StringDtype com NA: trim e converte ''/None/'none'/'null'/'nan' -> <NA>.
+    """
+    s = s.astype("string").str.strip()
+    low = s.fillna("").str.lower()
+    mask_empty = (low == "") | low.isin(["none", "null", "nan"])
+    return s.mask(mask_empty, pd.NA).astype("string")
+
+
+def _to_nullable_boolean_strict(s: pd.Series) -> pd.Series:
+    """
+    Mantém apenas True/False; todo o resto vira <NA>; dtype 'boolean'.
+    """
+    if s.dtype == object or str(s.dtype).startswith("string"):
+        s = s.astype("string").str.strip()
+        low = s.fillna("").str.lower()
+        s = s.mask((low == "") | low.isin(["none", "null", "nan"]), pd.NA)
+
+    vals = s.astype("object")
+    mask_true  = vals.apply(lambda v: isinstance(v, (bool, np.bool_)) and v is True)
+    mask_false = vals.apply(lambda v: isinstance(v, (bool, np.bool_)) and v is False)
+
+    out = pd.Series(pd.array([pd.NA] * len(vals), dtype="boolean"), index=vals.index)
+    out[mask_true] = True
+    out[mask_false] = False
+    return out
+
 
 def _normalize_schema_hints(hints: dict | None) -> dict:
     """
@@ -137,9 +198,6 @@ def _normalize_schema_hints(hints: dict | None) -> dict:
         # else: desconhecido → ignora (ou faça um logger.warning aqui)
     return norm
 
-# -----------------------
-# Type normalization
-# -----------------------
 def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger) -> dd.DataFrame:
     """
     Normalize dtypes and do lightweight value cleaning.
@@ -153,20 +211,19 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
 
     # --- 1) String-like columns (fail fast on errors) ---
     # Use pandas StringDtype ("string") for safe NA handling and consistent downstream behavior.
-    string_like = ["id", "instrument_type", "survey", "instrument_type_homogenized"]
+    string_like = ["id", "instrument_type", "survey", "instrument_type_homogenized", "source"]
     for col in string_like:
         if col in df.columns:
             try:
-                df[col] = df[col].fillna("").astype("string")
+                df[col] = df[col].map_partitions(
+                    _normalize_string_series_to_na,
+                    meta=pd.Series(pd.array([], dtype="string")),
+                )
                 if col == "survey":
-                    # Canonicalize survey to UPPER for stable downstream rules
-                    df[col] = df[col].str.strip().str.upper()
-                else:
-                    df[col] = df[col].str.strip()
+                    df[col] = df[col].str.upper()
             except Exception as e:
                 raise ValueError(
                     f"[{product_name}] Failed to convert column '{col}' to pandas StringDtype. "
-                    f"Common causes: nested/array-like objects (lists/dicts), mixed types, or invalid extension dtypes. "
                     f"Original error: {e}"
                 ) from e
 
@@ -174,10 +231,12 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
     type_cast_ok = False
     if "type" in df.columns:
         try:
-            df["type"] = df["type"].fillna("").astype("string").str.strip().str.lower()
+            df["type"] = df["type"].map_partitions(
+                _normalize_string_series_to_na,
+                meta=pd.Series(pd.array([], dtype="string")),
+            ).str.lower()
             type_cast_ok = True
         except Exception as e:
-            # 'type' is optional → warning only; fast-path will be disabled downstream
             logger.warning(f"⚠️ {product_name} Failed to normalize 'type' to lower-case: {e}")
             type_cast_ok = False
 
@@ -249,8 +308,11 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
                     )
     
                 # Safe to cast now
-                df[col] = coerced.astype("float64")
-    
+                df[col] = coerced.map_partitions(
+                    lambda s: s.astype("Float64"),
+                    meta=pd.Series(pd.array([], dtype="Float64")),
+                )
+
             except ValueError:
                 raise
             except Exception as e:
@@ -282,7 +344,10 @@ def _generate_crd_ids(df: dd.DataFrame, product_name: str, temp_dir: str):
         return p
 
     parts = [
-        df.get_partition(i).map_partitions(_add_crd, offset, meta=df._meta.assign(CRD_ID=str))
+        df.get_partition(i).map_partitions(
+            _add_crd, offset,
+            meta=df._meta.assign(CRD_ID=pd.Series(pd.array([], dtype="string")))
+        )
         for i, offset in enumerate(offsets)
     ]
     df = dd.concat(parts)
@@ -334,6 +399,7 @@ def _honor_user_homogenized_mapping(
 
     return df
 
+
 def _homogenize(
     df: dd.DataFrame,
     translation_config: dict,
@@ -355,61 +421,96 @@ def _homogenize(
     """
     tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
     instrument_type_priority = translation_config.get("instrument_type_priority", {})
-    translation_rules_uc = {
-        k.upper(): v
-        for k, v in translation_config.get("translation_rules", {}).items()
-    }
+    translation_rules_uc = {k.upper(): v for k, v in translation_config.get("translation_rules", {}).items()}
 
     # -----------------------
-    # Helper: apply YAML translation row-wise
+    # Helper: row-wise translator driven by YAML rules
     # -----------------------
     def apply_translation(row: pd.Series, key: str):
-        # Look up rules by survey name (upper-cased keys)
+        """
+        - Looks up rules by upper-cased survey name.
+        - Supports direct lookup and conditional 'expr' rules.
+        - Replaces pd.NA in the eval context by None to avoid ambiguous boolean errors.
+        - If the observed value is numeric, attempts to coerce rule keys to floats for matching.
+        - Fallback:
+            * for 'instrument_type' → "" (will be normalized to <NA> later if empty)
+            * for 'z_flag'          → np.nan
+            * otherwise uses "" for strings, np.nan for numerics
+        """
+        # Survey rules
         survey_raw = row.get("survey")
         survey_key = (str(survey_raw).upper() if pd.notna(survey_raw) else "")
-        rules = translation_rules_uc.get(survey_key, {})
-        rule = rules.get(f"{key}_translation", {})
-        val = row.get(key)
+        ruleset = translation_rules_uc.get(survey_key, {}) or {}
+        rule = ruleset.get(f"{key}_translation", {}) or {}
+        if not isinstance(rule, dict):
+            rule = {}
 
-        # Normalize current value
+        # Observed value + default type
+        val = row.get(key)
+        if key == "instrument_type":
+            default_missing = ""
+        elif key == "z_flag":
+            default_missing = np.nan
+        else:
+            default_missing = "" if isinstance(val, str) else np.nan
+
+        # Normalize observed value
         if pd.isna(val):
-            val_norm = "" if isinstance(val, str) else val
-        elif isinstance(val, (int, float, np.number)):
-            val_norm = val
+            val_norm = None
+        elif isinstance(val, (int, float, np.number)) and not isinstance(val, (bool, np.bool_)):
+            val_norm = float(val)
         else:
             val_norm = str(val).strip().lower()
 
-        # Normalize rule keys for string matching
+        # Normalize rule keys for matching
         normalized_rule = {}
-        for k, v in rule.items():
-            if k in {"conditions", "default"}:
+        for rk, rv in rule.items():
+            if rk in {"conditions", "default"}:
                 continue
-            if isinstance(val_norm, (int, float, np.number)):
-                # Numeric comparisons use keys as-is
-                normalized_rule[k] = v
+            if isinstance(val_norm, (int, float)):
+                try:
+                    nk = float(rk)
+                except Exception:
+                    nk = rk  # non-numeric rule key won't match numeric val_norm
             else:
-                # String comparisons normalized to lower
-                normalized_rule[str(k).strip().lower()] = v
+                nk = str(rk).strip().lower()
+            normalized_rule[nk] = rv
 
         # Direct lookup
         if val_norm in normalized_rule:
             return normalized_rule[val_norm]
 
-        # Conditional expressions
+        # Conditional expressions (safe context: pd.NA -> None)
         if "conditions" in rule:
-            context = row.to_dict()
+            context = {k: (None if pd.isna(v) else v) for k, v in row.items()}
+        
+            # Whitelisted builtins only
+            safe_globals = {
+                "__builtins__": {},
+                "len": len,
+                "int": int,
+                "float": float,
+                "str": str,
+                "abs": abs,
+                "min": min,
+                "max": max,
+                "round": round,
+                "math": math,
+                "np": np,
+            }
+        
             try:
                 for cond in rule["conditions"]:
                     expr = cond.get("expr")
-                    if expr and eval(expr, {}, context):
-                        return cond["value"]
+                    if expr and eval(expr, safe_globals, context):
+                        return cond.get("value", default_missing)
             except Exception as e:
                 raise ValueError(
                     f"Error evaluating condition '{expr}' for survey '{survey_key}': {e}"
                 )
 
         # Fallback
-        return rule.get("default", "" if isinstance(val_norm, str) else np.nan)
+        return rule.get("default", default_missing)
 
     # -----------------------
     # z_flag_homogenized
@@ -455,19 +556,17 @@ def _homogenize(
             if can_use_zflag_as_quality():
                 logger.info(f"{product_name} Using 'z_flag' (quality-like) fast path for z_flag_homogenized.")
                 df["z_flag_homogenized"] = df["z_flag"].map_partitions(
-                    lambda s: s.apply(quality_like_to_flag),
-                    meta=("z_flag_homogenized", "f8"),
+                    lambda s: s.apply(quality_like_to_flag).astype("Float64"),
+                    meta=pd.Series(pd.array([], dtype="Float64")),
                 )
             else:
                 logger.info(f"{product_name} z_flag not quality-like; using YAML translation for z_flag_homogenized.")
                 df["z_flag_homogenized"] = df.map_partitions(
-                    lambda p: p.apply(lambda row: apply_translation(row, "z_flag"), axis=1),
-                    meta=("z_flag_homogenized", "f8"),
+                    lambda p: p.apply(lambda row: apply_translation(row, "z_flag"), axis=1).astype("Float64"),
+                    meta=pd.Series(pd.array([], dtype="Float64")),
                 )
         else:
-            logger.warning(
-                f"{product_name} Column 'z_flag_homogenized' already exists. Skipping recompute."
-            )
+            logger.warning(f"{product_name} Column 'z_flag_homogenized' already exists. Skipping recompute.")
 
     # -----------------------
     # instrument_type_homogenized
@@ -475,7 +574,7 @@ def _homogenize(
     used_type_fastpath = False
 
     def can_use_type_for_instrument() -> bool:
-        # Respect the outcome of normalization done in _normalize_types
+        # Respect normalization outcome from _normalize_types (type is string-lowered with NA)
         if not type_cast_ok or "type" not in df.columns:
             return False
         try:
@@ -493,14 +592,23 @@ def _homogenize(
         if "instrument_type_homogenized" not in df.columns:
             if can_use_type_for_instrument():
                 logger.info(f"{product_name} Using 'type' fast path for instrument_type_homogenized.")
-                df["instrument_type_homogenized"] = df["type"].astype(object)
+                # Ensure StringDtype with NA and lower-cased values
+                df["instrument_type_homogenized"] = df["type"].map_partitions(
+                    _normalize_string_series_to_na,
+                    meta=pd.Series(pd.array([], dtype="string")),
+                ).str.lower()
                 used_type_fastpath = True
             else:
                 logger.info(f"{product_name} 'type' not suitable; using YAML translation for instrument_type_homogenized.")
                 df["instrument_type_homogenized"] = df.map_partitions(
                     lambda p: p.apply(lambda row: apply_translation(row, "instrument_type"), axis=1),
-                    meta=("instrument_type_homogenized", "object"),
+                    meta=pd.Series(pd.array([], dtype="string")),
                 )
+                # Normalize to StringDtype with NA and lower-case
+                df["instrument_type_homogenized"] = df["instrument_type_homogenized"].map_partitions(
+                    _normalize_string_series_to_na,
+                    meta=pd.Series(pd.array([], dtype="string")),
+                ).str.lower()
         else:
             logger.warning(f"{product_name} Column 'instrument_type_homogenized' already exists. Skipping recompute.")
 
@@ -537,16 +645,25 @@ def _apply_tiebreaking_and_collect(
                 raise ValueError(
                     f"Tiebreaking column '{col}' is missing in catalog '{product_name}'."
                 )
-            if (df[col].isna() | (df[col] == "")).all().compute():
+
+            # Determine if the column is effectively empty (all NA/empty for string dtypes).
+            # For numeric dtypes we only check NA.
+            col_dtype = df[col].dtype
+            is_str = pd.api.types.is_string_dtype(col_dtype)
+            empty_mask = df[col].isna()
+            if is_str:
+                empty_mask = empty_mask | (df[col] == "")
+            if empty_mask.all().compute():
                 raise ValueError(
                     f"Tiebreaking column '{col}' is invalid in catalog '{product_name}' (all values are NaN/empty)."
                 )
+
+            # Except for 'instrument_type_homogenized', all tiebreak columns must be numeric.
             if col != "instrument_type_homogenized":
-                # Enforce numeric for all but instrument_type_homogenized
-                col_dtype = df[col].dtype
-                if not np.issubdtype(col_dtype, np.number):
+                # Use Pandas dtype check to handle nullable extension dtypes (Float64/Int64)
+                if not pd.api.types.is_numeric_dtype(col_dtype):
                     try:
-                        df[col] = df[col].astype(float)
+                        df[col] = dd.to_numeric(df[col], errors="coerce").astype("float64")
                         logger.info(f"ℹ️ {product_name} cast '{col}' to float for tie-breaking.")
                     except Exception as e:
                         raise ValueError(
@@ -618,9 +735,10 @@ def _apply_tiebreaking_and_collect(
 
             # Delta-z disambiguation among survivors
             if len(surviving) > 1 and (delta_z_threshold or 0) > 0:
-                z_vals = surviving["z"].values
-                ids = surviving["CRD_ID"].values
-                delta_z = np.abs(z_vals[:, None] - z_vals[None, :])
+                # Convert z to float NumPy array (coerce invalids to NaN) to avoid pd.NA ambiguity
+                z_vals = pd.to_numeric(surviving["z"], errors="coerce").to_numpy(dtype=float, copy=False)
+                ids = surviving["CRD_ID"].astype(str).to_numpy(copy=False)
+
                 remaining_ids = set(ids)
 
                 for i in range(len(ids)):
@@ -629,7 +747,11 @@ def _apply_tiebreaking_and_collect(
                     for j in range(i + 1, len(ids)):
                         if ids[j] not in remaining_ids:
                             continue
-                        if delta_z[i, j] <= float(delta_z_threshold):
+                        zi, zj = z_vals[i], z_vals[j]
+                        # Skip pairs with non-finite z (NaN/inf)
+                        if not (np.isfinite(zi) and np.isfinite(zj)):
+                            continue
+                        if abs(zi - zj) <= float(delta_z_threshold):
                             # Prefer i, eliminate j
                             group.loc[group["CRD_ID"] == ids[i], "tie_result"] = 2
                             group.loc[group["CRD_ID"] == ids[j], "tie_result"] = 0
@@ -661,8 +783,8 @@ def _apply_tiebreaking_and_collect(
         tie_update_dd = dd.from_pandas(combined_update, npartitions=1)
 
         # Ensure consistent string types
-        df["CRD_ID"] = df["CRD_ID"].astype(str)
-        tie_update_dd["CRD_ID"] = tie_update_dd["CRD_ID"].astype(str)
+        df["CRD_ID"] = df["CRD_ID"].astype("string")
+        tie_update_dd["CRD_ID"] = tie_update_dd["CRD_ID"].astype("string")
 
         # Replace tie_result with updated values; default to 1 if not present
         df = (
@@ -671,25 +793,34 @@ def _apply_tiebreaking_and_collect(
               .fillna({"tie_result": 1})
         )
 
+        df["tie_result"] = df["tie_result"].astype("Int8")
+
     return df
 
 # -----------------------
 # RA/DEC strict validation (fail fast)
 # -----------------------
 def _validate_ra_dec_or_fail(df: dd.DataFrame, product_name: str):
-    isfinite_ra  = df["ra"].map_partitions(lambda s: np.isfinite(s), meta=("ra", "bool"))
-    isfinite_dec = df["dec"].map_partitions(lambda s: np.isfinite(s), meta=("dec", "bool"))
+    def _isfinite_series(s: pd.Series) -> pd.Series:
+        arr = s.astype("float64")  # Float64 -> float64 (NaN onde <NA>)
+        return pd.Series(np.isfinite(arr), index=s.index)
+
+    isfinite_ra  = df["ra"].map_partitions(_isfinite_series,  meta=("ra", "bool"))
+    isfinite_dec = df["dec"].map_partitions(_isfinite_series, meta=("dec", "bool"))
+
+    ra64  = df["ra"].astype("float64")
+    dec64 = df["dec"].astype("float64")
 
     in_range = (
-        (df["ra"] >= 0.0) & (df["ra"] < 360.0) &
-        (df["dec"] >= -90.0) & (df["dec"] <= 90.0)
+        (ra64 >= 0.0) & (ra64 < 360.0) &
+        (dec64 >= -90.0) & (dec64 <= 90.0)
     )
     invalid_mask = ~(isfinite_ra & isfinite_dec & in_range)
 
     na_ra, na_dec = df["ra"].isna().sum(), df["dec"].isna().sum()
     nonfinite_ra, nonfinite_dec = (~isfinite_ra).sum(), (~isfinite_dec).sum()
-    oor_ra_low,  oor_ra_high  = (df["ra"] < 0.0).sum(), (df["ra"] >= 360.0).sum()
-    oor_dec_low, oor_dec_high = (df["dec"] < -90.0).sum(), (df["dec"] > 90.0).sum()
+    oor_ra_low,  oor_ra_high  = (ra64 < 0.0).sum(), (ra64 >= 360.0).sum()
+    oor_dec_low, oor_dec_high = (dec64 < -90.0).sum(), (dec64 > 90.0).sum()
     invalid_total = invalid_mask.sum()
 
     (na_ra, na_dec, nonfinite_ra, nonfinite_dec,
@@ -720,8 +851,8 @@ def _flag_dp1(df: dd.DataFrame) -> dd.DataFrame:
 
     def _compute(part: pd.DataFrame) -> pd.DataFrame:
         p = part.copy()
-        ra_rad  = np.deg2rad(p["ra"].values)
-        dec_rad = np.deg2rad(p["dec"].values)
+        ra_rad  = np.deg2rad(p["ra"].to_numpy(dtype=float, copy=False))
+        dec_rad = np.deg2rad(p["dec"].to_numpy(dtype=float, copy=False))
         in_any = np.zeros(len(p), dtype=bool)
         for ra_c, dec_c, rdeg in zip(ra_centers, dec_centers, radii):
             cos_ang = (np.sin(dec_c) * np.sin(dec_rad) +
@@ -759,7 +890,7 @@ def _select_output_columns(
     tiebreaking_priority: list,
     used_type_fastpath: bool,
     save_expr_columns: bool = False,
-    schema_hints: dict | None = None,   # <--- novo
+    schema_hints: dict | None = None,
 ) -> dd.DataFrame:
     final_cols = [
         "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err",
@@ -770,13 +901,15 @@ def _select_output_columns(
     if "instrument_type_homogenized" in df.columns:
         final_cols.append("instrument_type_homogenized")
 
+    # Se usamos o fastpath baseado em 'type', mantenha dtype string com NA
     if used_type_fastpath:
-        df["instrument_type"] = df["type"].fillna("").astype(str)
+        df["instrument_type"] = df["type"].astype("string")
 
+    # Quais colunas de tie-breaking também devem ir na saída
     extra = [c for c in tiebreaking_priority if c not in final_cols and c in df.columns]
     final_cols += extra
 
-    # --- expr columns só se save_expr_columns == True ---
+    # Expr columns só se habilitado
     extra_expr_cols = set()
     if save_expr_columns:
         for ruleset in translation_rules_uc.values():
@@ -784,62 +917,34 @@ def _select_output_columns(
                 rule = ruleset.get(key, {})
                 for cond in rule.get("conditions", []):
                     expr = cond.get("expr", "")
-                    extra_expr_cols.update(_extract_variables_from_expr(expr))
+                    vars_in_expr = _extract_variables_from_expr(expr)
+                    extra_expr_cols.update({v for v in vars_in_expr if v in df.columns})
 
     standard = {"id", "ra", "dec", "z", "z_flag", "z_err", "instrument_type", "survey"}
     already = set(final_cols)
+
+    # Precisamos delas (mesmo se não existirem no df; serão criadas como <NA> com dtype correto)
     needed = [c for c in extra_expr_cols if c not in standard and c not in already]
     if save_expr_columns:
         final_cols += needed
 
-    # ----- usar os hints vindos do YAML -----
-    schema_hints = schema_hints or {}  # se não vier no YAML, não força nada
+    # Hints vindos do YAML (normalizados antes via _normalize_schema_hints)
+    schema_hints = schema_hints or {}
     pandas_dtype = {"int": "Int64", "float": "Float64", "str": "string", "bool": "boolean"}
 
-    def _add_missing_with_dtype(_df: dd.DataFrame, col: str, pd_dtype: str) -> dd.DataFrame:
-        if pd_dtype == "string":
-            meta_added = _df._meta.assign(**{col: pd.Series(pd.array([], dtype="string"))})
-            def _adder(part: pd.DataFrame) -> pd.DataFrame:
-                p = part.copy()
-                p[col] = pd.Series([""] * len(p), index=p.index, dtype="string")
-                return p
-        else:
-            meta_added = _df._meta.assign(**{col: pd.Series(pd.array([], dtype=pd_dtype))})
-            def _adder(part: pd.DataFrame) -> pd.DataFrame:
-                p = part.copy()
-                p[col] = pd.Series(pd.NA, index=p.index, dtype=pd_dtype)
-                return p
-        return _df.map_partitions(_adder, meta=meta_added)
-
-    def _normalize_string_series(s: pd.Series) -> pd.Series:
-        s = s.astype("string").str.strip()
-        low = s.fillna("").str.lower()
-        mask_empty = (low == "") | low.isin(["none", "null", "nan"])
-        return s.mask(mask_empty, "").astype("string")
-
-    def _to_nullable_boolean(s: pd.Series) -> pd.Series:
-        if s.dtype == object or str(s.dtype).startswith("string"):
-            s = s.astype("string").str.strip()
-            low = s.fillna("").str.lower()
-            s = s.mask((low == "") | low.isin(["none", "null", "nan"]), pd.NA)
-        vals = s.astype("object")
-        mask_true  = vals.apply(lambda v: isinstance(v, (bool, np.bool_)) and v is True)
-        mask_false = vals.apply(lambda v: isinstance(v, (bool, np.bool_)) and v is False)
-        out = pd.Series(pd.array([pd.NA] * len(vals), dtype="boolean"), index=vals.index)
-        out[mask_true] = True
-        out[mask_false] = False
-        return out
-
     if save_expr_columns and schema_hints:
-        # só normaliza/coage as colunas que vamos salvar e que têm hint
+        # Só normalizamos/coagimos as colunas de expr que vamos salvar e que têm hint
         target_cols = [c for c in needed if c in schema_hints]
         for col in target_cols:
             kind = schema_hints[col]
             pd_dtype = pandas_dtype[kind]
+
             if col in df.columns:
+                # Normalizar/forçar dtype conforme o hint
                 if kind == "str":
                     df[col] = df[col].map_partitions(
-                        _normalize_string_series, meta=pd.Series(pd.array([], dtype="string"))
+                        _normalize_string_series_to_na,
+                        meta=pd.Series(pd.array([], dtype="string")),
                     )
                 elif kind == "float":
                     coerced = dd.to_numeric(df[col], errors="coerce")
@@ -855,11 +960,14 @@ def _select_output_columns(
                     )
                 elif kind == "bool":
                     df[col] = df[col].map_partitions(
-                        _to_nullable_boolean, meta=pd.Series(pd.array([], dtype="boolean"))
+                        _to_nullable_boolean_strict,
+                        meta=pd.Series(pd.array([], dtype="boolean")),
                     )
             else:
+                # Coluna não existe → cria com <NA> e dtype anulável correto
                 df = _add_missing_with_dtype(df, col, pd_dtype)
 
+    # Ordenação final e subsetting
     final_cols = list(dict.fromkeys(final_cols))
     df = df[[c for c in final_cols if c in df.columns]]
     return df
@@ -869,7 +977,7 @@ def _select_output_columns(
 # -----------------------
 def _save_parquet(df: dd.DataFrame, temp_dir: str, product_name: str) -> str:
     out_path = os.path.join(temp_dir, f"prepared_{product_name}")
-    df.to_parquet(out_path, write_index=False)
+    df.to_parquet(out_path, write_index=False, engine="pyarrow")
     return out_path
 
 def import_catalog(path, ra_col, dec_col, artifact_name, output_path, logs_dir, logger, client, size_threshold_mb=500):
