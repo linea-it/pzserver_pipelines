@@ -28,8 +28,8 @@ def get_executor(executor_config, logs_dir=None):
     
     elif executor_name == "slurm":
         instance_cfg = args.get("instance", {})
-        scale_cfg = args.get("scale", {})
-
+        scale_cfg = args.get("scale", {}) or {}
+    
         if logs_dir:
             extra_directives = instance_cfg.get("job_extra_directives", [])
             extra_directives.extend([
@@ -37,10 +37,28 @@ def get_executor(executor_config, logs_dir=None):
                 f"--error={logs_dir}/slurm-%j.err"
             ])
             instance_cfg["job_extra_directives"] = extra_directives
-
-        cluster = SLURMCluster(**instance_cfg)
-        cluster.scale(**scale_cfg)
     
+        cluster = SLURMCluster(**instance_cfg)
+    
+        # Minimal logic:
+        # - If user provides minimum/maximum jobs -> use adaptive scaling
+        # - Else, keep legacy fixed scaling with `jobs`
+        if "minimum_jobs" in scale_cfg or "maximum_jobs" in scale_cfg:
+            min_jobs = scale_cfg.get("minimum_jobs", None)
+            max_jobs = scale_cfg.get("maximum_jobs", None)
+    
+            kw = {}
+            if min_jobs is not None:
+                kw["minimum"] = min_jobs
+            if max_jobs is not None:
+                kw["maximum"] = max_jobs
+    
+            cluster.adapt(**kw)
+            # (Opcional) Para já subir 'minimum' imediatamente:
+            # if min_jobs is not None: cluster.scale(min_jobs)
+        elif "jobs" in scale_cfg:
+            cluster.scale(**scale_cfg)
+
     else:
         logger.warning(f"Unknown executor '{executor_name}'. Falling back to minimal local cluster.")
         cluster = LocalCluster(n_workers=1, threads_per_worker=1)

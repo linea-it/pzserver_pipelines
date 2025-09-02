@@ -23,7 +23,8 @@ executor:
 #        - "--propagate"
 #        - "--time=2:00:00"
 #    scale:
-#      jobs: 10 # Fixed number of dask jobs
+#      minimum_jobs: 10
+#      maximum_jobs: 20
 
 inputs:
   specz:
