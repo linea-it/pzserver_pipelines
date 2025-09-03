@@ -245,14 +245,19 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
     return df
 
 
-def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger,
-                                 protected: set[str] | None = None) -> dd.DataFrame:
-    """
-    Ensures unique names per partition. Keeps the first occurrence of each name
-    (including 'protected'); renames the others to <name>__dupN.
-    """
-    protected = protected or set()
+def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger) -> dd.DataFrame:
+    """Ensure unique column names across Dask partitions.
 
+    Preserves the first occurrence of each column name and renames subsequent
+    duplicates to "<name>__dupN" within each partition.
+
+    Args:
+        df (dd.DataFrame): Input Dask DataFrame.
+        logger (logging.Logger): Logger used to emit rename warnings.
+
+    Returns:
+        dd.DataFrame: DataFrame with unique column names per partition.
+    """
     def _renamer(pdf: pd.DataFrame) -> pd.DataFrame:
         cols = list(map(str, pdf.columns))
         seen: dict[str, int] = {}
@@ -261,9 +266,11 @@ def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger,
 
         for c in cols:
             if c not in seen:
+                # First occurrence: keep as-is.
                 seen[c] = 0
                 new_cols.append(c)
             else:
+                # Subsequent duplicates: append __dupN.
                 seen[c] += 1
                 new_name = f"{c}__dup{seen[c]}"
                 while new_name in seen:
@@ -275,8 +282,10 @@ def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger,
 
         if renamed_pairs:
             sample = ", ".join([f"{a}->{b}" for a, b in renamed_pairs[:6]])
-            logger.warning(f"⚠️ Renamed duplicate columns in partition: {sample}"
-                           f"{' ...' if len(renamed_pairs) > 6 else ''}")
+            logger.warning(
+                f"⚠️ Renamed duplicate columns in partition: {sample}"
+                f"{' ...' if len(renamed_pairs) > 6 else ''}"
+            )
 
         out = pdf.copy()
         out.columns = new_cols
@@ -287,16 +296,31 @@ def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger,
 
 
 def _rename_duplicate_columns_pd(pdf: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
+    """Ensure unique column names for a pandas DataFrame.
+
+    Preserves the first occurrence of each column name and renames subsequent
+    duplicates to "<name>__dupN".
+
+    Args:
+        pdf (pd.DataFrame): Input pandas DataFrame.
+        logger (logging.Logger): Logger used to emit rename warnings.
+
+    Returns:
+        pd.DataFrame: DataFrame with unique column names.
+    """
     cols = pd.Index(map(str, pdf.columns))
     if cols.has_duplicates:
-        seen = {}
-        new_cols = []
-        renamed = []
+        seen: dict[str, int] = {}
+        new_cols: list[str] = []
+        renamed: list[tuple[str, str]] = []
+
         for c in cols:
             if c not in seen:
+                # First occurrence: keep as-is.
                 seen[c] = 0
                 new_cols.append(c)
             else:
+                # Subsequent duplicates: append __dupN.
                 seen[c] += 1
                 new = f"{c}__dup{seen[c]}"
                 while new in seen:
@@ -305,13 +329,100 @@ def _rename_duplicate_columns_pd(pdf: pd.DataFrame, logger: logging.Logger) -> p
                 seen[new] = 0
                 new_cols.append(new)
                 renamed.append((c, new))
+
         if renamed:
-            sample = ", ".join([f"{a}->{b}" for a,b in renamed[:6]])
-            logger.warning(f"⚠️ Renamed duplicate columns (pandas): {sample}"
-                           f"{' ...' if len(renamed) > 6 else ''}")
+            sample = ", ".join([f"{a}->{b}" for a, b in renamed[:6]])
+            logger.warning(
+                f"⚠️ Renamed duplicate columns (pandas): {sample}"
+                f"{' ...' if len(renamed) > 6 else ''}"
+            )
+
         pdf = pdf.copy()
         pdf.columns = new_cols
+
     return pdf
+
+
+def _next_available_prev_name(existing: list[str], base: str) -> str:
+    """Return a unique column name for previous results.
+
+    If the given base name (e.g., "CRD_ID_prev") already exists in the list
+    of columns, appends a numeric suffix (2, 3, ...) until a free name is found.
+
+    Args:
+        existing (list[str]): List of current column names.
+        base (str): Desired base name.
+
+    Returns:
+        str: A column name that does not conflict with `existing`.
+    """
+    if base not in existing:
+        return base
+    i = 2
+    while f"{base}{i}" in existing:
+        i += 1
+    return f"{base}{i}"
+
+
+def _stash_previous_results(
+    df: dd.DataFrame,
+    entry: dict,
+    logger: logging.Logger,
+) -> dd.DataFrame:
+    """Stash previous pipeline results by renaming or duplicating selected columns.
+
+    Preserves prior-run results when present, using YAML to decide if the previous
+    CRD IDs were mapped into the standard ``id`` column:
+
+    - If YAML maps ``id <- CRD_ID`` and ``id`` exists, duplicate it to
+      ``CRD_ID_prev`` (or ``CRD_ID_prev2``, etc.) while keeping ``id`` intact.
+    - If a real ``CRD_ID`` column exists, rename it to ``CRD_ID_prev*``.
+    - If a ``compared_to`` column exists, rename it to ``compared_to_prev*``.
+    - ``tie_result`` is not renamed; it will be reused later (filled with 1 where
+      missing).
+
+    Args:
+        df (dd.DataFrame): Input Dask DataFrame (after _validate_and_rename()).
+        entry (dict): YAML entry for the product; used to inspect column mapping.
+        logger (logging.Logger): Logger for informational messages.
+
+    Returns:
+        dd.DataFrame: DataFrame with renamed/duplicated columns where necessary.
+    """
+    cols = list(map(str, df.columns))
+    columns_cfg = (entry.get("columns") or {})
+    # Only consider explicit, non-empty mappings
+    non_null_map = {str(std): str(src) for std, src in columns_cfg.items()
+                    if src not in (None, "", "null")}
+
+    # Special case: YAML explicitly mapped id <- CRD_ID
+    mapped_id_from_crd = str(non_null_map.get("id", "")).strip().lower() == "crd_id"
+
+    if mapped_id_from_crd and "id" in cols:
+        # Do not rename 'id'; create a copy as CRD_ID_prevN
+        new_name = _next_available_prev_name(cols, "CRD_ID_prev")
+        logger.info(f"Stashing CRD_ID from YAML-mapped 'id' → {new_name} (keeping 'id' intact)")
+        df[new_name] = df["id"]
+        cols.append(new_name)
+
+    # Normal case: if an actual CRD_ID column exists, stash it as CRD_ID_prev*
+    if "CRD_ID" in cols:
+        new_name = _next_available_prev_name(cols, "CRD_ID_prev")
+        if new_name != "CRD_ID":
+            logger.info(f"Stashing previous CRD_ID → {new_name}")
+            df = df.rename(columns={"CRD_ID": new_name})
+            cols.append(new_name)
+
+    # Stash compared_to as compared_to_prev*
+    if "compared_to" in cols:
+        new_name = _next_available_prev_name(cols, "compared_to_prev")
+        if new_name != "compared_to":
+            logger.info(f"Stashing previous compared_to → {new_name}")
+            df = df.rename(columns={"compared_to": new_name})
+            cols.append(new_name)
+
+    # tie_result is not renamed; its values will be reused during initialization
+    return df
 
 # -----------------------
 # Type helpers
@@ -1008,6 +1119,7 @@ def _homogenize(
 
     return df, used_type_fastpath, tiebreaking_priority, instrument_type_priority, translation_rules_uc
 
+
 # -----------------------
 # Tie-breaking / duplicates
 # -----------------------
@@ -1022,21 +1134,63 @@ def _apply_tiebreaking_and_collect(
 ) -> dd.DataFrame:
     """Resolve duplicates via prioritized tie-breaking and collect undirected edges.
 
-    Strategy:
-      1) Build RA/DEC key (rounded to 1e-6 deg).
-      2) Keep only keys with global duplicates (count > 1).
-      3) Shuffle rows so that same key coalesces in a partition.
-      4) Per-partition tie-breaking -> updates (CRD_ID, tie_result).
-      5) Per-partition edge emission -> (CRD_ID_A, CRD_ID_B).
-      6) Merge updates back; default non-dups to tie_result=1.
-      7) Accumulate edges on the driver.
+    Behavior:
+      - Initializes ``tie_result``: if column exists, keep its values (fillna→1);
+        otherwise create it with 1 for all rows. Cast to ``DTYPE_INT8``.
+      - Stars are globally excluded from comparisons:
+        rows with ``z_flag_homogenized == 6`` are set to ``tie_result = 3``
+        and never enter duplicate groups nor edge emission.
+      - Decisions are computed **only** for duplicate RA/DEC-key groups among
+        non-star rows. Updates are merged back without overwriting rows that
+        were not compared.
 
-    Robustness:
-      - Prefer p2p shuffle for speed; on any p2p consistency error, fall back
-        to 'tasks' shuffle automatically.
+    Args:
+        df: Input Dask DataFrame with columns including at least
+            ``CRD_ID, ra, dec``; optionally ``z, z_flag_homogenized`` and the
+            columns listed in ``tiebreaking_priority``.
+        translation_config: Dict with runtime knobs (e.g., ``delta_z_threshold``).
+        tiebreaking_priority: Ordered list of columns to break ties.
+        instrument_type_priority: Mapping str->rank for instrument type tie-break.
+        compared_to_dict_solo: In/out dict to collect undirected edges (driver-side).
+        product_name: Catalog identifier for logging.
+        logger: Logger.
+
+    Returns:
+        dd.DataFrame: Same shape as input with updated ``tie_result`` and without
+        modifying rows that were not part of duplicate comparisons.
+
+    Notes:
+        ``tie_result`` semantics:
+          0 = eliminated (in-group),
+          1 = winner / unique,
+          2 = hard tie (in-group),
+          3 = star (z_flag_homogenized==6) → excluded globally from comparisons.
     """
     import dask
     from dask.distributed import get_client
+
+    # ---- Init tie_result (preserve existing values; fillna with 1) ----
+    if "tie_result" in df.columns:
+        try:
+            prev_tr = dd.to_numeric(df["tie_result"], errors="coerce")
+            df["tie_result"] = prev_tr.fillna(1).map_partitions(
+                lambda s: s.astype(DTYPE_INT8),
+                meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
+            )
+            logger.info(f"{product_name} tie_result: reused existing column; filled missing with 1.")
+        except Exception as e:
+            logger.warning(f"⚠️ {product_name} tie_result reuse failed ({e}); initializing to 1.")
+            df["tie_result"] = 1
+            df["tie_result"] = df["tie_result"].map_partitions(
+                lambda s: s.astype(DTYPE_INT8),
+                meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
+            )
+    else:
+        df["tie_result"] = 1
+        df["tie_result"] = df["tie_result"].map_partitions(
+            lambda s: s.astype(DTYPE_INT8),
+            meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
+        )
 
     # ---- Config ----
     delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
@@ -1072,33 +1226,46 @@ def _apply_tiebreaking_and_collect(
             f"Cannot deduplicate '{product_name}': no tiebreaking_priority and delta_z_threshold unset/zero."
         )
 
-    # ---- Build key and prefilter duplicates ----
+    # ---- Globally flag stars (z_flag_homogenized == 6) with tie_result = 3 ----
+    is_star = None
+    if "z_flag_homogenized" in df.columns:
+        is_star = df["z_flag_homogenized"] == 6
+        try:
+            star_count = is_star.sum().compute()
+        except Exception:
+            star_count = 0
+        if star_count > 0:
+            # mask: overwrite tie_result with 3 where star; keep others unchanged
+            df["tie_result"] = df["tie_result"].mask(is_star, 3)
+            logger.info(f"{product_name}: flagged {star_count} star rows (tie_result=3).")
+    else:
+        # No column → no stars to exclude
+        is_star = dd.from_pandas(pd.Series([False] * 1), npartitions=1).iloc[:0]  # empty placeholder (unused)
+
+    # ---- Build key and prefilter duplicates (exclude stars from comparisons) ----
     valid_coord_mask = df["ra"].notnull() & df["dec"].notnull()
-    df_valid = df[valid_coord_mask].assign(
+    non_star_mask = (~(df["z_flag_homogenized"] == 6)) if "z_flag_homogenized" in df.columns else True
+    df_valid = df[valid_coord_mask & non_star_mask].assign(
         ra_dec_key=(
-            df["ra"].astype("float64").round(6).astype(str) + "_" +
-            df["dec"].astype("float64").round(6).astype(str)
+            df["ra"].astype("float64").round(4).astype(str) + "_" +
+            df["dec"].astype("float64").round(4).astype(str)
         )
     )
 
-    # Contagem global para selecionar apenas chaves com duplicatas
-    with dask.config.set({"dataframe.shuffle.method": "tasks"}):  # contagem é leve; 'tasks' é mais robusto
+    # Count globally to select only duplicate keys among NON-stars
+    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
         key_counts = df_valid["ra_dec_key"].value_counts(split_out=64)
     dup_keys = key_counts[key_counts > 1]
     df_dups = df_valid.merge(dup_keys.to_frame("cnt"), left_on="ra_dec_key", right_index=True, how="inner")
 
-    # Short-circuit: sem duplicatas
+    # Short-circuit: no duplicates -> keep existing tie_result as-in and return
     try:
         _ = df_dups.head(1, compute=True)
     except Exception:
         df["CRD_ID"] = df["CRD_ID"].astype(DTYPE_STR)
-        if "tie_result" not in df.columns:
-            df["tie_result"] = pd.Series(pd.array([], dtype=DTYPE_INT8)).reindex_like(df, fill_value=1)
-        else:
-            df["tie_result"] = df["tie_result"].fillna(1).astype(DTYPE_INT8)
         return df
 
-    # ---- Helpers: partition ops ----
+    # ---- Helpers: partition ops (input already excludes stars) ----
     def _tiebreak_partition_noindex(p: pd.DataFrame) -> pd.DataFrame:
         if p.empty:
             return pd.DataFrame({
@@ -1110,6 +1277,8 @@ def _apply_tiebreaking_and_collect(
 
         for _, group_raw in p.groupby("ra_dec_key", sort=False):
             group = group_raw.copy()
+
+            # Start with "undecided" (0) within the duplicate group
             group["tie_result"] = 0
             surviving = group.copy()
 
@@ -1120,15 +1289,7 @@ def _apply_tiebreaking_and_collect(
                 else:
                     surviving["_priority_value"] = surviving[priority_col].astype("float64").fillna(-np.inf)
 
-                # Early elimination: stars (flag 6) if z_flag_homogenized is used.
-                if priority_col == "z_flag_homogenized":
-                    ids_to_eliminate = surviving.loc[
-                        surviving["z_flag_homogenized"] == 6, "CRD_ID"
-                    ].astype(str).tolist()
-                    if ids_to_eliminate:
-                        group.loc[group["CRD_ID"].astype(str).isin(ids_to_eliminate), "tie_result"] = 0
-                        surviving = surviving[surviving["z_flag_homogenized"] != 6]
-
+                # Note: stars are already excluded globally; no need to drop them here.
                 if surviving.empty:
                     break
 
@@ -1211,7 +1372,7 @@ def _apply_tiebreaking_and_collect(
         out["CRD_ID_B"] = out["CRD_ID_B"].astype(DTYPE_STR)
         return out
 
-    # ---- Shuffle + fallback wrapper ----
+    # ---- Shuffle + compute updates for duplicate groups only (non-stars) ----
     def run_shuffle_and_compute():
         client = get_client()
         try:
@@ -1219,10 +1380,10 @@ def _apply_tiebreaking_and_collect(
         except Exception:
             nworkers = 1
         target_parts = max(2 * nworkers, df_dups.npartitions)
-    
+
         with dask.config.set({"dataframe.shuffle.method": "tasks"}):
             df_shuf = df_dups.shuffle("ra_dec_key", shuffle="tasks", npartitions=target_parts)
-    
+
             meta_updates = pd.DataFrame({
                 "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
                 "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
@@ -1231,34 +1392,46 @@ def _apply_tiebreaking_and_collect(
                 "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
                 "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
             })
-    
+
             tie_update_dd = df_shuf.map_partitions(_tiebreak_partition_noindex, meta=meta_updates) \
                                    .drop_duplicates(subset=["CRD_ID"], keep="last")
             edges_dd      = df_shuf.map_partitions(_edges_partition_noindex,    meta=meta_edges) \
                                    .drop_duplicates()
-    
+
             tie_update_dd, edges_dd = dask.persist(tie_update_dd, edges_dd)
-    
+
         edges = edges_dd.compute()
         return tie_update_dd, edges
 
     tie_update_dd, edges = run_shuffle_and_compute()
 
-    # ---- Merge decisions back ----
+    # ---- Merge decisions back WITHOUT overwriting non-compared rows ----
     df["CRD_ID"] = df["CRD_ID"].astype(DTYPE_STR)
-    df = (
-        df.drop("tie_result", axis=1, errors="ignore")
-          .merge(tie_update_dd, on="CRD_ID", how="left")
-          .fillna({"tie_result": 1})
+    df = df.merge(
+        tie_update_dd.rename(columns={"tie_result": "tie_result_update"}),
+        on="CRD_ID",
+        how="left",
     )
-    df["tie_result"] = df["tie_result"].astype(DTYPE_INT8)
+    # Only overwrite when there is an update (i.e., the row was compared).
+    # Star rows (tie_result==3) have no updates and are preserved as 3.
+    df["tie_result"] = df["tie_result_update"].fillna(df["tie_result"])
 
-    # ---- Accumulate edges on driver ----
+    # Final dtype normalization (use pandas in partition to avoid dd.to_numeric inside map_partitions)
+    df["tie_result"] = df["tie_result"].map_partitions(
+        lambda s: pd.to_numeric(s, errors="coerce").fillna(1).astype(DTYPE_INT8),
+        meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
+    )
+
+    # Drop helper column
+    df = df.drop(columns=["tie_result_update"], errors="ignore")
+
+    # ---- Accumulate edges on driver (already excludes stars) ----
     for a, b in zip(edges.get("CRD_ID_A", []), edges.get("CRD_ID_B", [])):
         compared_to_dict_solo.setdefault(a, set()).add(b)
         compared_to_dict_solo.setdefault(b, set()).add(a)
 
     return df
+
 
 # -----------------------
 # RA/DEC strict validation (fail fast)
@@ -1393,18 +1566,22 @@ def _select_output_columns(
     save_expr_columns: bool = False,
     schema_hints: dict | None = None,
 ) -> dd.DataFrame:
-    """Assemble final output schema and coerce optional expr columns.
+    """Assemble final output schema and coerce optional expression columns.
+
+    This function builds a deterministic list of columns for the final output,
+    optionally includes variables referenced in YAML expressions, and adds any
+    previous-run columns (e.g., CRD_ID_prev, CRD_ID_prev2, compared_to_prev*).
 
     Args:
-      df: Frame after tie-breaking and DP1 flagging.
-      translation_rules_uc: Upper-cased translation rules (for expr var discovery).
-      tiebreaking_priority: Priority columns to append if present.
-      used_type_fastpath: If True, copy normalized `type` into `instrument_type`.
-      save_expr_columns: Whether to keep variables used in YAML expressions.
-      schema_hints: Normalized hints {'int','float','str','bool'} for expr cols.
+        df (dd.DataFrame): Frame after tie-breaking and DP1 flagging.
+        translation_rules_uc (dict): Upper-cased translation rules (for expr discovery).
+        tiebreaking_priority (list): Priority columns to append if present.
+        used_type_fastpath (bool): If True, copy normalized `type` into `instrument_type`.
+        save_expr_columns (bool): Whether to keep variables used in YAML expressions.
+        schema_hints (dict | None): Normalized hints {'int','float','str','bool'} for expr cols.
 
     Returns:
-      Subset of `df` with deterministic column order and coerced dtypes.
+        dd.DataFrame: Subset of `df` with deterministic column order and coerced dtypes.
     """
     final_cols = [
         "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err",
@@ -1439,6 +1616,13 @@ def _select_output_columns(
     needed = [c for c in extra_expr_cols if c not in standard and c not in already]
     if save_expr_columns:
         final_cols += needed
+
+    # Include any previous-run columns (CRD_ID_prev*, compared_to_prev*), preserving order.
+    prev_like = [c for c in df.columns if str(c).startswith("CRD_ID_prev")]
+    prev_like += [c for c in df.columns if str(c).startswith("compared_to_prev")]
+    for c in prev_like:
+        if c not in final_cols:
+            final_cols.append(c)
 
     # Coerce hinted expr columns to requested dtypes.
     schema_hints = schema_hints or {}
@@ -1484,7 +1668,7 @@ def _select_output_columns(
     final_cols = list(dict.fromkeys(final_cols))
     df = df[[c for c in final_cols if c in df.columns]]
     return df
-
+    
 
 # -----------------------
 # Save parquet + HATS/margin
@@ -1492,9 +1676,8 @@ def _select_output_columns(
 def _save_parquet(df: dd.DataFrame, temp_dir: str, product_name: str) -> str:
     """Write a partitioned Parquet artifact for the prepared catalog.
 
-    Output layout:
-        ``<temp_dir>/prepared_<product_name>/`` with one or more files produced
-        by ``Dask.to_parquet(..., engine="pyarrow")``.
+    The function ensures unique column names per partition and writes the
+    result to a directory named "prepared_<product_name>" under `temp_dir`.
 
     Args:
         df (dd.DataFrame): Prepared dataframe to persist.
@@ -1507,14 +1690,8 @@ def _save_parquet(df: dd.DataFrame, temp_dir: str, product_name: str) -> str:
     out_path = os.path.join(temp_dir, f"prepared_{product_name}")
     logger = logging.getLogger(LOGGER_NAME)
 
-    protected = {
-        "CRD_ID", "id", "ra", "dec", "z", "z_err", "z_flag",
-        "instrument_type", "survey", "source",
-        "z_flag_homogenized", "instrument_type_homogenized",
-        "tie_result", "is_in_DP1_fields",
-    }
-
-    df = _rename_duplicate_columns_dd(df, logger, protected=protected)
+    # Ensure unique column names per partition (first occurrence kept, others renamed to __dupN)
+    df = _rename_duplicate_columns_dd(df, logger)
 
     with dask.config.set({"dataframe.shuffle.method": "tasks"}):
         df.to_parquet(out_path, write_index=False, engine="pyarrow")
@@ -1522,69 +1699,82 @@ def _save_parquet(df: dd.DataFrame, temp_dir: str, product_name: str) -> str:
 
 
 # ---- Helper: build a stable Arrow schema for our prepared catalog ----
-def _build_arrow_schema_for_catalog(df: pd.DataFrame) -> pa.Schema:
+def _build_arrow_schema_for_catalog(
+    df: pd.DataFrame,
+    schema_hints: dict | None = None,
+) -> pa.Schema:
     """Build a robust pyarrow Schema for LSDB.from_dataframe.
 
-    We declare explicit Arrow types for all standard columns we may output,
-    so per-pixel empty partitions don’t degrade to `null[pyarrow]`.
-
-    Args:
-        df: Prepared pandas DataFrame (pandas>=2 with ArrowDtype preferred).
-
-    Returns:
-        pyarrow.Schema with appropriate nullability for each column.
+    Declares explicit Arrow types for standard columns, historical prev-columns,
+    and (optionally) expression columns per `schema_hints` to prevent null-typed drift.
     """
-    # Canonical types we expect in the prepared parquet
     canonical = {
-        # core ids / strings
         "CRD_ID": pa.string(),
         "id": pa.string(),
         "source": pa.string(),
         "survey": pa.string(),
         "instrument_type": pa.string(),
         "instrument_type_homogenized": pa.string(),
-        # coordinates / redshift
         "ra": pa.float64(),
         "dec": pa.float64(),
         "z": pa.float64(),
         "z_err": pa.float64(),
         "z_flag": pa.float64(),
         "z_flag_homogenized": pa.float64(),
-        # flags / results
         "tie_result": pa.int8(),
         "is_in_DP1_fields": pa.int64(),
     }
 
-    fields = []
+    def _hint_to_pa(dt: str) -> pa.DataType:
+        k = str(dt).lower()
+        if k == "str":
+            return pa.string()
+        if k == "float":
+            return pa.float64()
+        if k == "int":
+            return pa.int64()
+        if k == "bool":
+            return pa.bool_()
+        return pa.string()
+
+    schema_hints = schema_hints or {}
+    fields: list[pa.Field] = []
+
     for col in df.columns:
-        # Prefer our canonical mapping when available
-        if col in canonical:
-            fields.append(pa.field(col, canonical[col], nullable=True))
+        name = str(col)
+
+        # 1) canonical mapeamento
+        if name in canonical:
+            fields.append(pa.field(name, canonical[name], nullable=True))
             continue
 
-        # Otherwise, derive a reasonable Arrow type from pandas dtype
-        dt = df[col].dtype
+        # 2) históricos: forçar string
+        if name.startswith("CRD_ID_prev") or name.startswith("compared_to_prev"):
+            fields.append(pa.field(name, pa.string(), nullable=True))
+            continue
 
-        # Pandas ArrowDtype -> use its underlying pyarrow dtype
+        # 3) hints de expr: se fornecidos, forçar tipo
+        if name in schema_hints:
+            fields.append(pa.field(name, _hint_to_pa(schema_hints[name]), nullable=True))
+            continue
+
+        # 4) fallback: inferir a partir do dtype do pandas
+        dt = df[name].dtype
         if isinstance(dt, pd.ArrowDtype):
-            fields.append(pa.field(col, dt.pyarrow_dtype, nullable=True))
+            fields.append(pa.field(name, dt.pyarrow_dtype, nullable=True))
             continue
 
-        # Pandas extension dtypes
         s = str(dt)
         if s.startswith("Float") or s == "float64":
-            fields.append(pa.field(col, pa.float64(), nullable=True))
+            fields.append(pa.field(name, pa.float64(), nullable=True))
         elif s.startswith("Int") or s in {"int64", "int32", "int16", "int8"}:
-            # default to int64 unless clearly int8 already
-            arr_type = pa.int8() if "8" in s else pa.int64()
-            fields.append(pa.field(col, arr_type, nullable=True))
+            fields.append(pa.field(name, pa.int64() if "8" not in s else pa.int8(), nullable=True))
         elif s in {"boolean", "bool"}:
-            fields.append(pa.field(col, pa.bool_(), nullable=True))
+            fields.append(pa.field(name, pa.bool_(), nullable=True))
         else:
-            # object, string, unknown -> string
-            fields.append(pa.field(col, pa.string(), nullable=True))
+            fields.append(pa.field(name, pa.string(), nullable=True))
 
-    # Deduplicate by column name preserving order
+    # Deduplicar preservando ordem
     seen = set()
     uniq_fields = []
     for f in fields:
@@ -1593,7 +1783,7 @@ def _build_arrow_schema_for_catalog(df: pd.DataFrame) -> pa.Schema:
             seen.add(f.name)
 
     return pa.schema(uniq_fields)
-
+    
 
 def import_catalog(
     path: str,
@@ -1604,7 +1794,8 @@ def import_catalog(
     logs_dir: str,
     logger: logging.Logger,
     client,  # type: ignore[override]
-    size_threshold_mb: int = 500,
+    size_threshold_mb: int = 200,
+    schema_hints: dict | None = None,
 ) -> None:
     """Import a Parquet catalog into HATS format.
 
@@ -1623,6 +1814,9 @@ def import_catalog(
         logger: Logger instance.
         client: Dask client (required for the distributed fallback).
         size_threshold_mb: Upper bound to try the fast path.
+        schema_hints: Optional raw schema hints for expr columns; if provided,
+            they will be normalized and enforced in the Arrow schema builder.
+            Example: {"snr": "float", "flag_text": "str"}.
     """
     # Discover parquet files (supports optional 'base/' subdir)
     base_path = os.path.join(path, "base")
@@ -1633,6 +1827,9 @@ def import_catalog(
 
     total_size_mb = sum(os.path.getsize(f) for f in parquet_files) / 1024**2
     hats_path = os.path.join(output_path, artifact_name)
+
+    # Normalize hints here (keeps function self-contained)
+    schema_hints_norm = _normalize_schema_hints(schema_hints or {})
 
     # ---- FAST PATH (small datasets): pandas -> LSDB.from_dataframe with explicit schema
     if total_size_mb <= size_threshold_mb:
@@ -1668,8 +1865,16 @@ def import_catalog(
                         # If cast fails (e.g., values out of range), leave as-is; schema will still force Arrow type
                         pass
 
+            # Force _prev* columns to string (historical columns)
+            for c in map(str, dfp.columns):
+                if c.startswith("CRD_ID_prev") or c.startswith("compared_to_prev"):
+                    try:
+                        dfp[c] = dfp[c].astype(DTYPE_STR)
+                    except Exception:
+                        pass  # Schema will still force to string
+
             # Build an explicit Arrow schema from the *current* dfp columns
-            schema = _build_arrow_schema_for_catalog(dfp)
+            schema = _build_arrow_schema_for_catalog(dfp, schema_hints=schema_hints_norm)
 
             # Create LSDB Catalog with explicit schema and write to HATS
             catalog = lsdb.from_dataframe(
@@ -1789,6 +1994,7 @@ def _maybe_hats_and_margin(
     logger: logging.Logger,
     client,  # type: ignore[override]
     combine_mode: str,
+    schema_hints: dict | None = None,
 ) -> tuple[str, str]:
     """Optionally build HATS and margin cache artifacts depending on mode.
 
@@ -1798,16 +2004,19 @@ def _maybe_hats_and_margin(
       3) Runs the margin cache pipeline (``cat{prefix}_margin``) if beneficial.
 
     Args:
-        out_path (str): Path returned by :func:`_save_parquet`.
-        product_name (str): Product internal name (must start with digits + underscore).
-        logs_dir (str): Directory for logs (not directly used here).
-        temp_dir (str): Directory for output artifacts.
-        logger (logging.Logger): Logger.
+        out_path: Path returned by :func:`_save_parquet`.
+        product_name: Product internal name (must start with digits + underscore).
+        logs_dir: Directory for logs (not directly used here).
+        temp_dir: Directory for output artifacts.
+        logger: Logger.
         client: Dask client.
-        combine_mode (str): One of
+        combine_mode: One of
             ``"concatenate"``,
             ``"concatenate_and_mark_duplicates"``,
             ``"concatenate_and_remove_duplicates"``.
+        schema_hints: Optional raw schema hints for expression columns
+            (e.g., {"snr": "float", "flag_text": "str"}). Normalized inside
+            :func:`import_catalog`.
 
     Returns:
         tuple[str, str]: ``(hats_path, margin_cache_path)``. Note that the
@@ -1831,12 +2040,30 @@ def _maybe_hats_and_margin(
         prefix = m.group(1)
         art_hats, art_margin = f"cat{prefix}_hats", f"cat{prefix}_margin"
 
-        import_catalog(out_path, "ra", "dec", art_hats, temp_dir, logs_dir, logger, client)
-        generate_margin_cache_safe(os.path.join(temp_dir, art_hats), temp_dir, art_margin, logs_dir, logger, client)
+        import_catalog(
+            out_path,
+            "ra",
+            "dec",
+            art_hats,
+            temp_dir,
+            logs_dir,
+            logger,
+            client,
+            schema_hints=schema_hints,  # repassa hints
+        )
+        generate_margin_cache_safe(
+            os.path.join(temp_dir, art_hats),
+            temp_dir,
+            art_margin,
+            logs_dir,
+            logger,
+            client,
+        )
 
         hats_path = os.path.join(temp_dir, art_hats)
         margin_cache_path = os.path.join(temp_dir, art_margin)
     return hats_path, margin_cache_path
+
 
 # =======================
 # Main orchestrator
@@ -1906,6 +2133,7 @@ def prepare_catalog(
 
     # 2) Validate & rename according to YAML mapping; enforce base schema.
     df = _validate_and_rename(df, entry, logger)
+    df = _stash_previous_results(df, entry, logger)
 
     # 3) Honor already-homogenized columns declared via YAML (if any).
     df = _honor_user_homogenized_mapping(df, entry, product_name, logger)
@@ -1984,8 +2212,16 @@ def prepare_catalog(
     out_path = _save_parquet(df_to_write, temp_dir, product_name)
 
     # 13) Optionally produce HATS + margin artifacts.
+    schema_hints_raw = translation_config.get("expr_column_schema")
     hats_path, margin_cache_path = _maybe_hats_and_margin(
-        out_path, product_name, logs_dir, temp_dir, logger, client, combine_mode
+        out_path,
+        product_name,
+        logs_dir,
+        temp_dir,
+        logger,
+        client,
+        combine_mode,
+        schema_hints=schema_hints_raw,
     )
 
     logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: prepare_catalog id={product_name}")

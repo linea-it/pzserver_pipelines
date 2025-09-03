@@ -23,10 +23,13 @@ import pathlib
 from collections import defaultdict, deque
 from datetime import datetime
 from typing import TYPE_CHECKING
+from functools import reduce
+from collections import deque
 
 # -----------------------
 # Third-party
 # -----------------------
+import dask
 import dask.dataframe as dd
 import lsdb
 import numpy as np
@@ -174,14 +177,14 @@ def crossmatch_tiebreak(
         )
 
     # --- Pre-filter eliminated rows ---
-    left_alive = left_cat.query("tie_result != 0")
-    right_alive = right_cat.query("tie_result != 0")
+    left_alive = left_cat.query("tie_result == 1 or tie_result == 2")
+    right_alive = right_cat.query("tie_result == 1 or tie_result == 2")
 
     # --- Spatial crossmatch (within radius) ---
     xmatched = left_alive.crossmatch(
         right_alive,
         radius_arcsec=crossmatch_radius,
-        n_neighbors=10,
+        n_neighbors=2,
         suffixes=("left", "right"),
     )
 
@@ -215,12 +218,12 @@ def crossmatch_tiebreak(
         zflag_right = row.get("z_flag_homogenizedright")
 
         # Early star rule
-        if pd.notna(zflag_left) and zflag_left == 6 and pd.notna(zflag_right) and zflag_right == 6:
-            return (0, 0)
-        elif pd.notna(zflag_left) and zflag_left == 6:
-            return (0, 2 if right_was_tie else 1)
-        elif pd.notna(zflag_right) and zflag_right == 6:
-            return (2 if left_was_tie else 1, 0)
+        #if pd.notna(zflag_left) and zflag_left == 6 and pd.notna(zflag_right) and zflag_right == 6:
+        #    return (0, 0)
+        #elif pd.notna(zflag_left) and zflag_left == 6:
+        #    return (0, 2 if right_was_tie else 1)
+        #elif pd.notna(zflag_right) and zflag_right == 6:
+        #    return (2 if left_was_tie else 1, 0)
 
         if not tiebreaking_priority:
             return (2, 2)  # defer to Δz
@@ -262,25 +265,59 @@ def crossmatch_tiebreak(
     xmatched = xmatched.assign(tie_left=tie_results[0], tie_right=tie_results[1])
 
     # ------------------------------------------------------------------
-    # Collect pairs for Δz processing and compared_to accumulation
+    # Collect links for compared_to (distributed) and prep Δz resolution
     # ------------------------------------------------------------------
-    pairs = xmatched[["CRD_IDleft", "CRD_IDright", "tie_left", "tie_right", "zleft", "zright"]].compute()
+    # Work on the underlying Dask DataFrame (xmatched._ddf) to avoid early .compute().
+    xmatched_ddf = xmatched._ddf
+    pairs_dd = xmatched_ddf[["CRD_IDleft", "CRD_IDright", "tie_left", "tie_right", "zleft", "zright"]].persist()
 
-    # Build new compared_to links from this step
-    compared_to_new = defaultdict(set)
-    for _, row in pairs.iterrows():
-        left_id = str(row["CRD_IDleft"])
-        right_id = str(row["CRD_IDright"])
-        compared_to_new[left_id].add(right_id)
-        compared_to_new[right_id].add(left_id)
+    # === Build compared_to_new WITHOUT pulling all edges to the driver ===
+    def _pairs_partition_to_dict(pdf: pd.DataFrame) -> dict[str, set[str]]:
+        """Return an undirected adjacency dict from a single pandas partition."""
+        out: dict[str, set[str]] = {}
+        if pdf.empty:
+            return out
+        L = pdf["CRD_IDleft"].astype(str).to_numpy()
+        R = pdf["CRD_IDright"].astype(str).to_numpy()
+        for a, b in zip(L, R):
+            s = out.get(a)
+            if s is None:
+                out[a] = {b}
+            else:
+                s.add(b)
+            s = out.get(b)
+            if s is None:
+                out[b] = {a}
+            else:
+                s.add(a)
+        return out
+
+    def _merge_two(a: dict[str, set[str]], b: dict[str, set[str]]) -> dict[str, set[str]]:
+        """In-place union of adjacency dicts."""
+        if not a:
+            return b
+        if not b:
+            return a
+        for k, v in b.items():
+            s = a.get(k)
+            if s is None:
+                a[k] = set(v)
+            else:
+                s.update(v)
+        return a
+
+    # Partition-wise adjacencies (delayed) from Dask partitions
+    parts = [dask.delayed(_pairs_partition_to_dict)(p) for p in pairs_dd.to_delayed()]
+    compared_to_new = reduce(lambda A, B: dask.delayed(_merge_two)(A, B),
+                             parts, dask.delayed(dict)()).compute()
 
     logger.info(
-        "New pairs this step: %d total links in %d objects",
+        "New pairs (distributed agg): %d total links in %d objects",
         sum(len(v) for v in compared_to_new.values()),
         len(compared_to_new),
     )
 
-    # Merge with previous compared_to dicts
+    # === Merge with previous compared_to dicts and persist JSON ===
     compared_to_dict = defaultdict(set)
     for d in [compared_to_left, compared_to_right]:
         for k, v in d.items():
@@ -292,46 +329,55 @@ def crossmatch_tiebreak(
     logger.info("Compared_to (merged): %d total links across %d objects", total_links, len(compared_to_dict))
     logger.info("Step %s: Compared_to merge completed", step)
 
-    # Persist compared_to
     compared_to_serializable = {k: sorted(v) for k, v in compared_to_dict.items()}
     compared_to_path = os.path.join(temp_dir, f"compared_to_xmatch_step{step}.json")
     with open(compared_to_path, "w") as f:
         json.dump(compared_to_serializable, f)
 
+    # === Identify losers early (distributed) ===
+    # Use boolean indexing (not .loc) to avoid Dask loc pitfalls.
+    losersL = (
+        pairs_dd[pairs_dd["tie_left"] == 0]["CRD_IDleft"]
+        .astype(str).drop_duplicates().compute()
+    )
+    losersR = (
+        pairs_dd[pairs_dd["tie_right"] == 0]["CRD_IDright"]
+        .astype(str).drop_duplicates().compute()
+    )
+    losers_set = set(pd.Index(losersL).union(pd.Index(losersR)))
+
+    # Only surviving edges proceed to Δz / component collapse (much smaller set).
+    survivors_dd = pairs_dd[(pairs_dd["tie_left"] != 0) & (pairs_dd["tie_right"] != 0)]
+
     # ------------------------------------------------------------------
-    # Δz tie resolution (hard ties only)
+    # Δz tie resolution (hard ties only) on the survivors set
     # ------------------------------------------------------------------
-    # Stable order helps debugging
+    # Materialize to pandas now that the table is significantly smaller.
+    pairs = survivors_dd[["CRD_IDleft", "CRD_IDright", "tie_left", "tie_right", "zleft", "zright"]].compute()
     pairs = pairs.sort_values(["CRD_IDleft", "CRD_IDright"], kind="mergesort").reset_index(drop=True)
-    
-    if float(delta_z_threshold) > 0.0:
+
+    if float(delta_z_threshold) > 0.0 and not pairs.empty:
         thr = float(delta_z_threshold)
-    
+
         def apply_delta_z_fix(pairs_df: pd.DataFrame) -> pd.DataFrame:
             """
-            Δz disambiguation in two phases driven by the Δz threshold:
-    
-            Phase 1) One-to-one resolution inside the subgraph |Δz| <= thr:
-              - Consider only pairs that are still hard ties (2,2).
-              - If a hard-tie pair is isolated (degree==1 on both sides within the
-                thresholded subgraph), drop the side with fewer `compared_to` links
-                (break ties lexicographically by CRD_ID).
-              - If exactly one node of the pair belongs to the cumulative hard-tie
-                set, keep that node and drop the other.
-    
-            Phase 2) Component collapse inside the same thresholded subgraph:
-              - After phase (1), for any connected component (within |Δz| <= thr)
-                that still has >= 2 survivors, deterministically pick a single
-                winner and mark all other nodes in that component as losers by
-                setting at least one of their ties to 0.
-              - Winner selection priority:
-                  a) If exactly one survivor is in `hard_tie_cumulative` → pick it.
-                  b) Otherwise, pick the node with the largest `compared_to` degree.
-                  c) Remaining ties → pick by CRD_ID (lexicographic ascending).
+            Δz disambiguation within the subgraph |Δz| <= thr:
+
+            Phase 1) Isolated 1–to–1 hard ties:
+              - Consider pairs with tie_left==2 & tie_right==2 only.
+              - If both nodes have degree 1 within Δz-bounded subgraph, drop the side
+                with smaller compared_to degree (tie → lexicographic).
+              - If exactly one node is in hard_tie_cumulative, keep it.
+
+            Phase 2) Collapse remaining multi–multi components:
+              - In each connected component inside |Δz| <= thr, pick a winner:
+                  (a) single node in hard_tie_cumulative → winner
+                  (b) else highest compared_to degree
+                  (c) else lexicographic by CRD_ID
+                Mark others as losers by setting one of their ties to 0.
             """
             pairs_df = pairs_df.copy()
-    
-            # Build the |Δz| <= thr mask on the current rows
+
             both_tie = (pairs_df["tie_left"] == 2) & (pairs_df["tie_right"] == 2)
             z_ok = pairs_df["zleft"].notna() & pairs_df["zright"].notna()
             within = both_tie & z_ok & (
@@ -339,55 +385,46 @@ def crossmatch_tiebreak(
             )
             if not within.any():
                 return pairs_df
-    
-            # ---------------------------
+
             # Phase 1: isolated 1–to–1s
-            # ---------------------------
             W1 = pairs_df.loc[within, ["CRD_IDleft", "CRD_IDright"]]
             degL = W1["CRD_IDleft"].value_counts()
             degR = W1["CRD_IDright"].value_counts()
-    
+
             for idx, row in pairs_df.loc[within].iterrows():
-                L = str(row["CRD_IDleft"])
-                R = str(row["CRD_IDright"])
-                # Only handle isolated 1–to–1 hard ties inside the Δz-threshold subgraph
+                L = str(row["CRD_IDleft"]); R = str(row["CRD_IDright"])
                 if degL.get(L, 0) == 1 and degR.get(R, 0) == 1:
                     left_in_hard  = L in hard_tie_cumulative
                     right_in_hard = R in hard_tie_cumulative
                     n_left  = len(compared_to_dict.get(L, []))
                     n_right = len(compared_to_dict.get(R, []))
-    
+
                     drop = "right"  # default: keep left
                     if right_in_hard and not left_in_hard:
                         drop = "left"
                     elif (not left_in_hard) and (not right_in_hard):
-                        # Drop the node with fewer links; tie → lexicographic
                         if n_left < n_right:
                             drop = "left"
                         elif n_left == n_right and R < L:
                             drop = "left"
-    
+
                     if drop == "left":
                         pairs_df.at[idx, "tie_left"] = 0
                     else:
                         pairs_df.at[idx, "tie_right"] = 0
-    
-            # ---------------------------------------------------------
-            # Phase 2: collapse multi–multi components (|Δz| <= thr)
-            # ---------------------------------------------------------
+
+            # Phase 2: collapse multi–multi components
             W = pairs_df.loc[within, ["CRD_IDleft", "CRD_IDright"]].astype(str)
             if not W.empty:
-                # Adjacency only from edges within the threshold
                 adj: dict[str, set[str]] = defaultdict(set)
                 nodes = set()
                 for L, R in W.itertuples(index=False):
                     adj[L].add(R); adj[R].add(L)
                     nodes.add(L); nodes.add(R)
-    
-                # Helpers to check if a node has already been marked as a loser in any pair
+
                 left_is_loser  = (pairs_df["tie_left"]  == 0)
                 right_is_loser = (pairs_df["tie_right"] == 0)
-    
+
                 def node_is_loser(n: str) -> bool:
                     n = str(n)
                     return (
@@ -395,8 +432,7 @@ def crossmatch_tiebreak(
                         or
                         ((pairs_df["CRD_IDright"].astype(str) == n) & right_is_loser).any()
                     )
-    
-                # BFS over connected components inside the Δz subgraph
+
                 seen: set[str] = set()
                 for start in nodes:
                     if start in seen:
@@ -409,126 +445,165 @@ def crossmatch_tiebreak(
                         for v in adj[u]:
                             if v not in seen:
                                 seen.add(v); dq.append(v)
-    
-                    # Nodes that haven't been eliminated by phase (1)
+
                     survivors = [n for n in comp if not node_is_loser(n)]
                     if len(survivors) <= 1:
-                        continue  # nothing left to resolve in this component
-    
-                    # Determine a single winner by the stated priority
+                        continue
+
                     def degree(n: str) -> int:
                         return len(compared_to_dict.get(str(n), []))
-    
+
                     hard_in_comp = [n for n in survivors if n in hard_tie_cumulative]
                     if len(hard_in_comp) == 1:
                         winner = hard_in_comp[0]
                     else:
-                        # Highest compared_to degree; tie-break by CRD_ID (ascending)
                         winner = sorted(survivors, key=lambda n: (-degree(n), str(n)))[0]
-    
-                    # Mark all other survivors as losers by setting at least one tie to 0
+
                     for n in survivors:
                         if n == winner:
                             continue
                         maskL = within & (pairs_df["CRD_IDleft"].astype(str)  == n)
                         maskR = within & (pairs_df["CRD_IDright"].astype(str) == n)
-    
-                        # A single 0 is enough to classify the node as a loser
                         if maskL.any():
                             first_idx = pairs_df.index[maskL][0]
                             pairs_df.at[first_idx, "tie_left"] = 0
                         elif maskR.any():
                             first_idx = pairs_df.index[maskR][0]
                             pairs_df.at[first_idx, "tie_right"] = 0
-    
+
             return pairs_df
-    
-        # Apply the Δz disambiguation
+
         pairs = apply_delta_z_fix(pairs)
-    
-    # ------------------------------------------------------------------
-    # Collapse per-pair decisions to a single tie_result per CRD_ID
-    # Component rule: ≥2 survivors → 2; exactly 1 → 1; losers → 0
-    # ------------------------------------------------------------------
-    pairs = pairs.sort_values(["CRD_IDleft", "CRD_IDright"], kind="mergesort").reset_index(drop=True)
-    
-    if pairs.empty:
-        final_map: dict[str, int] = {}
-    else:
-        # Bipartite edges (L–R)
-        W = pairs[["CRD_IDleft", "CRD_IDright"]].astype(str)
-    
-        # Universe of nodes
-        all_nodes = pd.Index(pd.unique(pd.concat([W["CRD_IDleft"], W["CRD_IDright"]], ignore_index=True)))
-    
-        # Losers (0) — if a node lost in any pair, it's a loser
-        losers = (
-            pd.Index(pairs.loc[pairs["tie_left"] == 0, "CRD_IDleft"].astype(str))
+
+    # Update losers with any Δz-induced losses (materialized in 'pairs')
+    if not pairs.empty:
+        more_losers = (
+            pd.Index(pairs.loc[pairs["tie_left"] == 0,  "CRD_IDleft"].astype(str))
             .union(pairs.loc[pairs["tie_right"] == 0, "CRD_IDright"].astype(str))
         )
-    
-        # Build adjacency for the full graph (all crossmatched edges, not only within thr)
-        adj: dict[str, set[str]] = defaultdict(set)
-        for L, R in W.itertuples(index=False):
-            adj[L].add(R)
-            adj[R].add(L)
-    
-        # Traverse connected components and assign final decisions
-        final_map = {}
+        losers_set.update(list(more_losers))
+
+    # ==============================================================
+    # Build per-node priority table to allow "unique-winner" override
+    # Lexicographic order follows 'tiebreaking_priority'
+    # ==============================================================
+
+    def _priority_series_from_side(ddf: dd.DataFrame, side: str, col: str) -> dd.Series:
+        """Return a numeric series for a tiebreaking column on given side."""
+        s = ddf[f"{col}{side}"]
+        if col == "instrument_type_homogenized":
+            # Map instrument type to numeric priority (unknown -> 0)
+            return s.map_partitions(
+                lambda p: p.map(instrument_type_priority).astype("float64"),
+                meta=("prio", "f8"),
+            )
+        else:
+            return dd.to_numeric(s, errors="coerce")
+
+    # Build a (CRD_ID, [priority columns...]) table from left + right sides and aggregate by max
+    frames = []
+    for side in ("left", "right"):
+        series_list = [xmatched_ddf[f"CRD_ID{side}"].astype(str).rename("CRD_ID")]
+        for col in tiebreaking_priority:
+            series_list.append(_priority_series_from_side(xmatched_ddf, side, col).rename(col))
+        frames.append(dd.concat(series_list, axis=1))
+
+    node_prio_dd = dd.concat(frames)
+    # Aggregate per-node (max over observed values)
+    node_prio_df = node_prio_dd.groupby("CRD_ID")[tiebreaking_priority].max().compute()
+    # Use -inf for missing to enforce deterministic lexicographic comparison
+    node_prio_df = node_prio_df.astype("float64").replace({np.nan: -np.inf})
+
+    def _pick_unique_winner(ids: list[str]) -> str | None:
+        """
+        Return a single CRD_ID if there is a unique lexicographic maximum across
+        tiebreaking_priority columns. Otherwise, return None.
+        """
+        if not ids or not tiebreaking_priority:
+            return None
+        sub = node_prio_df.reindex(ids).fillna(-np.inf)
+        cand = sub.index
+        for col in tiebreaking_priority:
+            col_vals = sub.loc[cand, col]
+            m = col_vals.max()
+            cand = col_vals.index[col_vals == m]
+            if len(cand) == 1:
+                return cand[0]
+        return None
+
+    # ------------------------------------------------------------------
+    # Collapse per-node decisions using the FULL crossmatch graph
+    #   - losers (in losers_set) -> 0 (always)
+    #   - if a connected component (FULL graph) has ≥2 survivors:
+    #         try unique-winner override by priority:
+    #             if unique lexicographic max exists -> winner=1, others=0
+    #             else -> all survivors=2 (multi survivor)
+    #   - if exactly 1 survivor -> 1
+    # ------------------------------------------------------------------
+
+    # Initialize final_map with ALL losers so they are applied unconditionally
+    final_map: dict[str, int] = {str(n): 0 for n in losers_set}
+
+    # Build full undirected adjacency from compared_to_new (already symmetric)
+    adj_full: dict[str, set[str]] = {str(k): set(map(str, v)) for k, v in compared_to_new.items()}
+
+    # Universe of nodes present in the full graph
+    all_nodes_full: set[str] = set(adj_full.keys())
+    for v in adj_full.values():
+        all_nodes_full.update(v)
+
+    if all_nodes_full:
         seen: set[str] = set()
-    
-        for start in all_nodes:
+        losers_all = set(map(str, losers_set))
+
+        for start in list(all_nodes_full):
             if start in seen:
                 continue
-    
-            # BFS to gather component nodes
+
+            # BFS over FULL graph (including losers as transit nodes)
             comp: list[str] = []
             dq = deque([start]); seen.add(start)
             while dq:
                 u = dq.popleft()
                 comp.append(u)
-                for v in adj[u]:
-                    if v not in seen:
-                        seen.add(v); dq.append(v)
-    
-            comp_set = set(comp)
-            comp_losers = comp_set & set(losers)
-            comp_survivors = [n for n in comp if n not in comp_losers]
-    
-            # Mark losers
-            for n in comp_losers:
-                final_map[n] = 0
-    
-            # Survivors: ≥2 -> 2, exactly 1 -> 1
+                for w in adj_full.get(u, ()):
+                    if w not in seen:
+                        seen.add(w); dq.append(w)
+
+            # Survivors in this component (exclude explicit losers)
+            comp_survivors = [n for n in comp if n not in losers_all]
+
             if len(comp_survivors) >= 2:
-                for n in comp_survivors:
-                    final_map[n] = 2
+                # Try unique-winner override by priority
+                winner = _pick_unique_winner(comp_survivors)
+                if winner is not None:
+                    final_map[winner] = 1
+                    for n in comp_survivors:
+                        if n != winner:
+                            final_map[n] = 0
+                else:
+                    # No unique max → multi-survivor semantics
+                    for n in comp_survivors:
+                        final_map[n] = 2
+
             elif len(comp_survivors) == 1:
                 final_map[comp_survivors[0]] = 1
-            # If no survivors, all were marked 0 above
-    
-    # Persist/extend hard ties (those kept as 2)
-    hard_tie_ids = [k for k, v in final_map.items() if v == 2]
-    hard_tie_cumulative.update(hard_tie_ids)
-    with open(hard_tie_path, "w") as f:
-        json.dump(list(hard_tie_cumulative), f)
+            # else: component has only losers → nothing to add (all 0 already)
 
     # ------------------------------------------------------------------
-    # Apply final decisions back to left/right and merge
+    # Apply final decisions back to left/right and merge (unchanged)
     # ------------------------------------------------------------------
     def apply_final(df_part: pd.DataFrame) -> pd.DataFrame:
         out = df_part.copy()
         if final_map:
             mapped = out["CRD_ID"].astype(str).map(final_map)
-            # Only overwrite where a final decision exists
             out["tie_result"] = mapped.fillna(out["tie_result"])
         return out
 
-    left_cat = left_cat.map_partitions(apply_final, meta=left_cat._ddf._meta)
+    left_cat  = left_cat.map_partitions(apply_final,  meta=left_cat._ddf._meta)
     right_cat = right_cat.map_partitions(apply_final, meta=right_cat._ddf._meta)
 
-    left_ddf = left_cat._ddf
-    right_ddf = right_cat._ddf
+    left_ddf, right_ddf = left_cat._ddf, right_cat._ddf
     merged = dd.concat([left_ddf, right_ddf])
 
     # ------------------------------------------------------------------
@@ -552,6 +627,12 @@ def crossmatch_tiebreak(
     for col in tiebreaking_priority:
         expected_types[col] = DTYPE_STR if col == "instrument_type_homogenized" else DTYPE_FLOAT
     
+    # Add dynamic prev-columns as strings
+    for c in map(str, merged.columns):
+        if c.startswith("CRD_ID_prev") or c.startswith("compared_to_prev"):
+            expected_types[c] = DTYPE_STR
+    
+    # Apply casts
     for col, dtype in expected_types.items():
         if col not in merged.columns:
             continue
