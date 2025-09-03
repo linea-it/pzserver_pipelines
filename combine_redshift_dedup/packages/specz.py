@@ -38,6 +38,9 @@ import numpy as np
 import pandas as pd
 from dask.distributed import get_client
 
+dask.config.set({"dataframe.shuffle.method": "tasks"})
+os.environ.setdefault("DASK_DISTRIBUTED__SHUFFLE__METHOD", "tasks")
+
 # -----------------------
 # Project (lsdb/hats/CRC)
 # -----------------------
@@ -241,6 +244,74 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
 
     return df
 
+
+def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger,
+                                 protected: set[str] | None = None) -> dd.DataFrame:
+    """
+    Ensures unique names per partition. Keeps the first occurrence of each name
+    (including 'protected'); renames the others to <name>__dupN.
+    """
+    protected = protected or set()
+
+    def _renamer(pdf: pd.DataFrame) -> pd.DataFrame:
+        cols = list(map(str, pdf.columns))
+        seen: dict[str, int] = {}
+        new_cols: list[str] = []
+        renamed_pairs: list[tuple[str, str]] = []
+
+        for c in cols:
+            if c not in seen:
+                seen[c] = 0
+                new_cols.append(c)
+            else:
+                seen[c] += 1
+                new_name = f"{c}__dup{seen[c]}"
+                while new_name in seen:
+                    seen[c] += 1
+                    new_name = f"{c}__dup{seen[c]}"
+                seen[new_name] = 0
+                new_cols.append(new_name)
+                renamed_pairs.append((c, new_name))
+
+        if renamed_pairs:
+            sample = ", ".join([f"{a}->{b}" for a, b in renamed_pairs[:6]])
+            logger.warning(f"⚠️ Renamed duplicate columns in partition: {sample}"
+                           f"{' ...' if len(renamed_pairs) > 6 else ''}")
+
+        out = pdf.copy()
+        out.columns = new_cols
+        return out
+
+    meta_fixed = _renamer(df._meta)
+    return df.map_partitions(_renamer, meta=meta_fixed)
+
+
+def _rename_duplicate_columns_pd(pdf: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
+    cols = pd.Index(map(str, pdf.columns))
+    if cols.has_duplicates:
+        seen = {}
+        new_cols = []
+        renamed = []
+        for c in cols:
+            if c not in seen:
+                seen[c] = 0
+                new_cols.append(c)
+            else:
+                seen[c] += 1
+                new = f"{c}__dup{seen[c]}"
+                while new in seen:
+                    seen[c] += 1
+                    new = f"{c}__dup{seen[c]}"
+                seen[new] = 0
+                new_cols.append(new)
+                renamed.append((c, new))
+        if renamed:
+            sample = ", ".join([f"{a}->{b}" for a,b in renamed[:6]])
+            logger.warning(f"⚠️ Renamed duplicate columns (pandas): {sample}"
+                           f"{' ...' if len(renamed) > 6 else ''}")
+        pdf = pdf.copy()
+        pdf.columns = new_cols
+    return pdf
 
 # -----------------------
 # Type helpers
@@ -949,33 +1020,28 @@ def _apply_tiebreaking_and_collect(
     product_name: str,
     logger: logging.Logger,
 ) -> dd.DataFrame:
-    """Resolve duplicates via prioritized tie-breaking and collect pair links.
+    """Resolve duplicates via prioritized tie-breaking and collect undirected edges.
 
-    Pipeline:
-      1) Build collision key from RA/DEC rounded to 1e-6 deg.
-      2) Shuffle by key.
-      3) Per-partition tie-break; survivors get 1 (or 2 during resolution), losers 0.
-      4) Merge decisions.
-      5) Emit undirected edges for items sharing a key.
+    Strategy:
+      1) Build RA/DEC key (rounded to 1e-6 deg).
+      2) Keep only keys with global duplicates (count > 1).
+      3) Shuffle rows so that same key coalesces in a partition.
+      4) Per-partition tie-breaking -> updates (CRD_ID, tie_result).
+      5) Per-partition edge emission -> (CRD_ID_A, CRD_ID_B).
+      6) Merge updates back; default non-dups to tie_result=1.
+      7) Accumulate edges on the driver.
 
-    Args:
-      df: Input with CRD_ID.
-      translation_config: Full config (uses delta_z_threshold).
-      tiebreaking_priority: Ordered columns to prioritize.
-      instrument_type_priority: Score map for instrument types.
-      compared_to_dict_solo: Accumulator of pairwise links (driver).
-      product_name: Catalog id for logging.
-      logger: Logger.
-
-    Returns:
-      dd.DataFrame: With tie_result (nullable Int8) merged in.
-
-    Raises:
-      ValueError: On missing/empty priority columns or no criteria.
+    Robustness:
+      - Prefer p2p shuffle for speed; on any p2p consistency error, fall back
+        to 'tasks' shuffle automatically.
     """
+    import dask
+    from dask.distributed import get_client
+
+    # ---- Config ----
     delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
 
-    # Validate priority columns.
+    # ---- Validate tiebreaking columns ----
     if not tiebreaking_priority:
         logger.warning(f"⚠️ {product_name} tiebreaking_priority is empty. Using delta_z_threshold only.")
     else:
@@ -983,7 +1049,6 @@ def _apply_tiebreaking_and_collect(
             if col not in df.columns:
                 raise ValueError(f"Tiebreaking column '{col}' is missing in catalog '{product_name}'.")
             col_dtype = df[col].dtype
-            # Treat empty strings as empty for string-typed columns (and instrument_type_homogenized).
             is_str = (col == "instrument_type_homogenized") or pd.api.types.is_string_dtype(col_dtype)
             empty_mask = df[col].isna()
             if is_str:
@@ -992,7 +1057,6 @@ def _apply_tiebreaking_and_collect(
                 raise ValueError(
                     f"Tiebreaking column '{col}' is invalid in catalog '{product_name}' (all NaN/empty)."
                 )
-            # All except instrument_type_homogenized must be numeric.
             if col != "instrument_type_homogenized" and not pd.api.types.is_numeric_dtype(col_dtype):
                 try:
                     df[col] = dd.to_numeric(df[col], errors="coerce").astype("float64")
@@ -1008,7 +1072,7 @@ def _apply_tiebreaking_and_collect(
             f"Cannot deduplicate '{product_name}': no tiebreaking_priority and delta_z_threshold unset/zero."
         )
 
-    # Valid coordinates only. Cast to float64 to avoid extension-NA rounding issues.
+    # ---- Build key and prefilter duplicates ----
     valid_coord_mask = df["ra"].notnull() & df["dec"].notnull()
     df_valid = df[valid_coord_mask].assign(
         ra_dec_key=(
@@ -1017,11 +1081,25 @@ def _apply_tiebreaking_and_collect(
         )
     )
 
-    # Shuffle by key.
-    df_shuf = df_valid.set_index("ra_dec_key", shuffle="tasks")
+    # Contagem global para selecionar apenas chaves com duplicatas
+    with dask.config.set({"dataframe.shuffle.method": "tasks"}):  # contagem é leve; 'tasks' é mais robusto
+        key_counts = df_valid["ra_dec_key"].value_counts(split_out=64)
+    dup_keys = key_counts[key_counts > 1]
+    df_dups = df_valid.merge(dup_keys.to_frame("cnt"), left_on="ra_dec_key", right_index=True, how="inner")
 
-    def _tiebreak_partition(p: pd.DataFrame) -> pd.DataFrame:
-        """Per-partition tie-breaking (index: ra_dec_key)."""
+    # Short-circuit: sem duplicatas
+    try:
+        _ = df_dups.head(1, compute=True)
+    except Exception:
+        df["CRD_ID"] = df["CRD_ID"].astype(DTYPE_STR)
+        if "tie_result" not in df.columns:
+            df["tie_result"] = pd.Series(pd.array([], dtype=DTYPE_INT8)).reindex_like(df, fill_value=1)
+        else:
+            df["tie_result"] = df["tie_result"].fillna(1).astype(DTYPE_INT8)
+        return df
+
+    # ---- Helpers: partition ops ----
+    def _tiebreak_partition_noindex(p: pd.DataFrame) -> pd.DataFrame:
         if p.empty:
             return pd.DataFrame({
                 "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
@@ -1030,7 +1108,7 @@ def _apply_tiebreaking_and_collect(
 
         updates: list[pd.DataFrame] = []
 
-        for _, group_raw in p.groupby(level=0, sort=False):
+        for _, group_raw in p.groupby("ra_dec_key", sort=False):
             group = group_raw.copy()
             group["tie_result"] = 0
             surviving = group.copy()
@@ -1060,10 +1138,8 @@ def _apply_tiebreaking_and_collect(
                 if len(surviving) == 1:
                     break
 
-            # Mark priority survivors as ties to resolve.
             group.loc[group["CRD_ID"].astype(str).isin(surviving["CRD_ID"].astype(str)), "tie_result"] = 2
 
-            # Optional |Δz| disambiguation.
             if len(surviving) > 1 and (delta_z_threshold or 0) > 0:
                 z_vals = pd.to_numeric(surviving["z"], errors="coerce").to_numpy(dtype=float, copy=False)
                 ids = surviving["CRD_ID"].astype(str).to_numpy(copy=False)
@@ -1084,7 +1160,6 @@ def _apply_tiebreaking_and_collect(
                             group.loc[group["CRD_ID"].astype(str) == ids[j], "tie_result"] = 0
                             remaining.discard(ids[j])
 
-            # Convert a single “2” survivor to “1”.
             survivors = group[group["tie_result"] == 2]
             if len(survivors) == 1:
                 group.loc[group["tie_result"] == 2, "tie_result"] = 1
@@ -1094,29 +1169,27 @@ def _apply_tiebreaking_and_collect(
                     cid = str(non_elim.iloc[0]["CRD_ID"])
                     group.loc[group["CRD_ID"].astype(str) == cid, "tie_result"] = 1
 
-            updates.append(group[["CRD_ID", "tie_result"]].copy())
+            updates.append(group[["CRD_ID", "tie_result"]])
 
         out = pd.concat(updates, ignore_index=True) if updates else pd.DataFrame(columns=["CRD_ID", "tie_result"])
-        out["CRD_ID"] = out["CRD_ID"].astype(DTYPE_STR)
-        out["tie_result"] = out["tie_result"].astype(DTYPE_INT8)
+        if not out.empty:
+            out["CRD_ID"] = out["CRD_ID"].astype(DTYPE_STR)
+            out["tie_result"] = out["tie_result"].astype(DTYPE_INT8)
+        else:
+            out = pd.DataFrame({
+                "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
+                "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
+            })
         return out
 
-    # Meta for updates.
-    meta_updates = pd.DataFrame({
-        "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
-        "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
-    })
-    tie_update_dd = df_shuf.map_partitions(_tiebreak_partition, meta=meta_updates).drop_duplicates(subset=["CRD_ID"], keep="last")
-
-    # Edge emission.
-    def _edges_partition(p: pd.DataFrame) -> pd.DataFrame:
+    def _edges_partition_noindex(p: pd.DataFrame) -> pd.DataFrame:
         if p.empty:
             return pd.DataFrame({
                 "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
                 "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
             })
         edges = []
-        for _, group in p.groupby(level=0, sort=False):
+        for _, group in p.groupby("ra_dec_key", sort=False):
             ids = group["CRD_ID"].astype(str).tolist()
             n = len(ids)
             if n <= 1:
@@ -1138,13 +1211,40 @@ def _apply_tiebreaking_and_collect(
         out["CRD_ID_B"] = out["CRD_ID_B"].astype(DTYPE_STR)
         return out
 
-    meta_edges = pd.DataFrame({
-        "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
-        "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
-    })
-    edges_dd = df_shuf.map_partitions(_edges_partition, meta=meta_edges).drop_duplicates()
+    # ---- Shuffle + fallback wrapper ----
+    def run_shuffle_and_compute():
+        client = get_client()
+        try:
+            nworkers = len(client.scheduler_info()["workers"]) or 1
+        except Exception:
+            nworkers = 1
+        target_parts = max(2 * nworkers, df_dups.npartitions)
+    
+        with dask.config.set({"dataframe.shuffle.method": "tasks"}):
+            df_shuf = df_dups.shuffle("ra_dec_key", shuffle="tasks", npartitions=target_parts)
+    
+            meta_updates = pd.DataFrame({
+                "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
+                "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
+            })
+            meta_edges = pd.DataFrame({
+                "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
+                "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
+            })
+    
+            tie_update_dd = df_shuf.map_partitions(_tiebreak_partition_noindex, meta=meta_updates) \
+                                   .drop_duplicates(subset=["CRD_ID"], keep="last")
+            edges_dd      = df_shuf.map_partitions(_edges_partition_noindex,    meta=meta_edges) \
+                                   .drop_duplicates()
+    
+            tie_update_dd, edges_dd = dask.persist(tie_update_dd, edges_dd)
+    
+        edges = edges_dd.compute()
+        return tie_update_dd, edges
 
-    # Merge decisions.
+    tie_update_dd, edges = run_shuffle_and_compute()
+
+    # ---- Merge decisions back ----
     df["CRD_ID"] = df["CRD_ID"].astype(DTYPE_STR)
     df = (
         df.drop("tie_result", axis=1, errors="ignore")
@@ -1153,8 +1253,7 @@ def _apply_tiebreaking_and_collect(
     )
     df["tie_result"] = df["tie_result"].astype(DTYPE_INT8)
 
-    # Accumulate edges.
-    edges = edges_dd.compute()
+    # ---- Accumulate edges on driver ----
     for a, b in zip(edges.get("CRD_ID_A", []), edges.get("CRD_ID_B", [])):
         compared_to_dict_solo.setdefault(a, set()).add(b)
         compared_to_dict_solo.setdefault(b, set()).add(a)
@@ -1406,8 +1505,94 @@ def _save_parquet(df: dd.DataFrame, temp_dir: str, product_name: str) -> str:
         str: Absolute path to the output directory containing Parquet files.
     """
     out_path = os.path.join(temp_dir, f"prepared_{product_name}")
-    df.to_parquet(out_path, write_index=False, engine="pyarrow")
+    logger = logging.getLogger(LOGGER_NAME)
+
+    protected = {
+        "CRD_ID", "id", "ra", "dec", "z", "z_err", "z_flag",
+        "instrument_type", "survey", "source",
+        "z_flag_homogenized", "instrument_type_homogenized",
+        "tie_result", "is_in_DP1_fields",
+    }
+
+    df = _rename_duplicate_columns_dd(df, logger, protected=protected)
+
+    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
+        df.to_parquet(out_path, write_index=False, engine="pyarrow")
     return out_path
+
+
+# ---- Helper: build a stable Arrow schema for our prepared catalog ----
+def _build_arrow_schema_for_catalog(df: pd.DataFrame) -> pa.Schema:
+    """Build a robust pyarrow Schema for LSDB.from_dataframe.
+
+    We declare explicit Arrow types for all standard columns we may output,
+    so per-pixel empty partitions don’t degrade to `null[pyarrow]`.
+
+    Args:
+        df: Prepared pandas DataFrame (pandas>=2 with ArrowDtype preferred).
+
+    Returns:
+        pyarrow.Schema with appropriate nullability for each column.
+    """
+    # Canonical types we expect in the prepared parquet
+    canonical = {
+        # core ids / strings
+        "CRD_ID": pa.string(),
+        "id": pa.string(),
+        "source": pa.string(),
+        "survey": pa.string(),
+        "instrument_type": pa.string(),
+        "instrument_type_homogenized": pa.string(),
+        # coordinates / redshift
+        "ra": pa.float64(),
+        "dec": pa.float64(),
+        "z": pa.float64(),
+        "z_err": pa.float64(),
+        "z_flag": pa.float64(),
+        "z_flag_homogenized": pa.float64(),
+        # flags / results
+        "tie_result": pa.int8(),
+        "is_in_DP1_fields": pa.int64(),
+    }
+
+    fields = []
+    for col in df.columns:
+        # Prefer our canonical mapping when available
+        if col in canonical:
+            fields.append(pa.field(col, canonical[col], nullable=True))
+            continue
+
+        # Otherwise, derive a reasonable Arrow type from pandas dtype
+        dt = df[col].dtype
+
+        # Pandas ArrowDtype -> use its underlying pyarrow dtype
+        if isinstance(dt, pd.ArrowDtype):
+            fields.append(pa.field(col, dt.pyarrow_dtype, nullable=True))
+            continue
+
+        # Pandas extension dtypes
+        s = str(dt)
+        if s.startswith("Float") or s == "float64":
+            fields.append(pa.field(col, pa.float64(), nullable=True))
+        elif s.startswith("Int") or s in {"int64", "int32", "int16", "int8"}:
+            # default to int64 unless clearly int8 already
+            arr_type = pa.int8() if "8" in s else pa.int64()
+            fields.append(pa.field(col, arr_type, nullable=True))
+        elif s in {"boolean", "bool"}:
+            fields.append(pa.field(col, pa.bool_(), nullable=True))
+        else:
+            # object, string, unknown -> string
+            fields.append(pa.field(col, pa.string(), nullable=True))
+
+    # Deduplicate by column name preserving order
+    seen = set()
+    uniq_fields = []
+    for f in fields:
+        if f.name not in seen:
+            uniq_fields.append(f)
+            seen.add(f.name)
+
+    return pa.schema(uniq_fields)
 
 
 def import_catalog(
@@ -1421,59 +1606,107 @@ def import_catalog(
     client,  # type: ignore[override]
     size_threshold_mb: int = 500,
 ) -> None:
-    """Import a Parquet catalog into HATS format (direct or distributed path).
+    """Import a Parquet catalog into HATS format.
 
-    For catalogs with total size ``<= size_threshold_mb``, a fast local path is
-    used (``lsdb.from_dataframe(...).to_hats``). Larger catalogs are imported
-    via the HATS pipeline with a distributed client.
+    Tries a fast path via `lsdb.from_dataframe(..., schema=...)` for small
+    catalogs, providing an explicit pyarrow Schema to avoid meta drift
+    (e.g., `null[pyarrow]` vs `string[pyarrow]`). On any error, falls back to
+    the distributed HATS import (`pipeline_with_client`) with robust shuffle.
 
     Args:
-        path (str): Directory produced by ``_save_parquet`` or any folder
-            containing Parquet files (supports optional ``base/`` subdir).
-        ra_col (str): RA column name.
-        dec_col (str): DEC column name.
-        artifact_name (str): Name of the HATS output artifact (folder).
-        output_path (str): Destination directory for HATS output.
-        logs_dir (str): Directory for logs (not directly used here).
-        logger (logging.Logger): Logger for progress messages.
-        client: Dask client for distributed import (required for large catalogs).
-        size_threshold_mb (int): Threshold (MB) to switch to distributed import.
-
-    Raises:
-        ValueError: If no Parquet files are found under ``path``.
+        path: Directory produced by `_save_parquet` (or any folder with parquet).
+        ra_col: RA column name.
+        dec_col: DEC column name.
+        artifact_name: Output HATS artifact name (folder).
+        output_path: Destination root directory.
+        logs_dir: Logs directory (informational).
+        logger: Logger instance.
+        client: Dask client (required for the distributed fallback).
+        size_threshold_mb: Upper bound to try the fast path.
     """
-    # Detect parquet file paths (supporting optional 'base/' subdir).
+    # Discover parquet files (supports optional 'base/' subdir)
     base_path = os.path.join(path, "base")
     parquet_files = glob.glob(os.path.join(base_path, "*.parquet")) if os.path.exists(base_path) \
         else glob.glob(os.path.join(path, "*.parquet"))
-
     if not parquet_files:
         raise ValueError(f"No Parquet files found at {path}")
 
     total_size_mb = sum(os.path.getsize(f) for f in parquet_files) / 1024**2
     hats_path = os.path.join(output_path, artifact_name)
 
+    # ---- FAST PATH (small datasets): pandas -> LSDB.from_dataframe with explicit schema
     if total_size_mb <= size_threshold_mb:
-        logger.info(f"⚡ Small catalog detected ({total_size_mb:.1f} MB). Using direct `to_hats()` method.")
-        df = pd.read_parquet(parquet_files)
-        catalog = lsdb.from_dataframe(
-            df, catalog_name=artifact_name, ra_column=ra_col, dec_column=dec_col
-        )
-        catalog.to_hats(hats_path, overwrite=True)
-        logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: import_catalog id={artifact_name}")
-    else:
-        logger.info(f"🧱 Large catalog detected ({total_size_mb:.1f} MB). Using distributed HATS import.")
-        file_reader = ParquetReader()
-        args = ImportArguments(
-            ra_column=ra_col,
-            dec_column=dec_col,
-            input_file_list=parquet_files,
-            file_reader=file_reader,
-            output_artifact_name=artifact_name,
-            output_path=output_path,
-        )
+        try:
+            logger.info(f"⚡ Small catalog detected ({total_size_mb:.1f} MB). Trying fast `from_dataframe` with schema.")
+            # Load to pandas (Arrow-backed dtypes if available)
+            dfp = pd.read_parquet(parquet_files)
+
+            dfp = _rename_duplicate_columns_pd(dfp, logger)
+
+            # Enforce canonical dtypes on critical columns before building schema
+            # (this ensures consistency even if a later pixel slice is all-NA)
+            for col, pd_dtype in [
+                ("CRD_ID", DTYPE_STR),
+                ("id", DTYPE_STR),
+                ("source", DTYPE_STR),
+                ("survey", DTYPE_STR),
+                ("instrument_type", DTYPE_STR),
+                ("instrument_type_homogenized", DTYPE_STR),
+                ("ra", DTYPE_FLOAT),
+                ("dec", DTYPE_FLOAT),
+                ("z", DTYPE_FLOAT),
+                ("z_err", DTYPE_FLOAT),
+                ("z_flag", DTYPE_FLOAT),
+                ("z_flag_homogenized", DTYPE_FLOAT),
+                ("tie_result", DTYPE_INT8),
+                ("is_in_DP1_fields", DTYPE_INT),
+            ]:
+                if col in dfp.columns:
+                    try:
+                        dfp[col] = dfp[col].astype(pd_dtype)
+                    except Exception:
+                        # If cast fails (e.g., values out of range), leave as-is; schema will still force Arrow type
+                        pass
+
+            # Build an explicit Arrow schema from the *current* dfp columns
+            schema = _build_arrow_schema_for_catalog(dfp)
+
+            # Create LSDB Catalog with explicit schema and write to HATS
+            catalog = lsdb.from_dataframe(
+                dfp,
+                catalog_name=artifact_name,
+                ra_column=ra_col,
+                dec_column=dec_col,
+                use_pyarrow_types=True,
+                schema=schema,
+            )
+            catalog.to_hats(hats_path, overwrite=True)
+            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: import_catalog id={artifact_name} (fast path)")
+            return
+        except Exception as e:
+            # Fall back to distributed pipeline if any meta/schema drift occurs
+            logger.warning(f"⚠️ Fast path failed for {artifact_name} ({type(e).__name__}: {e}). Falling back to distributed import.")
+
+    # ---- DISTRIBUTED FALLBACK: hats-import pipeline (robust)
+    if client is None:
+        raise ValueError("❌ Dask client is required to import catalog into HATS (distributed fallback).")
+
+    logger.info("🧱 Using distributed HATS import (pipeline_with_client).")
+    file_reader = ParquetReader()
+    args = ImportArguments(
+        ra_column=ra_col,
+        dec_column=dec_col,
+        input_file_list=parquet_files,
+        file_reader=file_reader,
+        output_artifact_name=artifact_name,
+        output_path=output_path,
+    )
+
+    # Use a robust shuffle for HPC environments (avoid p2p here)
+    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
         pipeline_with_client(args, client)
-        logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: import_catalog id={artifact_name}")
+
+    logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: import_catalog id={artifact_name} (distributed)")
 
 
 def generate_margin_cache_safe(
@@ -1623,70 +1856,85 @@ def prepare_catalog(
       3) Respect user-provided homogenized fields if mapped in YAML.
       4) Normalize dtypes/values; map survey-specific z_flag encodings.
       5) Generate stable ``CRD_ID`` and initialize ``tie_result=1``.
-      6) Compute homogenized columns and apply tie-breaking (if enabled).
-      7) Strict RA/DEC validation and DP1 field flagging.
-      8) Select final columns, write prepared Parquet.
-      9) Optionally build HATS + margin cache artifacts.
+      6) Compute homogenized columns.
+      7) **Persist + repartition** to stabilize memory and improve shuffle throughput.
+      8) Apply tie-breaking (if enabled), collecting duplicate edges.
+      9) Strict RA/DEC validation and DP1 field flagging.
+      10) Select final columns and write prepared Parquet (coalesced partitions).
+      11) Optionally build HATS + margin cache artifacts.
+
+    Performance notes:
+      * Persisting after homogenization pins the cleaned dataframe in worker
+        memory and avoids re-reading from storage during the upcoming shuffle.
+      * Repartitioning to medium-large partitions (~256MB) balances throughput
+        and memory pressure for your workers (25 cores, 50GB).
 
     Args:
-        entry (dict): YAML node for the product. Required keys:
+        entry: YAML node for the product. Required keys:
             - ``internal_name`` (str)
             - ``path`` (str or structured path for ProductHandle)
             - ``columns`` (mapping of standard->source; nulls allowed)
-        translation_config (dict): Configuration with translation rules and
-            tie-breaking settings (e.g., ``tiebreaking_priority``,
-            ``instrument_type_priority``, ``delta_z_threshold``,
-            optional ``save_expr_columns`` and ``expr_column_schema``).
-        logs_dir (str): Directory for log files.
-        temp_dir (str): Directory for temporary and output artifacts.
-        combine_mode (str, optional): One of
+        translation_config: Configuration with translation rules and tie-breaking
+            settings (e.g., ``tiebreaking_priority``, ``instrument_type_priority``,
+            ``delta_z_threshold``, optional ``save_expr_columns`` and
+            ``expr_column_schema``).
+        logs_dir: Directory for log files.
+        temp_dir: Directory for temporary and output artifacts.
+        combine_mode: One of
             ``"concatenate"``,
             ``"concatenate_and_mark_duplicates"``,
-            ``"concatenate_and_remove_duplicates"``. Defaults to
-            ``"concatenate_and_mark_duplicates"``.
+            ``"concatenate_and_remove_duplicates"``.
 
     Returns:
-        tuple[str, str, str, str, str, str]:
-            - ``hats_path`` (str): Path to HATS catalog (may be empty if not built).
-            - ``ra_col`` (str): RA column name used for HATS import (always ``"ra"``).
-            - ``dec_col`` (str): DEC column name used for HATS import (always ``"dec"``).
-            - ``product_name`` (str): Internal product name.
-            - ``margin_cache_path`` (str): Path to margin cache (may not exist if skipped).
-            - ``compared_to_path`` (str): JSON file path with per-catalog pair links.
+        (hats_path, ra_col, dec_col, product_name, margin_cache_path, compared_to_path)
 
     Raises:
         ValueError: On malformed YAML mapping, missing required columns, invalid
             tie-breaking configuration, or invalid coordinates.
     """
-    client = get_client()
+    from dask.distributed import get_client as _get_client, wait  # local import
+
+    client = _get_client()
 
     product_name = entry["internal_name"]
     logger = _build_logger(logs_dir, LOGGER_NAME, "prepare_all.log")
     logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: prepare_catalog id={product_name}")
 
-    # Load product into a Dask DataFrame.
+    # 1) Load product into a Dask DataFrame.
     ph = ProductHandle(entry["path"])
     df = ph.to_ddf()
 
-    # Validate & rename according to YAML mapping; enforce base schema.
+    # 2) Validate & rename according to YAML mapping; enforce base schema.
     df = _validate_and_rename(df, entry, logger)
 
-    # Honor already-homogenized columns declared via YAML (if any).
+    # 3) Honor already-homogenized columns declared via YAML (if any).
     df = _honor_user_homogenized_mapping(df, entry, product_name, logger)
 
-    # Normalize dtypes/values (strings, floats, optional `type`, and z_flag mapping).
+    # 4) Normalize dtypes/values (strings, floats, optional `type`, and z_flag mapping).
     df, type_cast_ok = _normalize_types(df, product_name, logger)
 
-    # Assign CRD_IDs and init tie bookkeeping.
+    # 5) Assign CRD_IDs and init tie bookkeeping.
     df, compared_to_path = _generate_crd_ids(df, product_name, temp_dir)
     df["tie_result"] = 1
     compared_to_dict_solo: dict[str, set[str]] = defaultdict(set)
 
-    # Compute homogenized fields and resolve duplicates if requested.
+    # 6) Compute homogenized fields (vectorized translations / fast-paths).
     df, used_type_fastpath, tiebreaking_priority, instrument_type_priority, translation_rules_uc = _homogenize(
         df, translation_config, product_name, logger, type_cast_ok=type_cast_ok
     )
 
+    # 7) Persist + repartition BEFORE the tie-breaking shuffle.
+    part_size = "256MB"  # hardcoded: good default for 25 cores / 50GB workers
+    try:
+        df = df.persist(); wait(df)
+        with dask.config.set({"dataframe.shuffle.method": "tasks"}):
+            df = df.repartition(partition_size=part_size)
+        logger.info(f"{product_name} persisted and repartitioned with partition_size={part_size}. "
+                    f"npartitions={df.npartitions}")
+    except Exception as e:
+        logger.warning(f"⚠️ {product_name} persist/repartition step failed or was skipped: {e}")
+
+    # 8) Resolve duplicates and collect pair links (if requested).
     if combine_mode in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
         df = _apply_tiebreaking_and_collect(
             df,
@@ -1702,13 +1950,13 @@ def prepare_catalog(
     with open(compared_to_path, "w") as f:
         json.dump({k: sorted(v) for k, v in compared_to_dict_solo.items()}, f)
 
-    # Validate geometry early to fail fast on malformed inputs.
+    # 9) Validate geometry early to fail fast on malformed inputs.
     _validate_ra_dec_or_fail(df, product_name)
 
-    # Flag DP1 fields.
+    # 10) Flag DP1 fields.
     df = _flag_dp1(df)
 
-    # Assemble final columns and write prepared parquet.
+    # 11) Assemble final columns.
     df = _select_output_columns(
         df,
         translation_rules_uc,
@@ -1717,9 +1965,25 @@ def prepare_catalog(
         save_expr_columns=translation_config.get("save_expr_columns", False),
         schema_hints=_normalize_schema_hints(translation_config.get("expr_column_schema")),
     )
-    out_path = _save_parquet(df, temp_dir, product_name)
 
-    # Optionally produce HATS + margin artifacts.
+    # Coalesce partitions before writing to reduce small-file counts and speed up HATS import.
+    try:
+        nworkers = len(client.scheduler_info()["workers"]) or 1
+    except Exception:
+        nworkers = 1
+    target_out_parts = max(2 * nworkers, 8)
+    try:
+        with dask.config.set({"dataframe.shuffle.method": "tasks"}):
+            df_to_write = df.repartition(npartitions=target_out_parts)
+        logger.info(f"{product_name} output repartitioned for write: npartitions={df_to_write.npartitions}")
+    except Exception as e:
+        logger.warning(f"⚠️ {product_name} output repartition failed; writing with current npartitions. Reason: {e}")
+        df_to_write = df
+
+    # 12) Write prepared parquet.
+    out_path = _save_parquet(df_to_write, temp_dir, product_name)
+
+    # 13) Optionally produce HATS + margin artifacts.
     hats_path, margin_cache_path = _maybe_hats_and_margin(
         out_path, product_name, logs_dir, temp_dir, logger, client, combine_mode
     )

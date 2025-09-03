@@ -19,7 +19,7 @@ import dask.dataframe as dd
 import numpy as np
 import pandas as pd
 from dask import compute, delayed
-from dask.distributed import Client, performance_report
+from dask.distributed import Client, as_completed, performance_report
 import lsdb
 
 # =====================
@@ -153,57 +153,106 @@ def main(config_path, cwd=".", base_dir_override=None):
     with performance_report(filename=global_report_path):
     
         logger.info(f"🧰 Preparing {len(catalogs)} input catalogs")
-    
-        futures = []
-        
-        for entry in catalogs:
+
+        # ------------------------------------------------------------------
+        # Concurrency control: limit the number of heavy prepare_catalog jobs
+        # in-flight to reduce simultaneous shuffles / I/O pressure.
+        # ------------------------------------------------------------------
+        max_inflight = 5
+
+        # Helper: build the 6-tuple result for already-prepared catalogs
+        def _prebuilt_result_tuple(entry):
+            match = re.match(r"(\d+)_", entry["internal_name"])
+            if not match:
+                raise ValueError(
+                    f"❌ Could not extract numeric prefix from internal_name '{entry['internal_name']}' "
+                    f"(expected format: '001_catalogname'). Cannot generate HATS/margin/cache paths."
+                )
+            catalog_prefix = match.group(1)
+            artifact_hats = f"cat{catalog_prefix}_hats"
+            artifact_margin = f"cat{catalog_prefix}_margin"
+            hats_path = os.path.join(temp_dir, artifact_hats)
+            margin_path = os.path.join(temp_dir, artifact_margin)
+            compared_path = os.path.join(temp_dir, f"compared_to_dict_{catalog_prefix}.json")
+            return (hats_path, "ra", "dec", entry["internal_name"], margin_path, compared_path)
+
+        # Helper: submit one prepare task
+        def _submit_one(entry):
             tag = f"prepare_{entry['internal_name']}"
             filename = os.path.basename(entry["path"])
             logger.info(f"📦 Preparing catalog: {entry['internal_name']} ({filename})")
-        
-            if tag not in completed:
-                future = client.submit(
-                    prepare_catalog,
-                    entry,
-                    translation_config,
-                    logs_dir,
-                    temp_dir,
-                    combine_mode  # ✅ não passe client
-                )
-                futures.append(future)
+            return client.submit(
+                prepare_catalog,
+                entry,
+                translation_config,
+                logs_dir,
+                temp_dir,
+                combine_mode,  # ✅ do not pass client; prepare_catalog calls get_client()
+                pure=False,
+            )
+
+        # Build queue (skip already prepared) and seed results
+        queue = []
+        results = []
+        for entry in catalogs:
+            tag = f"prepare_{entry['internal_name']}"
+            if tag in completed:
+                logger.info(f"⏩ Catalog {entry['internal_name']} already prepared. Skipping heavy work.")
+                results.append(_prebuilt_result_tuple(entry))
             else:
-                logger.info(f"⏩ Catalog {entry['internal_name']} already prepared. Skipping.")
-                
-                match = re.match(r"(\d+)_", entry["internal_name"])
-                if match:
-                    catalog_prefix = match.group(1)
-                    artifact_hats = f"cat{catalog_prefix}_hats"
-                    artifact_margin = f"cat{catalog_prefix}_margin"
-                    hats_path = os.path.join(temp_dir, artifact_hats)
-                    margin_path = os.path.join(temp_dir, artifact_margin)
-                    compared_path = os.path.join(temp_dir, f"compared_to_dict_{catalog_prefix}.json")
-                else:
-                    raise ValueError(
-                        f"❌ Could not extract numeric prefix from internal_name '{entry['internal_name']}' "
-                        f"(expected format: '001_catalogname'). Cannot generate HATS/margin/cache paths."
-                    )
-        
-                futures.append(
-                    client.submit(
-                        lambda x: x,
-                        (hats_path, "ra", "dec", entry["internal_name"], margin_path, compared_path)
-                    )
-                )
-    
-        # === Trigger parallel execution and wait for results ===
+                queue.append(entry)
+
+        logger.info(
+            f"🧵 Concurrency for prepare stage: max_inflight={max_inflight}, "
+            f"to_prepare={len(queue)}, already_prepared={len(results)}"
+        )
+
+        # === Trigger parallel execution with bounded concurrency ===
         preparation_report_path = os.path.join(logs_dir, "preparation_dask_report.html")
         
         logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: pipeline_init id=pipeline_init")
         logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: prepare_catalogs id=prepare_catalogs")
-        
-        results = client.gather(futures)
-        
-        # === Unpack into a unified structure per catalog
+
+        # Use the mutable as_completed object so we can .add() futures dynamically
+        ac = as_completed()
+        inflight = []
+
+        # Seed up to max_inflight
+        to_launch = min(max_inflight, len(queue))
+        for _ in range(to_launch):
+            fut = _submit_one(queue.pop(0))
+            ac.add(fut)
+            inflight.append(fut)
+
+        # Drain while there are tasks running or waiting in the queue
+        prepared_count = 0
+        while inflight:
+            fut = next(ac)  # waits for the next finished future
+            inflight.remove(fut)
+            try:
+                res = fut.result()
+                results.append(res)
+                prepared_count += 1
+            except Exception as e:
+                logger.exception(f"❌ Failed while preparing a catalog: {e}")
+                raise
+
+            # Keep the pipeline full
+            if queue:
+                fut2 = _submit_one(queue.pop(0))
+                ac.add(fut2)
+                inflight.append(fut2)
+
+        logger.info(f"✅ Prepared {prepared_count} new catalogs; total results now {len(results)} / {len(catalogs)}")
+
+        # Sanity check: we must have 1 result per input catalog
+        if len(results) != len(catalogs):
+            raise RuntimeError(
+                f"Internal error: prepared results ({len(results)}) "
+                f"!= number of catalogs ({len(catalogs)})."
+            )
+
+        # === Unpack into a unified structure per catalog ===
         prepared_catalogs_info = [
             {
                 "hats_path": r[0],
