@@ -2143,7 +2143,6 @@ def prepare_catalog(
 
     # 5) Assign CRD_IDs and init tie bookkeeping.
     df, compared_to_path = _generate_crd_ids(df, product_name, temp_dir)
-    df["tie_result"] = 1
     compared_to_dict_solo: dict[str, set[str]] = defaultdict(set)
 
     # 6) Compute homogenized fields (vectorized translations / fast-paths).
