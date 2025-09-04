@@ -1132,59 +1132,36 @@ def _apply_tiebreaking_and_collect(
     product_name: str,
     logger: logging.Logger,
 ) -> dd.DataFrame:
-    """Resolve duplicates via prioritized tie-breaking and collect undirected edges.
-
-    Behavior:
-      - Initializes ``tie_result``: if column exists, keep its values (fillna→1);
-        otherwise create it with 1 for all rows. Cast to ``DTYPE_INT8``.
-      - Stars are globally excluded from comparisons:
-        rows with ``z_flag_homogenized == 6`` are set to ``tie_result = 3``
-        and never enter duplicate groups nor edge emission.
-      - Decisions are computed **only** for duplicate RA/DEC-key groups among
-        non-star rows. Updates are merged back without overwriting rows that
-        were not compared.
-
-    Args:
-        df: Input Dask DataFrame with columns including at least
-            ``CRD_ID, ra, dec``; optionally ``z, z_flag_homogenized`` and the
-            columns listed in ``tiebreaking_priority``.
-        translation_config: Dict with runtime knobs (e.g., ``delta_z_threshold``).
-        tiebreaking_priority: Ordered list of columns to break ties.
-        instrument_type_priority: Mapping str->rank for instrument type tie-break.
-        compared_to_dict_solo: In/out dict to collect undirected edges (driver-side).
-        product_name: Catalog identifier for logging.
-        logger: Logger.
-
-    Returns:
-        dd.DataFrame: Same shape as input with updated ``tie_result`` and without
-        modifying rows that were not part of duplicate comparisons.
-
-    Notes:
-        ``tie_result`` semantics:
-          0 = eliminated (in-group),
-          1 = winner / unique,
-          2 = hard tie (in-group),
-          3 = star (z_flag_homogenized==6) → excluded globally from comparisons.
-    """
+    """Resolve duplicates via prioritized tie-breaking and collect undirected edges."""
+    import numpy as np
+    import pandas as pd
     import dask
     from dask.distributed import get_client
 
-    # ---- Init tie_result (preserve existing values; fillna with 1) ----
-    if "tie_result" in df.columns:
+    # ------------------------
+    # Detect if tie_result pre-existed
+    # ------------------------
+    had_preexisting_tie = ("tie_result" in df.columns)
+
+    # ------------------------
+    # Init tie_result
+    # ------------------------
+    if had_preexisting_tie:
         try:
             prev_tr = dd.to_numeric(df["tie_result"], errors="coerce")
             df["tie_result"] = prev_tr.fillna(1).map_partitions(
                 lambda s: s.astype(DTYPE_INT8),
                 meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
             )
-            logger.info(f"{product_name} tie_result: reused existing column; filled missing with 1.")
+            logger.info(f"{product_name}: tie_result reused; filled missing with 1.")
         except Exception as e:
-            logger.warning(f"⚠️ {product_name} tie_result reuse failed ({e}); initializing to 1.")
+            logger.warning(f"⚠️ {product_name}: tie_result reuse failed ({e}); initializing to 1.")
             df["tie_result"] = 1
             df["tie_result"] = df["tie_result"].map_partitions(
                 lambda s: s.astype(DTYPE_INT8),
                 meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
             )
+            had_preexisting_tie = False  # caiu no fallback
     else:
         df["tie_result"] = 1
         df["tie_result"] = df["tie_result"].map_partitions(
@@ -1192,80 +1169,65 @@ def _apply_tiebreaking_and_collect(
             meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
         )
 
-    # ---- Config ----
+    # ------------------------
+    # FIX ① (pré-flag): garantir que 3 só exista com estrela quando NÃO havia tie prévio
+    # ------------------------
+    if not had_preexisting_tie and "z_flag_homogenized" in df.columns:
+        non_star_or_na = df["z_flag_homogenized"].isna() | (df["z_flag_homogenized"] != 6)
+        df["tie_result"] = df["tie_result"].mask((df["tie_result"] == 3) & non_star_or_na, 1).map_partitions(
+            lambda s: pd.to_numeric(s, errors="coerce").fillna(1).astype(DTYPE_INT8),
+            meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
+        )
+
+    # ------------------------
+    # Config & validation
+    # ------------------------
     delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
-
-    # ---- Validate tiebreaking columns ----
-    if not tiebreaking_priority:
-        logger.warning(f"⚠️ {product_name} tiebreaking_priority is empty. Using delta_z_threshold only.")
-    else:
-        for col in tiebreaking_priority:
-            if col not in df.columns:
-                raise ValueError(f"Tiebreaking column '{col}' is missing in catalog '{product_name}'.")
-            col_dtype = df[col].dtype
-            is_str = (col == "instrument_type_homogenized") or pd.api.types.is_string_dtype(col_dtype)
-            empty_mask = df[col].isna()
-            if is_str:
-                empty_mask = empty_mask | (df[col] == "")
-            if empty_mask.all().compute():
-                raise ValueError(
-                    f"Tiebreaking column '{col}' is invalid in catalog '{product_name}' (all NaN/empty)."
-                )
-            if col != "instrument_type_homogenized" and not pd.api.types.is_numeric_dtype(col_dtype):
-                try:
-                    df[col] = dd.to_numeric(df[col], errors="coerce").astype("float64")
-                    logger.info(f"ℹ️ {product_name} cast '{col}' to float for tie-breaking.")
-                except Exception as e:
-                    raise ValueError(
-                        f"Tiebreaking column '{col}' must be numeric (except 'instrument_type_homogenized'). "
-                        f"Attempted cast failed: {e}"
-                    )
-
     if not tiebreaking_priority and (delta_z_threshold is None or float(delta_z_threshold) == 0.0):
         raise ValueError(
             f"Cannot deduplicate '{product_name}': no tiebreaking_priority and delta_z_threshold unset/zero."
         )
+    for col in (tiebreaking_priority or []):
+        if col not in df.columns:
+            raise ValueError(f"Tiebreaking column '{col}' is missing in catalog '{product_name}'.")
+        if col != "instrument_type_homogenized" and not pd.api.types.is_numeric_dtype(df[col].dtype):
+            df[col] = dd.to_numeric(df[col], errors="coerce").astype("float64")
 
-    # ---- Globally flag stars (z_flag_homogenized == 6) with tie_result = 3 ----
-    is_star = None
-    if "z_flag_homogenized" in df.columns:
-        is_star = df["z_flag_homogenized"] == 6
+    if "instrument_type_homogenized" in df.columns:
         try:
-            star_count = is_star.sum().compute()
+            df["instrument_type_homogenized"] = df["instrument_type_homogenized"].astype("category")
         except Exception:
-            star_count = 0
-        if star_count > 0:
-            # mask: overwrite tie_result with 3 where star; keep others unchanged
-            df["tie_result"] = df["tie_result"].mask(is_star, 3)
-            logger.info(f"{product_name}: flagged {star_count} star rows (tie_result=3).")
-    else:
-        # No column → no stars to exclude
-        is_star = dd.from_pandas(pd.Series([False] * 1), npartitions=1).iloc[:0]  # empty placeholder (unused)
+            pass
 
-    # ---- Build key and prefilter duplicates (exclude stars from comparisons) ----
-    valid_coord_mask = df["ra"].notnull() & df["dec"].notnull()
-    non_star_mask = (~(df["z_flag_homogenized"] == 6)) if "z_flag_homogenized" in df.columns else True
-    df_valid = df[valid_coord_mask & non_star_mask].assign(
-        ra_dec_key=(
-            df["ra"].astype("float64").round(4).astype(str) + "_" +
-            df["dec"].astype("float64").round(4).astype(str)
-        )
-    )
+    # ------------------------
+    # Star flag (3) — só se NÃO havia tie pré-existente
+    # ------------------------
+    if not had_preexisting_tie and "z_flag_homogenized" in df.columns:
+        is_star = df["z_flag_homogenized"] == 6
+        df["tie_result"] = df["tie_result"].mask(is_star, 3)
 
-    # Count globally to select only duplicate keys among NON-stars
-    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-        key_counts = df_valid["ra_dec_key"].value_counts(split_out=64)
-    dup_keys = key_counts[key_counts > 1]
-    df_dups = df_valid.merge(dup_keys.to_frame("cnt"), left_on="ra_dec_key", right_index=True, how="inner")
+    # ------------------------
+    # Build mask & add (ra4, dec4)
+    # ------------------------
+    mask = df["ra"].notnull() & df["dec"].notnull()
+    if "z_flag_homogenized" in df.columns:
+        mask = mask & (df["z_flag_homogenized"] != 6)  # estrelas fora das comparações
 
-    # Short-circuit: no duplicates -> keep existing tie_result as-in and return
-    try:
-        _ = df_dups.head(1, compute=True)
-    except Exception:
-        df["CRD_ID"] = df["CRD_ID"].astype(DTYPE_STR)
-        return df
+    def _add_ra4_dec4(part: pd.DataFrame) -> pd.DataFrame:
+        if part.empty:
+            return part.assign(ra4=pd.Series([], dtype="float64"),
+                               dec4=pd.Series([], dtype="float64"))
+        p = part.copy()
+        p["ra4"]  = np.round(pd.to_numeric(p["ra"],  errors="coerce").astype("float64"), 4)
+        p["dec4"] = np.round(pd.to_numeric(p["dec"], errors="coerce").astype("float64"), 4)
+        return p
 
-    # ---- Helpers: partition ops (input already excludes stars) ----
+    meta_add = df._meta.assign(ra4=np.float64(), dec4=np.float64())
+    df_valid = df[mask].map_partitions(_add_ra4_dec4, meta=meta_add)
+
+    # ------------------------
+    # Helpers por partição
+    # ------------------------
     def _tiebreak_partition_noindex(p: pd.DataFrame) -> pd.DataFrame:
         if p.empty:
             return pd.DataFrame({
@@ -1273,53 +1235,59 @@ def _apply_tiebreaking_and_collect(
                 "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
             })
 
-        updates: list[pd.DataFrame] = []
-
-        for _, group_raw in p.groupby("ra_dec_key", sort=False):
+        out_chunks: list[pd.DataFrame] = []
+        for _, group_raw in p.groupby(["ra4", "dec4"], sort=False):
+            if len(group_raw) <= 1:
+                continue
             group = group_raw.copy()
-
-            # Start with "undecided" (0) within the duplicate group
-            group["tie_result"] = 0
+            group["CRD_ID"] = group["CRD_ID"].astype(str)
+            group["tie_result"] = 0  # indeciso dentro do grupo duplicado
             surviving = group.copy()
 
-            for priority_col in tiebreaking_priority:
+            for priority_col in (tiebreaking_priority or []):
                 if priority_col == "instrument_type_homogenized":
                     pr = surviving["instrument_type_homogenized"].map(instrument_type_priority).astype("float64")
                     surviving["_priority_value"] = pr.fillna(-np.inf)
                 else:
-                    surviving["_priority_value"] = surviving[priority_col].astype("float64").fillna(-np.inf)
+                    surviving["_priority_value"] = pd.to_numeric(
+                        surviving[priority_col], errors="coerce"
+                    ).astype("float64").fillna(-np.inf)
 
-                # Note: stars are already excluded globally; no need to drop them here.
                 if surviving.empty:
                     break
-
                 max_val = surviving["_priority_value"].max()
-                surviving = surviving[surviving["_priority_value"] == max_val].drop(columns=["_priority_value"], errors="ignore")
-
+                surviving = surviving[surviving["_priority_value"] == max_val].drop(
+                    columns=["_priority_value"], errors="ignore"
+                )
                 if len(surviving) == 1:
                     break
 
-            group.loc[group["CRD_ID"].astype(str).isin(surviving["CRD_ID"].astype(str)), "tie_result"] = 2
+            if len(surviving) >= 1:
+                cids = set(surviving["CRD_ID"].astype(str))
+                group.loc[group["CRD_ID"].astype(str).isin(cids), "tie_result"] = 2  # provisórios
 
-            if len(surviving) > 1 and (delta_z_threshold or 0) > 0:
-                z_vals = pd.to_numeric(surviving["z"], errors="coerce").to_numpy(dtype=float, copy=False)
-                ids = surviving["CRD_ID"].astype(str).to_numpy(copy=False)
-                remaining = set(ids)
+            if len(surviving) > 1 and float(delta_z_threshold or 0.0) > 0.0 and "z" in group.columns:
                 thr = float(delta_z_threshold)
-
+                surv = surviving.copy()
+                ids = surv["CRD_ID"].astype(str).to_numpy(copy=False)
+                z_vals = pd.to_numeric(surv["z"], errors="coerce").to_numpy(dtype=float, copy=False)
+                remain = set(ids)
                 for i in range(len(ids)):
-                    if ids[i] not in remaining:
+                    if ids[i] not in remain:
+                        continue
+                    zi = z_vals[i]
+                    if not np.isfinite(zi):
                         continue
                     for j in range(i + 1, len(ids)):
-                        if ids[j] not in remaining:
+                        if ids[j] not in remain:
                             continue
-                        zi, zj = z_vals[i], z_vals[j]
-                        if not (np.isfinite(zi) and np.isfinite(zj)):
+                        zj = z_vals[j]
+                        if not np.isfinite(zj):
                             continue
                         if abs(zi - zj) <= thr:
-                            group.loc[group["CRD_ID"].astype(str) == ids[i], "tie_result"] = 2
-                            group.loc[group["CRD_ID"].astype(str) == ids[j], "tie_result"] = 0
-                            remaining.discard(ids[j])
+                            group.loc[group["CRD_ID"] == ids[i], "tie_result"] = 2
+                            group.loc[group["CRD_ID"] == ids[j], "tie_result"] = 0
+                            remain.discard(ids[j])
 
             survivors = group[group["tie_result"] == 2]
             if len(survivors) == 1:
@@ -1328,19 +1296,19 @@ def _apply_tiebreaking_and_collect(
                 non_elim = group[group["tie_result"] != 0]
                 if len(non_elim) == 1:
                     cid = str(non_elim.iloc[0]["CRD_ID"])
-                    group.loc[group["CRD_ID"].astype(str) == cid, "tie_result"] = 1
+                    group.loc[group["CRD_ID"] == cid, "tie_result"] = 1
 
-            updates.append(group[["CRD_ID", "tie_result"]])
+            out_chunks.append(group[["CRD_ID", "tie_result"]])
 
-        out = pd.concat(updates, ignore_index=True) if updates else pd.DataFrame(columns=["CRD_ID", "tie_result"])
-        if not out.empty:
-            out["CRD_ID"] = out["CRD_ID"].astype(DTYPE_STR)
-            out["tie_result"] = out["tie_result"].astype(DTYPE_INT8)
-        else:
-            out = pd.DataFrame({
+        if not out_chunks:
+            return pd.DataFrame({
                 "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
                 "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
             })
+
+        out = pd.concat(out_chunks, ignore_index=True)
+        out["CRD_ID"] = out["CRD_ID"].astype(DTYPE_STR)
+        out["tie_result"] = out["tie_result"].astype(DTYPE_INT8)
         return out
 
     def _edges_partition_noindex(p: pd.DataFrame) -> pd.DataFrame:
@@ -1350,7 +1318,7 @@ def _apply_tiebreaking_and_collect(
                 "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
             })
         edges = []
-        for _, group in p.groupby("ra_dec_key", sort=False):
+        for _, group in p.groupby(["ra4", "dec4"], sort=False):
             ids = group["CRD_ID"].astype(str).tolist()
             n = len(ids)
             if n <= 1:
@@ -1362,76 +1330,89 @@ def _apply_tiebreaking_and_collect(
                         continue
                     a_norm, b_norm = (a, b) if a < b else (b, a)
                     edges.append((a_norm, b_norm))
+
         if not edges:
             return pd.DataFrame({
                 "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
                 "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
             })
+
         out = pd.DataFrame(edges, columns=["CRD_ID_A", "CRD_ID_B"])
         out["CRD_ID_A"] = out["CRD_ID_A"].astype(DTYPE_STR)
         out["CRD_ID_B"] = out["CRD_ID_B"].astype(DTYPE_STR)
         return out
 
-    # ---- Shuffle + compute updates for duplicate groups only (non-stars) ----
+    # ------------------------
+    # Um único shuffle; processamento por partição
+    # ------------------------
     def run_shuffle_and_compute():
         client = get_client()
         try:
             nworkers = len(client.scheduler_info()["workers"]) or 1
         except Exception:
             nworkers = 1
-        target_parts = max(2 * nworkers, df_dups.npartitions)
+        target_parts = max(2 * nworkers, df.npartitions)
+        try:
+            with dask.config.set({"dataframe.shuffle.method": "p2p"}):
+                df_shuf = df_valid.shuffle(on=["ra4", "dec4"], npartitions=target_parts)
+        except Exception:
+            with dask.config.set({"dataframe.shuffle.method": "tasks"}):
+                df_shuf = df_valid.shuffle(on=["ra4", "dec4"], npartitions=target_parts)
 
-        with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-            df_shuf = df_dups.shuffle("ra_dec_key", shuffle="tasks", npartitions=target_parts)
+        meta_updates = pd.DataFrame({
+            "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
+            "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
+        })
+        meta_edges = pd.DataFrame({
+            "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
+            "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
+        })
 
-            meta_updates = pd.DataFrame({
-                "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
-                "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
-            })
-            meta_edges = pd.DataFrame({
-                "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
-                "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
-            })
+        tie_update_dd = df_shuf.map_partitions(_tiebreak_partition_noindex, meta=meta_updates)
+        edges_dd      = df_shuf.map_partitions(_edges_partition_noindex,    meta=meta_edges)
 
-            tie_update_dd = df_shuf.map_partitions(_tiebreak_partition_noindex, meta=meta_updates) \
-                                   .drop_duplicates(subset=["CRD_ID"], keep="last")
-            edges_dd      = df_shuf.map_partitions(_edges_partition_noindex,    meta=meta_edges) \
-                                   .drop_duplicates()
+        tie_update_dd, edges_dd = dask.persist(tie_update_dd, edges_dd)
+        return tie_update_dd, edges_dd
 
-            tie_update_dd, edges_dd = dask.persist(tie_update_dd, edges_dd)
+    tie_update_dd, edges_dd = run_shuffle_and_compute()
 
-        edges = edges_dd.compute()
-        return tie_update_dd, edges
-
-    tie_update_dd, edges = run_shuffle_and_compute()
-
-    # ---- Merge decisions back WITHOUT overwriting non-compared rows ----
+    # ------------------------
+    # Merge updates (sem sobrescrever quem não foi comparado)
+    # ------------------------
     df["CRD_ID"] = df["CRD_ID"].astype(DTYPE_STR)
     df = df.merge(
         tie_update_dd.rename(columns={"tie_result": "tie_result_update"}),
         on="CRD_ID",
         how="left",
     )
-    # Only overwrite when there is an update (i.e., the row was compared).
-    # Star rows (tie_result==3) have no updates and are preserved as 3.
     df["tie_result"] = df["tie_result_update"].fillna(df["tie_result"])
+    df = df.drop(columns=["tie_result_update"], errors="ignore")
 
-    # Final dtype normalization (use pandas in partition to avoid dd.to_numeric inside map_partitions)
+    # ------------------------
+    # FIX ② (pós-merge): garantir 3 só em estrela quando NÃO havia tie prévio
+    # ------------------------
+    if not had_preexisting_tie and "z_flag_homogenized" in df.columns:
+        non_star_or_na = df["z_flag_homogenized"].isna() | (df["z_flag_homogenized"] != 6)
+        df["tie_result"] = df["tie_result"].mask((df["tie_result"] == 3) & non_star_or_na, 1)
+
+    # dtype final
     df["tie_result"] = df["tie_result"].map_partitions(
         lambda s: pd.to_numeric(s, errors="coerce").fillna(1).astype(DTYPE_INT8),
         meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
     )
 
-    # Drop helper column
-    df = df.drop(columns=["tie_result_update"], errors="ignore")
-
-    # ---- Accumulate edges on driver (already excludes stars) ----
-    for a, b in zip(edges.get("CRD_ID_A", []), edges.get("CRD_ID_B", [])):
-        compared_to_dict_solo.setdefault(a, set()).add(b)
-        compared_to_dict_solo.setdefault(b, set()).add(a)
+    # ------------------------
+    # Coleta das arestas (streaming)
+    # ------------------------
+    for part_delayed in edges_dd.to_delayed():
+        part = dask.compute(part_delayed)[0]
+        if part is None or part.empty:
+            continue
+        for a, b in zip(part["CRD_ID_A"], part["CRD_ID_B"]):
+            compared_to_dict_solo.setdefault(a, set()).add(b)
+            compared_to_dict_solo.setdefault(b, set()).add(a)
 
     return df
-
 
 # -----------------------
 # RA/DEC strict validation (fail fast)
