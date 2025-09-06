@@ -32,86 +32,6 @@ def _parse_cmp_list_fast(s: str) -> list[str]:
         return []
     return [x.strip() for x in s.split(",") if x.strip()]
 
-def validate_intra_source_cells(df_final: pd.DataFrame, ndp: int = 4, source_col: str = "source"):
-    """
-    Para objetos de mesma 'source' (coluna `source_col`) e mesma célula (ra/dec arredondados a `ndp`),
-    verifica se foram comparados entre si via 'compared_to'.
-    """
-    df = df_final.copy()
-
-    # Normalizações
-    df["CRD_ID"] = df["CRD_ID"].astype(str)
-    df[source_col] = df[source_col].map(_norm_str).astype("string")
-    df["compared_to"] = df["compared_to"].astype("string")
-    df["ra4"]  = pd.to_numeric(df["ra"], errors="coerce").round(ndp)
-    df["dec4"] = pd.to_numeric(df["dec"], errors="coerce").round(ndp)
-    df["cmp_set"] = df["compared_to"].map(_parse_cmp_list_fast)
-
-    rows = []
-    # (1) agrupar por source
-    for src, gsrc in df.groupby(source_col, dropna=False):
-        # (2) dentro da source, agrupar por célula ra/dec arredondada
-        for (ra4, dec4), sub in gsrc.groupby(["ra4", "dec4"], dropna=False):
-            if len(sub) < 2:
-                continue
-            id_to_set = dict(zip(sub["CRD_ID"], sub["cmp_set"]))
-            ids = list(sub["CRD_ID"])
-            for a, b in combinations(ids, 2):
-                a_in_b = a in id_to_set.get(b, set())
-                b_in_a = b in id_to_set.get(a, set())
-                status = "ok_bi" if (a_in_b and b_in_a) else ("ok_one_way" if (a_in_b or b_in_a) else "missing")
-                rows.append({
-                    "source": src, "ra4": ra4, "dec4": dec4,
-                    "A": a, "B": b, "A_in_B": a_in_b, "B_in_A": b_in_a, "status": status
-                })
-
-    pairs = pd.DataFrame(rows)
-
-    if pairs.empty:
-        cell_summary = pd.DataFrame(columns=["source","ra4","dec4","n_pairs","n_ok_bi","n_ok_any","n_missing","bi_cov","any_cov"])
-        totals = {"n_cells": 0, "n_pairs": 0, "n_ok_bi": 0, "n_ok_any": 0, "n_missing": 0}
-    else:
-        g = pairs.groupby(["source","ra4","dec4"], dropna=False)
-        cell_summary = g.agg(
-            n_pairs=("status","size"),
-            n_ok_bi=("status", lambda s: (s == "ok_bi").sum()),
-            n_ok_any=("status", lambda s: s.isin(["ok_bi", "ok_one_way"]).sum()),
-            n_missing=("status", lambda s: (s == "missing").sum()),
-        ).reset_index()
-        cell_summary["bi_cov"]  = cell_summary["n_ok_bi"] / cell_summary["n_pairs"]
-        cell_summary["any_cov"] = cell_summary["n_ok_any"] / cell_summary["n_pairs"]
-
-        totals = {
-            "n_cells":   int(cell_summary.shape[0]),
-            "n_pairs":   int(pairs.shape[0]),
-            "n_ok_bi":   int((pairs["status"] == "ok_bi").sum()),
-            "n_ok_any":  int(pairs["status"].isin(["ok_bi","ok_one_way"]).sum()),
-            "n_missing": int((pairs["status"] == "missing").sum()),
-        }
-
-    violations = pairs[pairs["status"] != "ok_bi"].copy()
-
-    # extra: diagnóstico por source (qtd de células com 2+ objetos)
-    cell_sizes = (
-        df.groupby([source_col, "ra4", "dec4"], dropna=False)
-          .size().reset_index(name="n")
-    )
-    diag_sources = (
-        cell_sizes.groupby(source_col)["n"]
-        .agg(n_cells="size", cells_2plus=lambda s: (s >= 2).sum())
-        .reset_index()
-        .rename(columns={source_col: "source"})
-        .sort_values("cells_2plus", ascending=False)
-    )
-
-    return {
-        "pairs": pairs,
-        "cell_summary": cell_summary,
-        "totals": totals,
-        "violations": violations,
-        "diag_sources": diag_sources,
-    }
-
 
 def validate_intra_source_cells_fast(
     df_final: pd.DataFrame,
@@ -365,6 +285,7 @@ we show up to **{samples_per_source}** cells (the largest ones) and list their o
                 "z_flag_homogenized",
                 "instrument_type_homogenized",  # preferred
                 "type_homogenized",             # fallback, if it exists
+                "tie_result",
                 "compared_to",
             ]
             cols_present = [c for c in col_candidates if c in df_base.columns]
@@ -825,67 +746,6 @@ def validate_group(group_df: pd.DataFrame, threshold: float) -> list[dict]:
 # ------------------------------
 # Public API  (excludes stars from graph + enforces tie_result==3)
 # ------------------------------
-def validate_tie_results(
-    df_final: pd.DataFrame,
-    threshold: float = 0.0005,
-    max_groups: int | None = None,
-) -> dict:
-    """
-    Main entry point.
-    - Excludes stars (z_flag_homogenized==6 or tie_result==3) from graph.
-    - Builds components from 'compared_to' among NON-stars.
-    - Validates pairs and groups with the declared rules.
-    - Validates that all stars have tie_result==3.
-    """
-    df = df_final.copy()
-    df["CRD_ID"] = df["CRD_ID"].astype(str)
-    df["compared_to"] = df["compared_to"].astype("string")
-
-    # Identify stars & enforce tie_result==3
-    zf = pd.to_numeric(df.get("z_flag_homogenized"), errors="coerce")
-    tr = pd.to_numeric(df.get("tie_result"), errors="coerce")
-    star_mask = (zf == 6) | (tr == 3)
-    star_ids = set(df.loc[star_mask, "CRD_ID"].astype(str))
-    # Pre-collect violations for stars with wrong tie_result
-    violations = []
-    wrong_tr_mask = (zf == 6) & (tr != 3)
-    if wrong_tr_mask.any():
-        rows = df.loc[wrong_tr_mask].copy()
-        violations.append({
-            "rule": "STAR_MUST_BE_3",
-            "message": "Rows with z_flag_homogenized==6 must have tie_result==3.",
-            "group_ids": tuple(rows["CRD_ID"].tolist()),
-            "rows": rows,
-        })
-
-    # Build components EXCLUDING stars
-    components = build_components(df, excluded_ids=star_ids)
-    if max_groups is not None:
-        components = components[:max_groups]
-
-    n_pairs = n_groups = 0
-
-    for comp in components:
-        group_df = df[df["CRD_ID"].isin(comp)].copy()
-        if len(group_df) == 2:
-            n_pairs += 1
-            violations.extend(validate_pair(group_df, threshold))
-        elif len(group_df) > 2:
-            n_groups += 1
-            violations.extend(validate_group(group_df, threshold))
-        # singleton components are irrelevant here
-
-    summary = {
-        "n_components": len(components),
-        "n_pairs": n_pairs,
-        "n_groups": n_groups,
-        "n_violations": len(violations),
-        "by_rule": pd.Series([v["rule"] for v in violations]).value_counts().to_dict() if violations else {},
-        "n_stars_excluded": int(star_mask.sum()),
-    }
-    return {"summary": summary, "violations": violations}
-
-
 def validate_tie_results_fast(
     df_final: pd.DataFrame,
     threshold: float = 0.0005,
@@ -893,13 +753,15 @@ def validate_tie_results_fast(
     include_rows: bool = False,
 ):
     """
-    Fast + compat com a semântica do build_components:
-      - Só conta nós que aparecem em alguma aresta (como o baseline).
-      - Mantém vizinhos "pendurados" (citados em compared_to mas sem linha),
-        exceto se estiverem em star_ids (iguais ao baseline).
-      - Componentes podem existir mesmo que virem singletons após filtrar
-        por linhas presentes; ainda assim contam em n_components (como baseline).
-      - Validação só roda quando há >=2 linhas PRESENTES no DF.
+    Fast validator compatible with the semantics of build_components:
+      - Only counts nodes that appear in at least one edge (as the baseline does).
+      - Keeps "dangling" neighbors (mentioned in compared_to but with no row),
+        except if they are in star_ids (same as the baseline).
+      - Components may exist even if they become singletons after filtering
+        to present rows; they still count in n_components (as baseline).
+      - Validation only runs when there are >= 2 PRESENT rows in the component.
+    Assumptions:
+      - Helper functions _parse_cmp_list_fast and _norm_str are available in scope.
     """
     import numpy as np
     import math
@@ -908,7 +770,7 @@ def validate_tie_results_fast(
 
     df = df_final.copy()
 
-    # colunas necessárias (se faltar, preenche com NaN)
+    # Ensure required columns exist
     cols = ["CRD_ID", "compared_to", "z_flag_homogenized", "tie_result",
             "instrument_type_homogenized", "z"]
     for c in cols:
@@ -918,13 +780,15 @@ def validate_tie_results_fast(
     df["CRD_ID"] = df["CRD_ID"].astype(str)
     df["compared_to"] = df["compared_to"].astype("string")
 
-    # estrelas: z_flag==6 OU tie_result==3  (mesma definição)
+    # Stars: z_flag==6 OR tie_result==3 (equivalent definition)
     zf = pd.to_numeric(df["z_flag_homogenized"], errors="coerce")
     tr = pd.to_numeric(df["tie_result"], errors="coerce")
     star_mask = (zf == 6) | (tr == 3)
     star_ids = set(df.loc[star_mask, "CRD_ID"].astype(str))
 
     violations = []
+
+    # Consistency: any z_flag==6 must have tie_result==3
     wrong_tr_mask = (zf == 6) & (tr != 3)
     if wrong_tr_mask.any():
         rows = df.loc[wrong_tr_mask, cols].copy() if include_rows else None
@@ -935,7 +799,7 @@ def validate_tie_results_fast(
             "rows": rows,
         })
 
-    # Base para gerar arestas: SOMENTE nós A não-estrelas (como baseline)
+    # Build directed edges from compared_to using only non-star A nodes (baseline behavior)
     base = df.loc[~df["CRD_ID"].isin(star_ids), ["CRD_ID", "compared_to"]].copy()
     if base.empty:
         summary = {
@@ -946,23 +810,21 @@ def validate_tie_results_fast(
         }
         return {"summary": summary, "violations": violations}
 
-    # explode compared_to -> arestas dirigidas (A,B)
     cmp_df = (
         base.assign(_cmp_list=base["compared_to"].map(_parse_cmp_list_fast))
-            [["CRD_ID","_cmp_list"]]
+            [["CRD_ID", "_cmp_list"]]
             .explode("_cmp_list", ignore_index=True)
-            .rename(columns={"CRD_ID":"A", "_cmp_list":"B"})
+            .rename(columns={"CRD_ID": "A", "_cmp_list": "B"})
     )
-    # remove vazios
+    # Drop empty neighbors
     cmp_df = cmp_df[cmp_df["B"].notna() & (cmp_df["B"] != "")]
-    # baseline: descarta apenas vizinhos que estão em star_ids;
-    # vizinhos ausentes no DF mas não-estrela (desconhecidos) PERMANECEM.
+    # Discard neighbors that are stars; keep unknown/non-star neighbors even if absent in DF
     cmp_df = cmp_df[~cmp_df["B"].isin(star_ids)]
 
-    # Se não há arestas → baseline teria seen_nodes vazio → 0 componentes
+    # If no edges remain, there are no seen nodes -> 0 components
     if cmp_df.empty:
         summary = {
-            "n_components": 0,           # compat: NÃO conta singletons sem arestas
+            "n_components": 0,  # do NOT count singleton nodes without edges
             "n_pairs": 0, "n_groups": 0,
             "n_violations": len(violations),
             "by_rule": pd.Series([v["rule"] for v in violations]).value_counts().to_dict() if violations else {},
@@ -970,12 +832,12 @@ def validate_tie_results_fast(
         }
         return {"summary": summary, "violations": violations}
 
-    # NÓS DO GRAFO = união(A ∪ B) das arestas (como seen_nodes do baseline)
+    # Graph nodes are the union of endpoints in edges (seen_nodes baseline)
     nodes = pd.Index(pd.unique(pd.concat([cmp_df["A"], cmp_df["B"]], ignore_index=True)))
     id2ix = {cid: i for i, cid in enumerate(nodes)}
     n = nodes.size
 
-    # Arestas não-dirigidas deduplicadas
+    # Build undirected deduplicated edges
     a_ix = cmp_df["A"].map(id2ix).to_numpy()
     b_ix = cmp_df["B"].map(id2ix).to_numpy()
     lo = np.minimum(a_ix, b_ix)
@@ -985,27 +847,37 @@ def validate_tie_results_fast(
     und_view = und.view([('x', und.dtype), ('y', und.dtype)])
     und = np.unique(und_view).view(und.dtype).reshape(-1, 2)
 
-    # Grafo esparso + componentes (conta TODOS os componentes do grafo)
+    # Sparse graph + components (count ALL graph components)
     data = np.ones(und.shape[0], dtype=np.int8)
     A = coo_matrix((data, (und[:, 0], und[:, 1])), shape=(n, n))
     A = A + A.T
     n_comp, labels = connected_components(A, directed=False, return_labels=True)
 
-    # Índices dos nós PRESENTES no DF (não-estrelas + possíveis B citados que existam no DF)
+    # Indices of nodes that are PRESENT in df (after removing stars), to use in validation
     present = df.set_index("CRD_ID").reindex(nodes, copy=False)
-    idx_vals = np.asarray(present.index)  # garante ndarray
+    idx_vals = np.asarray(present.index)
     present_mask = (~pd.isna(idx_vals)) & (pd.Index(idx_vals).isin(df["CRD_ID"].astype(str).values))
-    present_idx = np.flatnonzero(present_mask)  # equivale a np.where(...)[0]
+    present_idx = np.flatnonzero(present_mask)
 
-    # Arrays para os presentes (para validação); nós ausentes não são usados na validação
-    sub = present.iloc[present_idx][["z_flag_homogenized","tie_result","instrument_type_homogenized","z"]]
-    zf_arr = pd.to_numeric(sub["z_flag_homogenized"], errors="coerce").to_numpy()
+    # Arrays for PRESENT rows only
+    sub = present.iloc[present_idx][["z_flag_homogenized", "tie_result", "instrument_type_homogenized", "z"]]
+
+    # ---- Ranking for z_flag: NaN -> -2 (lowest), 6 -> -1 (below any non-star), others -> numeric value
+    zf_raw = pd.to_numeric(sub["z_flag_homogenized"], errors="coerce").to_numpy()
+    zf_rank = np.where(np.isnan(zf_raw), -2, zf_raw)
+    zf_rank = np.where(zf_raw == 6, -1, zf_rank)
+
+    # tie_result array
     tr_arr = pd.to_numeric(sub["tie_result"], errors="coerce").fillna(-1).astype(int).to_numpy()
+
+    # instrument_type mapping; unknown/NA -> 0 (so known types dominate NA)
     type_map = {"s": 3, "g": 2, "p": 1}
     it_arr = sub["instrument_type_homogenized"].map(lambda t: type_map.get(_norm_str(t), 0)).astype(int).to_numpy()
+
+    # redshift array
     z_arr = pd.to_numeric(sub["z"], errors="coerce").to_numpy()
 
-    # mapa: global_ix -> local_ix (apenas presentes)
+    # Map global index -> local index (only for present nodes)
     gix_to_lix = {gix: lix for lix, gix in enumerate(present_idx)}
 
     def zdiff(a, b):
@@ -1017,36 +889,38 @@ def validate_tie_results_fast(
     n_pairs = 0
     n_groups = 0
 
-    # Opcionalmente limitar número de componentes analisados (como baseline faz slice)
+    # Optionally limit number of components to scan
     comp_order = np.arange(n_comp)
     if max_groups is not None and max_groups < n_comp:
         comp_order = comp_order[:max_groups]
 
     for cid in comp_order:
-        # nós globais no componente
+        # Global node indices of the component
         gidx = np.where(labels == cid)[0]
-        # filtra só nós PRESENTES no DF
+        # Keep only PRESENT nodes (rows we have)
         lix = [gix_to_lix[g] for g in gidx if g in gix_to_lix]
         m = len(lix)
         if m <= 1:
-            continue  # nada a validar
+            continue  # nothing to validate
 
-        comp_ids_str = tuple(nodes[gidx].tolist())  # para contagem/identificação (compat)
-        zf_c = zf_arr[lix]
+        comp_ids_str = tuple(nodes[gidx].tolist())  # for reporting / identification
+        # Slice local arrays for this component
         tr_c = tr_arr[lix]
         it_c = it_arr[lix]
         z_c  = z_arr[lix]
+        zf_c_rank = zf_rank[lix]
 
         if m == 2:
             n_pairs += 1
             a, b = 0, 1
             tr_a, tr_b = tr_c[a], tr_c[b]
-            zf_a_eff = (-1 if zf_c[a] == 6 else zf_c[a])
-            zf_b_eff = (-1 if zf_c[b] == 6 else zf_c[b])
+            zf_a_eff = zf_c_rank[a]
+            zf_b_eff = zf_c_rank[b]
             ts_a, ts_b = it_c[a], it_c[b]
             dz = zdiff(np.array([z_c[a]]), np.array([z_c[b]]))[0]
 
             vios_local = []
+            # 1 vs 0: winner must strictly dominate by flag, or by type if flags equal, or Δz<threshold if still tied
             if {tr_a, tr_b} == {0, 1}:
                 win_is_a = (tr_a == 1)
                 win_zf = zf_a_eff if win_is_a else zf_b_eff
@@ -1059,15 +933,21 @@ def validate_tie_results_fast(
                     (win_zf == los_zf and win_ts == los_ts and dz < threshold)
                 )
                 if not cond:
-                    vios_local.append(("PAIR_1v0_PRIORITY", "Winner lacks higher flag/type/Δz<thr on tie."))
+                    vios_local.append(("PAIR_1v0_PRIORITY",
+                                       "Winner lacks higher flag/type or Δz<threshold when tie persists."))
+            # 2 vs 2: tie must have equal flag and type, and Δz>threshold (or undefined)
             elif tr_a == 2 and tr_b == 2:
                 cond = (zf_a_eff == zf_b_eff) and (ts_a == ts_b) and (dz > threshold or math.isinf(dz))
                 if not cond:
-                    vios_local.append(("PAIR_2v2_TIE_CONSISTENCY", "Tie (2,2) requires equal flag/type and Δz>thr (or undefined)."))
+                    vios_local.append(("PAIR_2v2_TIE_CONSISTENCY",
+                                       "Tie (2,2) requires equal flag/type and Δz>threshold (or undefined)."))
+            # 0 vs 0: both eliminated but not due solely to flag 6 (defensive check)
             elif tr_a == 0 and tr_b == 0:
-                vios_local.append(("PAIR_0v0_BOTH_FLAG6", "Both eliminated (0,0) but not both flag 6."))
+                vios_local.append(("PAIR_0v0_BOTH_FLAG6",
+                                   "Both eliminated (0,0) but not both flag 6."))
             else:
-                vios_local.append(("PAIR_INVALID_TIE_PATTERN", f"Unexpected tie_result pattern: ({tr_a},{tr_b})."))
+                vios_local.append(("PAIR_INVALID_TIE_PATTERN",
+                                   f"Unexpected tie_result pattern: ({tr_a},{tr_b})."))
 
             if vios_local:
                 rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
@@ -1080,54 +960,52 @@ def validate_tie_results_fast(
         else:
             n_groups += 1
             surv = np.isin(tr_c, (1, 2))
-            zf_eff = np.where(zf_c == 6, -1, zf_c)
-            # nanmax pode avisar se tudo NaN; nessa situação, tratamos como "sem dominância"
-            with np.errstate(all='ignore'):
-                max_flag = np.nanmax(zf_eff)
-            if not np.isfinite(max_flag):
-                max_flag = -np.inf  # ninguém domina; evita falsos positivos
 
-            if np.any(surv & (zf_eff < max_flag)):
+            # Max flag rank in the group (no NaNs in rank); if empty, set to -inf
+            max_flag = np.max(zf_c_rank) if zf_c_rank.size else -np.inf
+
+            # 1) Flag dominance: any survivor with flag rank < max_flag?
+            if np.any(surv & (zf_c_rank < max_flag)):
                 rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
                 violations.append({
                     "rule": "GROUP_FLAG_DOMINANCE",
-                    "message": "Survivors include members with lower z_flag than group max (excluding 6).",
+                    "message": "Survivors include members with lower z_flag than group max (with rank: NaN<star<others).",
                     "group_ids": comp_ids_str,
                     "rows": rows_payload,
                 })
 
-            cand_flag = (zf_eff == max_flag)
+            # 2) Type dominance among top-flag candidates
+            cand_flag = (zf_c_rank == max_flag)
             if np.any(cand_flag):
                 max_type = np.max(it_c[cand_flag]) if np.any(cand_flag) else -1
                 if np.any(surv & (it_c < max_type)):
                     rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
                     violations.append({
                         "rule": "GROUP_TYPE_DOMINANCE",
-                        "message": "Survivors include members with lower instrument_type than group max.",
+                        "message": "Survivors include members with lower instrument_type than group max among top-flag.",
                         "group_ids": comp_ids_str,
                         "rows": rows_payload,
                     })
+            else:
+                max_type = -1  # defensive fallback
 
-            # 3) Δz independence em candidatos (max-flag & max-type)
-            cand = cand_flag & (it_c == (np.max(it_c[cand_flag]) if np.any(cand_flag) else -1))
-            
-            # ✅ considere apenas os sobreviventes entre os candidatos
+            # 3) Δz independence among survivors at top-flag & top-type
+            cand = cand_flag & (it_c == max_type)
             cand_surv_idx = np.where(cand & surv)[0]
             if cand_surv_idx.size >= 2:
                 zS = z_c[cand_surv_idx]
-                # matriz de |Δz| apenas entre sobreviventes de topo
                 D = np.abs(zS[:, None] - zS[None, :])
                 iu = np.triu_indices_from(D, k=1)
                 if (D[iu] < threshold).any():
                     rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
                     violations.append({
                         "rule": "GROUP_DELTZ_INDEPENDENCE",
-                        "message": "Two survivors closer than threshold among max-flag&max-type.",
+                        "message": "Two survivors are closer than threshold among max-flag & max-type.",
                         "group_ids": comp_ids_str,
                         "rows": rows_payload,
                     })
 
-
+            # 4) Survivor count rules
             n_surv = int(np.sum(surv))
             if n_surv == 0:
                 rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
@@ -1158,9 +1036,7 @@ def validate_tie_results_fast(
                     })
 
     summary = {
-        # compat: conta TODOS os componentes do grafo (inclui aqueles que,
-        # após filtrar presentes, não geraram validação)
-        "n_components": int(n_comp),
+        "n_components": int(n_comp),     # count ALL graph components
         "n_pairs": n_pairs,
         "n_groups": n_groups,
         "n_violations": len(violations),
@@ -1168,6 +1044,7 @@ def validate_tie_results_fast(
         "n_stars_excluded": int(star_mask.sum()),
     }
     return {"summary": summary, "violations": violations}
+
 
 
 def explain_tie_validation_output(
@@ -1332,28 +1209,37 @@ def render_na_compared_to_validation(
     assert_if_invalid: bool = False,
 ):
     """
-    Render a Markdown report for the rule:
-      - If `compared_to` is <NA>, then `tie_result` must be 1.
-      - Exception: `tie_result` may be 3 only if `z_flag_homogenized == 6`.
+    Render a Markdown report para três regras:
 
-    Parameters
-    ----------
-    df_final : pd.DataFrame
-        DataFrame containing at least: compared_to, tie_result, z_flag_homogenized.
-    show_max : int
-        Max number of violating rows to display.
-    cols_to_show : list[str] | None
-        Columns to display for violating rows. If None, a sensible default is used.
-    assert_if_invalid : bool
-        If True, raises AssertionError when violations are found.
+    Regra A (isolados):
+      - Se `compared_to` é <NA>, então `tie_result` deve ser 1.
+      - Exceção: `tie_result` pode ser 3 somente se `z_flag_homogenized == 6`.
 
-    Returns
-    -------
-    dict with:
-      - total_na (int), valid_count (int), invalid_count (int)
-      - crosstab (pd.DataFrame)
-      - violations (pd.DataFrame)
+    Regra B (membros de componente):
+      - Se `compared_to` NÃO é <NA>, então `z_flag_homogenized` NÃO pode ser 6
+        (estrelas não entram no tiebreaking).
+
+    Regra C (global, independente de compared_to):
+      - `tie_result == 3` → `z_flag_homogenized` deve ser 6 (sempre).
+      - (opcional complementar) `z_flag_homogenized == 6` → `tie_result` deve ser 3.
+
+    Retorna um dicionário com sumários e amostras de violações por regra.
     """
+    # --- Imports para exibição bonita (ok fora de notebook) ---
+    try:
+        from IPython.display import display, Markdown
+    except Exception:
+        def display(x):  # type: ignore
+            pass
+        def Markdown(x):  # type: ignore
+            return x
+
+    # --- Checagem de colunas requeridas ---
+    required = {"compared_to", "tie_result", "z_flag_homogenized"}
+    missing = sorted(required - set(df_final.columns))
+    if missing:
+        raise KeyError(f"Missing required columns for validation: {missing}")
+
     if cols_to_show is None:
         cols_to_show = [
             "CRD_ID", "ra", "dec", "z", "z_flag", "z_err",
@@ -1361,7 +1247,7 @@ def render_na_compared_to_validation(
             "tie_result", "survey", "source", "compared_to",
         ]
 
-    # Normalize `compared_to` to true NA
+    # Normaliza compared_to para NA "de verdade"
     df = df_final.copy()
     df["compared_to"] = (
         df["compared_to"]
@@ -1372,70 +1258,189 @@ def render_na_compared_to_validation(
           })
     )
 
-    # 1) Subset rows where compared_to is truly NA
+    # Helpers numéricos
+    def _num(s):
+        return pd.to_numeric(s, errors="coerce")
+
+    # =============================================================================
+    # Regra A: compared_to é NA -> tie_result deve ser 1 (exceto flag==6 -> 3)
+    # =============================================================================
     na_cmp = df[df["compared_to"].isna()].copy()
 
-    # 2) Parse tie_result & z_flag_homogenized (keep -1 for logic)
-    tie_as_int   = pd.to_numeric(na_cmp["tie_result"], errors="coerce").fillna(-1).astype(int)
-    zflag_as_int = pd.to_numeric(na_cmp["z_flag_homogenized"], errors="coerce").fillna(-1).astype(int)
+    tie_A   = _num(na_cmp["tie_result"]).fillna(-1).astype(int)
+    zf_A    = _num(na_cmp["z_flag_homogenized"]).fillna(-1).astype(int)
 
-    # 3) Valid if:
-    #    - tie_result == 1
-    #    - OR tie_result == 3 and z_flag_homogenized == 6
-    valid_mask = tie_as_int.eq(1) | (tie_as_int.eq(3) & zflag_as_int.eq(6))
-    violations = na_cmp.loc[~valid_mask].copy()
+    valid_A = tie_A.eq(1) | (tie_A.eq(3) & zf_A.eq(6))
+    viol_A  = na_cmp.loc[~valid_A].copy()
 
-    # 4) Summary numbers
-    total_na      = int(len(na_cmp))
-    valid_count   = int(valid_mask.sum())
-    invalid_count = int(len(violations))
+    total_A   = int(len(na_cmp))
+    ok_A      = int(valid_A.sum())
+    bad_A     = int(len(viol_A))
 
-    # Header + rule description
     display(Markdown(
 f"""
-### Validation: `compared_to` is `<NA>` ➜ `tie_result` rule (with flag-6 exception)
+### Validation A: `compared_to` `<NA>` ➜ `tie_result` (com exceção flag==6)
 
-**Rule**  
-- If `compared_to` is `<NA>`, then **`tie_result` must be `1`**.  
-- **Exception:** `tie_result` may be **`3` only if `z_flag_homogenized == 6`**.
-
-**Summary**  
-- Rows with `compared_to` `<NA>`: **{total_na}**  
-- Valid: **{valid_count}**  
-- **INVALID:** **{invalid_count}**
+- Linhas com `compared_to` `<NA>`: **{total_A}**  
+- Válidas: **{ok_A}**  
+- **INVÁLIDAS:** **{bad_A}**
 """
     ))
 
-    # 4b) Crosstab for display (without -1)
-    tie_disp   = pd.to_numeric(na_cmp["tie_result"], errors="coerce").astype("Int64").astype("string").fillna("<NA>")
-    zflag_disp = pd.to_numeric(na_cmp["z_flag_homogenized"], errors="coerce").astype("Int64").astype("string").fillna("<NA>")
-    ctab = pd.crosstab(tie_disp, zflag_disp, dropna=False)
+    tie_disp_A   = _num(na_cmp["tie_result"]).astype("Int64").astype("string").fillna("<NA>")
+    zflag_disp_A = _num(na_cmp["z_flag_homogenized"]).astype("Int64").astype("string").fillna("<NA>")
+    ctab_A = pd.crosstab(tie_disp_A, zflag_disp_A, dropna=False)
 
-    display(Markdown("#### Crosstab: `tie_result` × `z_flag_homogenized` (display values; `<NA>` shown)"))
-    display(ctab)
+    display(Markdown("#### Crosstab A: `tie_result` × `z_flag_homogenized` (isolados; `<NA>` mostrado)"))
+    display(ctab_A)
 
-    # 5) Examples of violations (if any)
-    if invalid_count > 0:
-        cols_present = [c for c in cols_to_show if c in violations.columns]
-        display(Markdown(f"#### ⚠️ Examples of violations (up to {show_max})"))
-        display(violations[cols_present].head(show_max).reset_index(drop=True))
+    if bad_A > 0:
+        cols_present_A = [c for c in cols_to_show if c in viol_A.columns]
+        display(Markdown(f"#### ⚠️ Exemplos (até {show_max}) — Regra A"))
+        display(viol_A[cols_present_A].head(show_max).reset_index(drop=True))
     else:
-        display(Markdown("✅ All rows with `compared_to` `<NA>` satisfy the rule (either `tie_result == 1`, or `tie_result == 3` with `flag == 6`)."))
+        display(Markdown("✅ Regra A ok: todos isolados seguem a regra."))
 
-    # 6) Optional hard assertion
-    if assert_if_invalid and invalid_count > 0:
+    # =============================================================================
+    # Regra B: compared_to NÃO é NA -> z_flag_homogenized NÃO pode ser 6
+    # =============================================================================
+    #    not_na_cmp = df[df["compared_to"].notna()].copy()
+    #    zf_B = _num(not_na_cmp["z_flag_homogenized"])
+    #
+    #    viol_mask_B = zf_B.eq(6)
+    #    viol_B = not_na_cmp.loc[viol_mask_B].copy()
+    #
+    #    total_B = int(len(not_na_cmp))
+    #    bad_B   = int(viol_mask_B.sum())
+    #    ok_B    = int(total_B - bad_B)
+    #
+    #    display(Markdown(
+    #f"""
+    #### Validation B: `compared_to` **não** `<NA>` ➜ **proibir** `z_flag_homogenized == 6`
+    #
+    #- Linhas com `compared_to` não `<NA>`: **{total_B}**  
+    #- Válidas (flag ≠ 6 ou `<NA>`): **{ok_B}**  
+    #- **INVÁLIDAS (flag == 6):** **{bad_B}**
+    #"""
+    #    ))
+    #
+    #    if total_B > 0:
+    #        tie_disp_B   = _num(not_na_cmp["tie_result"]).astype("Int64").astype("string").fillna("<NA>")
+    #        zflag_disp_B = _num(not_na_cmp["z_flag_homogenized"]).astype("Int64").astype("string").fillna("<NA>")
+    #        ctab_B = pd.crosstab(tie_disp_B, zflag_disp_B, dropna=False)
+    #    else:
+    #        ctab_B = pd.DataFrame()
+    #
+    #    display(Markdown("#### Crosstab B: `tie_result` × `z_flag_homogenized` (em componentes; `<NA>` mostrado)"))
+    #    display(ctab_B)
+    #
+    #    if bad_B > 0:
+    #        cols_present_B = [c for c in cols_to_show if c in viol_B.columns]
+    #        display(Markdown(f"#### ⚠️ Exemplos (até {show_max}) — Regra B"))
+    #        display(viol_B[cols_present_B].head(show_max).reset_index(drop=True))
+    #    else:
+    #        display(Markdown("✅ Regra B ok: nenhum membro de componente tem `flag == 6`."))
+
+    # =============================================================================
+    # Regra C (GLOBAL): coerência de "estrela"
+    #   C1) Se tie_result == 3 → z_flag_homogenized deve ser 6
+    #   C2) Se z_flag_homogenized == 6 → tie_result deve ser 3
+    # =============================================================================
+    tie_all = _num(df["tie_result"])
+    zf_all  = _num(df["z_flag_homogenized"])
+
+    # C1: flag qualquer `3` sem flag==6 (pega exatamente seu caso)
+    mask_C1 = tie_all.eq(3) & ~zf_all.eq(6)
+    viol_C1 = df.loc[mask_C1].copy()
+
+    total_C1 = int(tie_all.eq(3).sum())
+    bad_C1   = int(mask_C1.sum())
+    ok_C1    = int(total_C1 - bad_C1)
+
+    display(Markdown(
+f"""
+### Validation C1 (Global): **`tie_result == 3` exige `z_flag_homogenized == 6`**
+
+- Linhas com `tie_result == 3`: **{total_C1}**  
+- Válidas (`flag == 6`): **{ok_C1}**  
+- **INVÁLIDAS (`flag != 6` ou `<NA>`):** **{bad_C1}**
+"""
+    ))
+
+    if bad_C1 > 0:
+        cols_present_C1 = [c for c in cols_to_show if c in viol_C1.columns]
+        display(Markdown(f"#### ⚠️ Exemplos (até {show_max}) — Regra C1"))
+        display(viol_C1[cols_present_C1].head(show_max).reset_index(drop=True))
+    else:
+        display(Markdown("✅ Regra C1 ok: todo `tie_result == 3` tem `flag == 6`."))
+
+    # C2: se flag==6 → tie_result deve ser 3 (opcional, mas útil)
+    mask_C2 = zf_all.eq(6) & ~tie_all.eq(3)
+    viol_C2 = df.loc[mask_C2].copy()
+
+    total_C2 = int(zf_all.eq(6).sum())
+    bad_C2   = int(mask_C2.sum())
+    ok_C2    = int(total_C2 - bad_C2)
+
+    display(Markdown(
+f"""
+### Validation C2 (Global): **`z_flag_homogenized == 6` exige `tie_result == 3`**
+
+- Linhas com `flag == 6`: **{total_C2}**  
+- Válidas (`tie_result == 3`): **{ok_C2}**  
+- **INVÁLIDAS (`tie_result != 3`):** **{bad_C2}**
+"""
+    ))
+
+    if bad_C2 > 0:
+        cols_present_C2 = [c for c in cols_to_show if c in viol_C2.columns]
+        display(Markdown(f"#### ⚠️ Exemplos (até {show_max}) — Regra C2"))
+        display(viol_C2[cols_present_C2].head(show_max).reset_index(drop=True))
+    else:
+        display(Markdown("✅ Regra C2 ok: todo `flag == 6` tem `tie_result == 3`."))
+
+    # =============================================================================
+    # Assertion (se solicitado) — falha se QUALQUER regra for violada
+    # =============================================================================
+    if assert_if_invalid and (bad_A > 0 or bad_B > 0 or bad_C1 > 0 or bad_C2 > 0):
         raise AssertionError(
-            "Found rows where `compared_to` is <NA> but `tie_result` is invalid "
-            "(not 1, nor 3 with flag==6)."
+            "Validation failed:\n"
+            f"- Rule A violations: {bad_A}\n"
+            f"- Rule B violations: {bad_B}\n"
+            f"- Rule C1 (tie==3 -> flag==6) violations: {bad_C1}\n"
+            f"- Rule C2 (flag==6 -> tie==3) violations: {bad_C2}\n"
+            "Veja as tabelas exibidas para exemplos."
         )
 
     return {
-        "total_na": total_na,
-        "valid_count": valid_count,
-        "invalid_count": invalid_count,
-        "crosstab": ctab,
-        "violations": violations,
+        # Rule A
+        "rule_na_cmp_total": total_A,
+        "rule_na_cmp_valid": ok_A,
+        "rule_na_cmp_invalid": bad_A,
+        "rule_na_cmp_crosstab": ctab_A,
+        "rule_na_cmp_violations": viol_A,
+
+        # Rule B
+        #"rule_non_na_star_total": total_B,
+        #"rule_non_na_star_valid": ok_B,
+        #"rule_non_na_star_invalid": bad_B,
+        #"rule_non_na_star_crosstab": ctab_B,
+        #"rule_non_na_star_violations": viol_B,
+
+        # Rule C1 (global: tie==3 -> flag==6)
+        "rule_global_tie3_total": total_C1,
+        "rule_global_tie3_valid": ok_C1,
+        "rule_global_tie3_invalid": bad_C1,
+        "rule_global_tie3_violations": viol_C1,
+
+        # Rule C2 (global: flag==6 -> tie==3)
+        "rule_global_flag6_total": total_C2,
+        "rule_global_flag6_valid": ok_C2,
+        "rule_global_flag6_invalid": bad_C2,
+        "rule_global_flag6_violations": viol_C2,
     }
+
+
 
 # =======================
 # =======================
@@ -1711,3 +1716,92 @@ def analyze_groups_by_compared_to(
         "case_descriptions": case_descriptions,
         "summary_counts": summary_counts,
     }
+
+def validate_tie_preservation(
+    df_original: pd.DataFrame,
+    df_processed: pd.DataFrame,
+    *,
+    key: str = "CRD_ID",
+    tr_col: str = "tie_result",
+    cmp_col: str = "compared_to",
+    max_examples: int = 20,
+) -> dict:
+    """
+    Validate that for rows in df_processed with compared_to <NA/empty>,
+    the tie_result matches exactly the original tie_result in df_original.
+
+    Parameters
+    ----------
+    key : unique ID column to join on (must exist in both dataframes)
+    tr_col : tie_result column name
+    cmp_col : compared_to column name
+    max_examples : cap the number of mismatches returned for quick inspection
+
+    Returns
+    -------
+    result : dict with:
+      - ok (bool)
+      - n_checked (int)
+      - n_missing_in_original (int)
+      - n_mismatches (int)
+      - mismatches (DataFrame): up to `max_examples` rows with details
+    """
+    # --- Normalize NA-like compared_to: treat NA or empty/whitespace as NA-like
+    cmp_str = df_processed[cmp_col].astype("string")
+    na_like_mask = cmp_str.isna() | (cmp_str.str.strip() == "")
+
+    proc_na = df_processed.loc[na_like_mask, [key, tr_col]].copy()
+    proc_na = proc_na.rename(columns={tr_col: f"{tr_col}_proc"})
+
+    # Join with original to fetch baseline tie_result
+    orig_min = df_original[[key, tr_col]].rename(columns={tr_col: f"{tr_col}_orig"})
+    merged = proc_na.merge(orig_min, on=key, how="left", validate="m:1")
+
+    # Track rows that don't exist in original (cannot validate)
+    missing_in_orig_mask = merged[f"{tr_col}_orig"].isna() & ~merged[f"{tr_col}_proc"].isna()
+    n_missing_in_original = int(missing_in_orig_mask.sum())
+
+    # Compare (treat NaN == NaN as equal)
+    tr_proc = pd.to_numeric(merged[f"{tr_col}_proc"], errors="coerce")
+    tr_orig = pd.to_numeric(merged[f"{tr_col}_orig"], errors="coerce")
+    equal_mask = (tr_proc == tr_orig) | (tr_proc.isna() & tr_orig.isna())
+    mismatch_mask = ~equal_mask & ~missing_in_orig_mask
+
+    mismatches_df = merged.loc[mismatch_mask, [key, f"{tr_col}_proc", f"{tr_col}_orig"]].copy()
+    if len(mismatches_df) > max_examples:
+        mismatches_df = mismatches_df.head(max_examples)
+
+    n_checked = int(len(merged))
+    n_mismatches = int(mismatch_mask.sum())
+
+    ok = (n_mismatches == 0) and (n_missing_in_original == 0)
+
+    return {
+        "ok": ok,
+        "n_checked": n_checked,
+        "n_missing_in_original": n_missing_in_original,
+        "n_mismatches": n_mismatches,
+        "mismatches": mismatches_df,
+    }
+
+
+def explain_tie_preservation(result: dict, *, title: str = "Tie-result preservation check") -> str:
+    """
+    Produce a short human-readable explanation from validate_tie_preservation() result.
+    """
+    lines = []
+    lines.append(f"{title}")
+    lines.append("-" * len(title))
+    lines.append(f"Checked rows (compared_to NA-like): {result['n_checked']}")
+    lines.append(f"Missing in original: {result['n_missing_in_original']}")
+    lines.append(f"Mismatches: {result['n_mismatches']}")
+    lines.append(f"Status: {'OK ✅' if result['ok'] else 'FAIL ❌'}")
+
+    mism = result.get("mismatches", None)
+    if mism is not None and len(mism) > 0:
+        lines.append("\nExamples (up to N shown):")
+        # Render a few examples as 'ID: proc -> orig'
+        for _, row in mism.iterrows():
+            lines.append(f"  {row.iloc[0]}: {row.iloc[1]} -> {row.iloc[2]}")
+
+    return "\n".join(lines)

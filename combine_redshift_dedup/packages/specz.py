@@ -14,18 +14,16 @@ Public API:
 # -----------------------
 # Standard library
 # -----------------------
-import ast
+import ast as _ast
 import builtins
 import difflib
 import glob
-import json
 import logging
 import math
 import os
 import pathlib
 import re
 import shutil
-from collections import defaultdict
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -47,9 +45,8 @@ os.environ.setdefault("DASK_DISTRIBUTED__SHUFFLE__METHOD", "tasks")
 import hats
 import lsdb
 from combine_redshift_dedup.packages.product_handle import ProductHandle
-from hats_import.catalog.file_readers import ParquetReader
-from hats_import.margin_cache.margin_cache_arguments import MarginCacheArguments
-from hats_import.pipeline import ImportArguments, pipeline_with_client
+from hats_import import CollectionArguments
+from hats_import.collection.run_import import run as run_collection_import
 
 if TYPE_CHECKING:
     # Avoid heavy imports at runtime just for typing
@@ -662,27 +659,20 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
 # CRD_ID generation
 # -----------------------
 def _generate_crd_ids(df: dd.DataFrame, product_name: str, temp_dir: str) -> tuple[dd.DataFrame, str]:
-    """Assign stable, catalog-scoped CRD_IDs and return the `compared_to` path.
+    """Assign stable, catalog-scoped CRD_IDs.
 
     The CRD_ID has the form ``CRD{NNN}_{i}``, where ``NNN`` is the numeric
     prefix extracted from ``product_name`` (``entry['internal_name']``) and
-    ``i`` is a 1-based, contiguous counter across all partitions. This function
-    computes partition lengths, derives running offsets, and assigns IDs
-    deterministically per partition to avoid a single large shuffle.
-
-    It also prepares the file path where the per-catalog pair graph
-    (``compared_to``) will be persisted later in the pipeline.
+    ``i`` is a 1-based, contiguous counter across all partitions.
 
     Args:
         df (dd.DataFrame): Input Dask DataFrame after schema normalization.
         product_name (str): Product internal name, expected to start with a
             numeric prefix (e.g., ``"492_vltvimos_v201"``).
-        temp_dir (str): Directory where intermediate artifacts are written.
+        temp_dir (str): Unused here, kept for signature stability during refactor.
 
     Returns:
-        tuple[dd.DataFrame, str]: The DataFrame with a new ``CRD_ID`` column
-        (pandas ``StringDtype``) and the absolute path to the JSON file where
-        this catalog's ``compared_to`` dictionary should be saved.
+        dd.DataFrame: DataFrame with a new ``CRD_ID`` column (Arrow string dtype).
 
     Raises:
         ValueError: If a numeric prefix cannot be extracted from ``product_name``.
@@ -719,9 +709,9 @@ def _generate_crd_ids(df: dd.DataFrame, product_name: str, temp_dir: str) -> tup
         for i, offset in enumerate(offsets)
     ]
     df = dd.concat(parts)
+    
+    return df
 
-    compared_to_path = os.path.join(temp_dir, f"compared_to_dict_{catalog_prefix}.json")
-    return df, compared_to_path
 
 # -----------------------
 # Homogenization (respect user-provided columns)
@@ -889,7 +879,6 @@ def _homogenize(
                     return pd.to_numeric(x, errors="coerce").astype(DTYPE_FLOAT)
                 return builtins.float(x)
 
-            import ast as _ast
 
             class _BoolToBitwise(_ast.NodeTransformer):
                 """Rewrite boolean ops and chained comparisons to bitwise equivalents."""
@@ -1121,300 +1110,6 @@ def _homogenize(
 
 
 # -----------------------
-# Tie-breaking / duplicates
-# -----------------------
-def _apply_tiebreaking_and_collect(
-    df: dd.DataFrame,
-    translation_config: dict,
-    tiebreaking_priority: list,
-    instrument_type_priority: dict,
-    compared_to_dict_solo: dict[str, set[str]],
-    product_name: str,
-    logger: logging.Logger,
-) -> dd.DataFrame:
-    """Resolve duplicates via prioritized tie-breaking and collect undirected edges."""
-    import numpy as np
-    import pandas as pd
-    import dask
-    from dask.distributed import get_client
-
-    # ------------------------
-    # Detect if tie_result pre-existed
-    # ------------------------
-    had_preexisting_tie = ("tie_result" in df.columns)
-
-    # ------------------------
-    # Init tie_result
-    # ------------------------
-    if had_preexisting_tie:
-        try:
-            prev_tr = dd.to_numeric(df["tie_result"], errors="coerce")
-            df["tie_result"] = prev_tr.fillna(1).map_partitions(
-                lambda s: s.astype(DTYPE_INT8),
-                meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
-            )
-            logger.info(f"{product_name}: tie_result reused; filled missing with 1.")
-        except Exception as e:
-            logger.warning(f"⚠️ {product_name}: tie_result reuse failed ({e}); initializing to 1.")
-            df["tie_result"] = 1
-            df["tie_result"] = df["tie_result"].map_partitions(
-                lambda s: s.astype(DTYPE_INT8),
-                meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
-            )
-            had_preexisting_tie = False  # caiu no fallback
-    else:
-        df["tie_result"] = 1
-        df["tie_result"] = df["tie_result"].map_partitions(
-            lambda s: s.astype(DTYPE_INT8),
-            meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
-        )
-
-    # ------------------------
-    # FIX ① (pré-flag): garantir que 3 só exista com estrela quando NÃO havia tie prévio
-    # ------------------------
-    if not had_preexisting_tie and "z_flag_homogenized" in df.columns:
-        non_star_or_na = df["z_flag_homogenized"].isna() | (df["z_flag_homogenized"] != 6)
-        df["tie_result"] = df["tie_result"].mask((df["tie_result"] == 3) & non_star_or_na, 1).map_partitions(
-            lambda s: pd.to_numeric(s, errors="coerce").fillna(1).astype(DTYPE_INT8),
-            meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
-        )
-
-    # ------------------------
-    # Config & validation
-    # ------------------------
-    delta_z_threshold = translation_config.get("delta_z_threshold", 0.0)
-    if not tiebreaking_priority and (delta_z_threshold is None or float(delta_z_threshold) == 0.0):
-        raise ValueError(
-            f"Cannot deduplicate '{product_name}': no tiebreaking_priority and delta_z_threshold unset/zero."
-        )
-    for col in (tiebreaking_priority or []):
-        if col not in df.columns:
-            raise ValueError(f"Tiebreaking column '{col}' is missing in catalog '{product_name}'.")
-        if col != "instrument_type_homogenized" and not pd.api.types.is_numeric_dtype(df[col].dtype):
-            df[col] = dd.to_numeric(df[col], errors="coerce").astype("float64")
-
-    if "instrument_type_homogenized" in df.columns:
-        try:
-            df["instrument_type_homogenized"] = df["instrument_type_homogenized"].astype("category")
-        except Exception:
-            pass
-
-    # ------------------------
-    # Star flag (3) — só se NÃO havia tie pré-existente
-    # ------------------------
-    if not had_preexisting_tie and "z_flag_homogenized" in df.columns:
-        is_star = df["z_flag_homogenized"] == 6
-        df["tie_result"] = df["tie_result"].mask(is_star, 3)
-
-    # ------------------------
-    # Build mask & add (ra4, dec4)
-    # ------------------------
-    mask = df["ra"].notnull() & df["dec"].notnull()
-    if "z_flag_homogenized" in df.columns:
-        mask = mask & (df["z_flag_homogenized"] != 6)  # estrelas fora das comparações
-
-    def _add_ra4_dec4(part: pd.DataFrame) -> pd.DataFrame:
-        if part.empty:
-            return part.assign(ra4=pd.Series([], dtype="float64"),
-                               dec4=pd.Series([], dtype="float64"))
-        p = part.copy()
-        p["ra4"]  = np.round(pd.to_numeric(p["ra"],  errors="coerce").astype("float64"), 4)
-        p["dec4"] = np.round(pd.to_numeric(p["dec"], errors="coerce").astype("float64"), 4)
-        return p
-
-    meta_add = df._meta.assign(ra4=np.float64(), dec4=np.float64())
-    df_valid = df[mask].map_partitions(_add_ra4_dec4, meta=meta_add)
-
-    # ------------------------
-    # Helpers por partição
-    # ------------------------
-    def _tiebreak_partition_noindex(p: pd.DataFrame) -> pd.DataFrame:
-        if p.empty:
-            return pd.DataFrame({
-                "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
-                "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
-            })
-
-        out_chunks: list[pd.DataFrame] = []
-        for _, group_raw in p.groupby(["ra4", "dec4"], sort=False):
-            if len(group_raw) <= 1:
-                continue
-            group = group_raw.copy()
-            group["CRD_ID"] = group["CRD_ID"].astype(str)
-            group["tie_result"] = 0  # indeciso dentro do grupo duplicado
-            surviving = group.copy()
-
-            for priority_col in (tiebreaking_priority or []):
-                if priority_col == "instrument_type_homogenized":
-                    pr = surviving["instrument_type_homogenized"].map(instrument_type_priority).astype("float64")
-                    surviving["_priority_value"] = pr.fillna(-np.inf)
-                else:
-                    surviving["_priority_value"] = pd.to_numeric(
-                        surviving[priority_col], errors="coerce"
-                    ).astype("float64").fillna(-np.inf)
-
-                if surviving.empty:
-                    break
-                max_val = surviving["_priority_value"].max()
-                surviving = surviving[surviving["_priority_value"] == max_val].drop(
-                    columns=["_priority_value"], errors="ignore"
-                )
-                if len(surviving) == 1:
-                    break
-
-            if len(surviving) >= 1:
-                cids = set(surviving["CRD_ID"].astype(str))
-                group.loc[group["CRD_ID"].astype(str).isin(cids), "tie_result"] = 2  # provisórios
-
-            if len(surviving) > 1 and float(delta_z_threshold or 0.0) > 0.0 and "z" in group.columns:
-                thr = float(delta_z_threshold)
-                surv = surviving.copy()
-                ids = surv["CRD_ID"].astype(str).to_numpy(copy=False)
-                z_vals = pd.to_numeric(surv["z"], errors="coerce").to_numpy(dtype=float, copy=False)
-                remain = set(ids)
-                for i in range(len(ids)):
-                    if ids[i] not in remain:
-                        continue
-                    zi = z_vals[i]
-                    if not np.isfinite(zi):
-                        continue
-                    for j in range(i + 1, len(ids)):
-                        if ids[j] not in remain:
-                            continue
-                        zj = z_vals[j]
-                        if not np.isfinite(zj):
-                            continue
-                        if abs(zi - zj) <= thr:
-                            group.loc[group["CRD_ID"] == ids[i], "tie_result"] = 2
-                            group.loc[group["CRD_ID"] == ids[j], "tie_result"] = 0
-                            remain.discard(ids[j])
-
-            survivors = group[group["tie_result"] == 2]
-            if len(survivors) == 1:
-                group.loc[group["tie_result"] == 2, "tie_result"] = 1
-            elif len(survivors) == 0:
-                non_elim = group[group["tie_result"] != 0]
-                if len(non_elim) == 1:
-                    cid = str(non_elim.iloc[0]["CRD_ID"])
-                    group.loc[group["CRD_ID"] == cid, "tie_result"] = 1
-
-            out_chunks.append(group[["CRD_ID", "tie_result"]])
-
-        if not out_chunks:
-            return pd.DataFrame({
-                "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
-                "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
-            })
-
-        out = pd.concat(out_chunks, ignore_index=True)
-        out["CRD_ID"] = out["CRD_ID"].astype(DTYPE_STR)
-        out["tie_result"] = out["tie_result"].astype(DTYPE_INT8)
-        return out
-
-    def _edges_partition_noindex(p: pd.DataFrame) -> pd.DataFrame:
-        if p.empty:
-            return pd.DataFrame({
-                "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
-                "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
-            })
-        edges = []
-        for _, group in p.groupby(["ra4", "dec4"], sort=False):
-            ids = group["CRD_ID"].astype(str).tolist()
-            n = len(ids)
-            if n <= 1:
-                continue
-            for i in range(n):
-                for j in range(i + 1, n):
-                    a, b = ids[i], ids[j]
-                    if a == b:
-                        continue
-                    a_norm, b_norm = (a, b) if a < b else (b, a)
-                    edges.append((a_norm, b_norm))
-
-        if not edges:
-            return pd.DataFrame({
-                "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
-                "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
-            })
-
-        out = pd.DataFrame(edges, columns=["CRD_ID_A", "CRD_ID_B"])
-        out["CRD_ID_A"] = out["CRD_ID_A"].astype(DTYPE_STR)
-        out["CRD_ID_B"] = out["CRD_ID_B"].astype(DTYPE_STR)
-        return out
-
-    # ------------------------
-    # Um único shuffle; processamento por partição
-    # ------------------------
-    def run_shuffle_and_compute():
-        client = get_client()
-        try:
-            nworkers = len(client.scheduler_info()["workers"]) or 1
-        except Exception:
-            nworkers = 1
-        target_parts = max(2 * nworkers, df.npartitions)
-        try:
-            with dask.config.set({"dataframe.shuffle.method": "p2p"}):
-                df_shuf = df_valid.shuffle(on=["ra4", "dec4"], npartitions=target_parts)
-        except Exception:
-            with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-                df_shuf = df_valid.shuffle(on=["ra4", "dec4"], npartitions=target_parts)
-
-        meta_updates = pd.DataFrame({
-            "CRD_ID": pd.Series(pd.array([], dtype=DTYPE_STR)),
-            "tie_result": pd.Series(pd.array([], dtype=DTYPE_INT8)),
-        })
-        meta_edges = pd.DataFrame({
-            "CRD_ID_A": pd.Series(pd.array([], dtype=DTYPE_STR)),
-            "CRD_ID_B": pd.Series(pd.array([], dtype=DTYPE_STR)),
-        })
-
-        tie_update_dd = df_shuf.map_partitions(_tiebreak_partition_noindex, meta=meta_updates)
-        edges_dd      = df_shuf.map_partitions(_edges_partition_noindex,    meta=meta_edges)
-
-        tie_update_dd, edges_dd = dask.persist(tie_update_dd, edges_dd)
-        return tie_update_dd, edges_dd
-
-    tie_update_dd, edges_dd = run_shuffle_and_compute()
-
-    # ------------------------
-    # Merge updates (sem sobrescrever quem não foi comparado)
-    # ------------------------
-    df["CRD_ID"] = df["CRD_ID"].astype(DTYPE_STR)
-    df = df.merge(
-        tie_update_dd.rename(columns={"tie_result": "tie_result_update"}),
-        on="CRD_ID",
-        how="left",
-    )
-    df["tie_result"] = df["tie_result_update"].fillna(df["tie_result"])
-    df = df.drop(columns=["tie_result_update"], errors="ignore")
-
-    # ------------------------
-    # FIX ② (pós-merge): garantir 3 só em estrela quando NÃO havia tie prévio
-    # ------------------------
-    if not had_preexisting_tie and "z_flag_homogenized" in df.columns:
-        non_star_or_na = df["z_flag_homogenized"].isna() | (df["z_flag_homogenized"] != 6)
-        df["tie_result"] = df["tie_result"].mask((df["tie_result"] == 3) & non_star_or_na, 1)
-
-    # dtype final
-    df["tie_result"] = df["tie_result"].map_partitions(
-        lambda s: pd.to_numeric(s, errors="coerce").fillna(1).astype(DTYPE_INT8),
-        meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
-    )
-
-    # ------------------------
-    # Coleta das arestas (streaming)
-    # ------------------------
-    for part_delayed in edges_dd.to_delayed():
-        part = dask.compute(part_delayed)[0]
-        if part is None or part.empty:
-            continue
-        for a, b in zip(part["CRD_ID_A"], part["CRD_ID_B"]):
-            compared_to_dict_solo.setdefault(a, set()).add(b)
-            compared_to_dict_solo.setdefault(b, set()).add(a)
-
-    return df
-
-# -----------------------
 # RA/DEC strict validation (fail fast)
 # -----------------------
 def _validate_ra_dec_or_fail(df: dd.DataFrame, product_name: str) -> None:
@@ -1523,14 +1218,14 @@ def _extract_variables_from_expr(expr: str) -> set[str]:
       Set of identifier names referenced in the expression.
     """
     try:
-        tree = ast.parse(expr, mode="eval")
+        tree = _ast.parse(expr, mode="eval")
     except Exception:
         return set()
 
-    class _Visitor(ast.NodeVisitor):
+    class _Visitor(_ast.NodeVisitor):
         def __init__(self):
             self.vars = set()
-        def visit_Name(self, node: ast.Name) -> None:  # type: ignore[override]
+        def visit_Name(self, node: _ast.Name) -> None:  # type: ignore[override]
             self.vars.add(node.id)
             self.generic_visit(node)
 
@@ -1566,12 +1261,19 @@ def _select_output_columns(
     """
     final_cols = [
         "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err",
-        "instrument_type", "survey", "source", "tie_result", "is_in_DP1_fields",
+        "instrument_type", "survey", "source", "tie_result", "is_in_DP1_fields", "compared_to"
     ]
     if "z_flag_homogenized" in df.columns:
         final_cols.append("z_flag_homogenized")
     if "instrument_type_homogenized" in df.columns:
         final_cols.append("instrument_type_homogenized")
+
+    # Ensure Arrow-backed string for 'compared_to' if present
+    if "compared_to" in df.columns:
+        df["compared_to"] = df["compared_to"].map_partitions(
+            _normalize_string_series_to_na,
+            meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
+        )
 
     # Preserve normalized string semantics when fast-path was used.
     if used_type_fastpath and "type" in df.columns:
@@ -1652,7 +1354,7 @@ def _select_output_columns(
     
 
 # -----------------------
-# Save parquet + HATS/margin
+# Save parquet
 # -----------------------
 def _save_parquet(df: dd.DataFrame, temp_dir: str, product_name: str) -> str:
     """Write a partitioned Parquet artifact for the prepared catalog.
@@ -1704,7 +1406,9 @@ def _build_arrow_schema_for_catalog(
         "z_flag_homogenized": pa.float64(),
         "tie_result": pa.int8(),
         "is_in_DP1_fields": pa.int64(),
+        "compared_to": pa.string(),  # <- ADD
     }
+
 
     def _hint_to_pa(dt: str) -> pa.DataType:
         k = str(dt).lower()
@@ -1764,65 +1468,121 @@ def _build_arrow_schema_for_catalog(
             seen.add(f.name)
 
     return pa.schema(uniq_fields)
-    
 
-def import_catalog(
-    path: str,
-    ra_col: str,
-    dec_col: str,
-    artifact_name: str,
-    output_path: str,
-    logs_dir: str,
+# =======================
+# Collections
+# =======================
+
+def _write_schema_file_for_collection(
+    parquet_path: str,
+    schema_out_path: str,
     logger: logging.Logger,
-    client,  # type: ignore[override]
-    size_threshold_mb: int = 200,
     schema_hints: dict | None = None,
-) -> None:
-    """Import a Parquet catalog into HATS format.
+) -> str:
+    """Create a minimal Parquet file containing only the desired Arrow schema.
 
-    Tries a fast path via `lsdb.from_dataframe(..., schema=...)` for small
-    catalogs, providing an explicit pyarrow Schema to avoid meta drift
-    (e.g., `null[pyarrow]` vs `string[pyarrow]`). On any error, falls back to
-    the distributed HATS import (`pipeline_with_client`) with robust shuffle.
+    Reads a small sample from the first Parquet found under `parquet_path`
+    (supports optional `base/`) to infer pandas dtypes, builds a robust
+    Arrow schema via `_build_arrow_schema_for_catalog(...)`, and writes an
+    **empty** Parquet file with that schema at `schema_out_path`.
 
     Args:
-        path: Directory produced by `_save_parquet` (or any folder with parquet).
-        ra_col: RA column name.
-        dec_col: DEC column name.
-        artifact_name: Output HATS artifact name (folder).
-        output_path: Destination root directory.
-        logs_dir: Logs directory (informational).
-        logger: Logger instance.
-        client: Dask client (required for the distributed fallback).
-        size_threshold_mb: Upper bound to try the fast path.
-        schema_hints: Optional raw schema hints for expr columns; if provided,
-            they will be normalized and enforced in the Arrow schema builder.
-            Example: {"snr": "float", "flag_text": "str"}.
+        parquet_path: Directory with prepared Parquet files (flat or `base/`).
+        schema_out_path: Destination file path for the schema-only Parquet.
+        logger: Logger for progress/warnings.
+        schema_hints: Optional hints for expression columns ({col: 'int'|'float'|'str'|'bool'}).
+
+    Returns:
+        str: Absolute path to the written schema Parquet file.
+
+    Raises:
+        ValueError: If no Parquet files are found.
     """
-    # Discover parquet files (supports optional 'base/' subdir)
-    base_path = os.path.join(path, "base")
-    parquet_files = glob.glob(os.path.join(base_path, "*.parquet")) if os.path.exists(base_path) \
-        else glob.glob(os.path.join(path, "*.parquet"))
-    if not parquet_files:
-        raise ValueError(f"No Parquet files found at {path}")
+    # discover parquet files
+    base_path = os.path.join(parquet_path, "base")
+    pattern = os.path.join(base_path, "*.parquet") if os.path.exists(base_path) \
+        else os.path.join(parquet_path, "*.parquet")
+    files = glob.glob(pattern)
+    files.sort()
+    if not files:
+        raise ValueError(f"No Parquet files found at '{parquet_path}' to infer schema")
 
-    total_size_mb = sum(os.path.getsize(f) for f in parquet_files) / 1024**2
-    hats_path = os.path.join(output_path, artifact_name)
+    # read a small sample to get pandas dtypes (enough to drive the schema builder)
+    # We read the first file entirely; it's fine for metadata-scale.
+    sample_df = pd.read_parquet(files[0])
+    sample_df = _rename_duplicate_columns_pd(sample_df, logger)
 
-    # Normalize hints here (keeps function self-contained)
-    schema_hints_norm = _normalize_schema_hints(schema_hints or {})
+    # build the Arrow schema
+    schema = _build_arrow_schema_for_catalog(sample_df, schema_hints=schema_hints or {})
 
-    # ---- FAST PATH (small datasets): pandas -> LSDB.from_dataframe with explicit schema
+    # ensure parent exists and write an EMPTY table with this schema
+    os.makedirs(os.path.dirname(schema_out_path), exist_ok=True)
+    empty_tbl = pa.Table.from_arrays(
+        [pa.array([], type=f.type) for f in schema],
+        names=[f.name for f in schema],
+    )
+    import pyarrow.parquet as pq
+    pq.write_table(empty_tbl, schema_out_path)
+
+    logger.info(f"🧩 Wrote schema file for collection: {schema_out_path}")
+    return schema_out_path
+    
+
+def _build_collection_with_retry(
+    parquet_path: str,
+    logs_dir: str,
+    logger: logging.Logger,
+    client,
+    try_margin: bool = True,
+    *,
+    schema_hints: dict | None = None,
+    size_threshold_mb: int = 200,
+) -> str:
+    """
+    Build a Collection from a Parquet folder.
+
+    Naming rule (requested):
+      - If `parquet_path` is ".../merged_stepX", the output collection is
+        ".../merged_stepX_hats".
+
+    Fast-path: pandas -> lsdb.from_dataframe(...).to_hats(destination)
+    Fallback: hats import pipeline (with/without margin), using the same destination.
+    """
+    # 0) Normalize paths and derive artifact naming from `parquet_path`
+    parquet_path = os.path.normpath(parquet_path)
+    parent_dir = os.path.dirname(parquet_path) or "."
+    base_name = os.path.basename(parquet_path)
+    output_artifact_name = f"{base_name}_hats"
+    collection_path = os.path.join(parent_dir, output_artifact_name)
+
+    # 1) Discover parquet files (accepts <parquet>/base/*.parquet or <parquet>/*.parquet)
+    base_path = os.path.join(parquet_path, "base")
+    pattern = os.path.join(base_path, "*.parquet") if os.path.exists(base_path) \
+        else os.path.join(parquet_path, "*.parquet")
+    in_file_paths = glob.glob(pattern)
+    in_file_paths.sort()
+    if not in_file_paths:
+        raise ValueError(f"No Parquet files found at '{parquet_path}'")
+
+    # 2) FAST PATH
+    try:
+        total_size_mb = sum(os.path.getsize(f) for f in in_file_paths) / 1024**2
+    except Exception:
+        total_size_mb = float("inf")
+
     if total_size_mb <= size_threshold_mb:
         try:
-            logger.info(f"⚡ Small catalog detected ({total_size_mb:.1f} MB). Trying fast `from_dataframe` with schema.")
-            # Load to pandas (Arrow-backed dtypes if available)
-            dfp = pd.read_parquet(parquet_files)
+            logger.info(
+                "⚡ Small catalog detected (%.1f MB). Building COLLECTION via fast path → %s",
+                total_size_mb, collection_path
+            )
+            # Load to pandas
+            pdf_list = [pd.read_parquet(p) for p in in_file_paths]
+            dfp = pd.concat(pdf_list, ignore_index=True) if len(pdf_list) > 1 else pdf_list[0]
 
+            # Ensure stable column names and dtypes
             dfp = _rename_duplicate_columns_pd(dfp, logger)
 
-            # Enforce canonical dtypes on critical columns before building schema
-            # (this ensures consistency even if a later pixel slice is all-NA)
             for col, pd_dtype in [
                 ("CRD_ID", DTYPE_STR),
                 ("id", DTYPE_STR),
@@ -1838,212 +1598,150 @@ def import_catalog(
                 ("z_flag_homogenized", DTYPE_FLOAT),
                 ("tie_result", DTYPE_INT8),
                 ("is_in_DP1_fields", DTYPE_INT),
+                ("compared_to", DTYPE_STR),
             ]:
                 if col in dfp.columns:
                     try:
                         dfp[col] = dfp[col].astype(pd_dtype)
                     except Exception:
-                        # If cast fails (e.g., values out of range), leave as-is; schema will still force Arrow type
                         pass
 
-            # Force _prev* columns to string (historical columns)
             for c in map(str, dfp.columns):
                 if c.startswith("CRD_ID_prev") or c.startswith("compared_to_prev"):
                     try:
                         dfp[c] = dfp[c].astype(DTYPE_STR)
                     except Exception:
-                        pass  # Schema will still force to string
+                        pass
 
-            # Build an explicit Arrow schema from the *current* dfp columns
-            schema = _build_arrow_schema_for_catalog(dfp, schema_hints=schema_hints_norm)
+            # Build robust Arrow schema
+            schema = _build_arrow_schema_for_catalog(
+                dfp, schema_hints=_normalize_schema_hints(schema_hints or {})
+            )
 
-            # Create LSDB Catalog with explicit schema and write to HATS
+            # Create in-memory catalog and write to the *final path* "<parquet_path>_hats"
             catalog = lsdb.from_dataframe(
                 dfp,
-                catalog_name=artifact_name,
-                ra_column=ra_col,
-                dec_column=dec_col,
+                catalog_name=output_artifact_name,  # only metadata; path is controlled by to_hats below
+                ra_column="ra",
+                dec_column="dec",
                 use_pyarrow_types=True,
                 schema=schema,
             )
-            catalog.to_hats(hats_path, overwrite=True)
-            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: import_catalog id={artifact_name} (fast path)")
-            return
+            catalog.to_hats(                       # write directly to the destination folder
+                collection_path,
+                as_collection=True,
+                overwrite=True,
+            )
+
+            logger.info(
+                "%s: Finished: COLLECTION fast-path path=%s",
+                datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
+                collection_path,
+            )
+            return collection_path
+
         except Exception as e:
-            # Fall back to distributed pipeline if any meta/schema drift occurs
-            logger.warning(f"⚠️ Fast path failed for {artifact_name} ({type(e).__name__}: {e}). Falling back to distributed import.")
+            logger.warning(
+                "⚠️ COLLECTION fast-path failed for %s (%s: %s). Falling back to hats_import.",
+                output_artifact_name, type(e).__name__, e
+            )
 
-    # ---- DISTRIBUTED FALLBACK: hats-import pipeline (robust)
-    if client is None:
-        raise ValueError("❌ Dask client is required to import catalog into HATS (distributed fallback).")
-
-    logger.info("🧱 Using distributed HATS import (pipeline_with_client).")
-    file_reader = ParquetReader()
-    args = ImportArguments(
-        ra_column=ra_col,
-        dec_column=dec_col,
-        input_file_list=parquet_files,
-        file_reader=file_reader,
-        output_artifact_name=artifact_name,
-        output_path=output_path,
-    )
-
-    # Use a robust shuffle for HPC environments (avoid p2p here)
-    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-        pipeline_with_client(args, client)
-
-    logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: import_catalog id={artifact_name} (distributed)")
-
-
-def generate_margin_cache_safe(
-    hats_path: str,
-    output_path: str,
-    artifact_name: str,
-    logs_dir: str,
-    logger: logging.Logger,
-    client,  # type: ignore[override]
-) -> str | None:
-    """Generate a margin cache for a HATS catalog when beneficial.
-
-    Behavior:
-      - If the catalog has more than one partition, runs the margin cache
-        pipeline; otherwise, logs and returns ``None``.
-      - If a previous run left a broken state (``intermediate/`` without a
-        ``margin_pair.csv``), the directory is removed and recomputed.
-      - If the HATS reader reports “no rows” for the margin, the function
-        logs and returns ``None`` instead of raising.
-
-    Args:
-        hats_path (str): Path to the HATS catalog.
-        output_path (str): Directory where the margin cache folder is written.
-        artifact_name (str): Name of the margin cache artifact (folder).
-        logs_dir (str): Directory for logs (not directly used here).
-        logger (logging.Logger): Logger for progress messages.
-        client: Dask client.
-
-    Returns:
-        str | None: Path to the margin cache folder, or ``None`` if skipped.
-
-    Raises:
-        OSError: If deletion of a corrupted margin directory fails.
-        ValueError: Re-raised for unexpected errors during HATS reading.
-    """
-    margin_dir = os.path.join(output_path, artifact_name)
-    intermediate_dir = os.path.join(margin_dir, "intermediate")
-    critical_file = os.path.join(intermediate_dir, "margin_pair.csv")
-
-    # Clean up broken resumption state if detected.
-    if os.path.exists(intermediate_dir) and not os.path.exists(critical_file):
-        logger.info(f"⚠️ Detected incomplete margin cache at {margin_dir}. Deleting to force regeneration...")
+    # 3) FALLBACK: hats_import (margin → no-margin)
+    def _clean_partial():
         try:
-            shutil.rmtree(margin_dir)
+            if os.path.isdir(collection_path):
+                shutil.rmtree(collection_path)
         except Exception as e:
-            logger.info(f"❌ Failed to delete corrupted margin cache at {margin_dir}: {e}")
-            raise
+            logger.warning("Failed to remove partial '%s': %s", collection_path, e)
+
+    # Prepare a schema-only Parquet to stabilize Arrow types for the importer
+    schema_file = os.path.join(parent_dir, f"{output_artifact_name}_schema.parquet")
+    try:
+        _write_schema_file_for_collection(
+            parquet_path=parquet_path,
+            schema_out_path=schema_file,
+            logger=logger,
+            schema_hints=_normalize_schema_hints(schema_hints or {}),
+        )
+    except Exception as e:
+        logger.warning(
+            "⚠️ Could not build schema file for fallback import (%s: %s). Proceeding without it.",
+            type(e).__name__, e
+        )
+        schema_file = None
+
+    def _make_args(with_margin: bool):
+        kw = dict(
+            input_file_list=in_file_paths,
+            file_reader="parquet",
+            ra_column="ra",
+            dec_column="dec",
+        )
+        if schema_file:
+            kw["use_schema_file"] = schema_file
+
+        # IMPORTANT: output_path = parent_dir, output_artifact_name = "<basename>_hats"
+        args = (
+            CollectionArguments(
+                output_artifact_name=output_artifact_name,
+                output_path=parent_dir,
+                resume=False,
+            ).catalog(**kw)
+        )
+        if with_margin:
+            args = args.add_margin(margin_threshold=5.0, is_default=True)
+        return args
+
+    if try_margin:
+        try:
+            logger.info("Building collection %s WITH margin (import pipeline)...", output_artifact_name)
+            run_collection_import(_make_args(with_margin=True), client)
+            return collection_path
+        except Exception as e:
+            logger.warning("WITH margin failed: %s. Retrying without margin...", e)
+            _clean_partial()
 
     try:
-        catalog = hats.read_hats(hats_path)
-        info = catalog.partition_info.as_dataframe().astype(int)
-        if len(info) > 1:
-            args = MarginCacheArguments(
-                input_catalog_path=hats_path,
-                output_path=output_path,
-                margin_threshold=1.0,
-                output_artifact_name=artifact_name,
-            )
-            pipeline_with_client(args, client)
-            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: generate_margin_cache id={artifact_name}")
-            return margin_dir
-        else:
-            logger.info(f"⚠️ Margin cache skipped: single partition for {artifact_name}")
-            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: generate_margin_cache id={artifact_name}")
-            return None
-    except ValueError as e:
-        if "Margin cache contains no rows" in str(e):
-            logger.info(f"⚠️ {e} Proceeding without margin cache.")
-            logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: generate_margin_cache id={artifact_name}")
-            return None
-        else:
-            raise
+        logger.info("Building collection %s WITHOUT margin (import pipeline)...", output_artifact_name)
+        run_collection_import(_make_args(with_margin=False), client)
+        return collection_path
+    except Exception as e:
+        _clean_partial()
+        raise RuntimeError(f"Failed to build collection '{output_artifact_name}': {e}")
 
 
-def _maybe_hats_and_margin(
+def _maybe_collection(
     out_path: str,
-    product_name: str,
     logs_dir: str,
-    temp_dir: str,
     logger: logging.Logger,
-    client,  # type: ignore[override]
+    client,
     combine_mode: str,
+    *,
     schema_hints: dict | None = None,
-) -> tuple[str, str]:
-    """Optionally build HATS and margin cache artifacts depending on mode.
+    size_threshold_mb: int = 200,
+) -> str:
+    """Optionally build a Collection from prepared Parquet.
 
-    If ``combine_mode != "concatenate"``, this function:
-      1) Parses the numeric prefix from ``product_name`` to name artifacts.
-      2) Imports the prepared Parquet into HATS (``cat{prefix}_hats``).
-      3) Runs the margin cache pipeline (``cat{prefix}_margin``) if beneficial.
-
-    Args:
-        out_path: Path returned by :func:`_save_parquet`.
-        product_name: Product internal name (must start with digits + underscore).
-        logs_dir: Directory for logs (not directly used here).
-        temp_dir: Directory for output artifacts.
-        logger: Logger.
-        client: Dask client.
-        combine_mode: One of
-            ``"concatenate"``,
-            ``"concatenate_and_mark_duplicates"``,
-            ``"concatenate_and_remove_duplicates"``.
-        schema_hints: Optional raw schema hints for expression columns
-            (e.g., {"snr": "float", "flag_text": "str"}). Normalized inside
-            :func:`import_catalog`.
-
-    Returns:
-        tuple[str, str]: ``(hats_path, margin_cache_path)``. Note that the
-        margin path is returned even if the cache was skipped; callers should
-        check existence if they need to read from it.
-
-    Raises:
-        ValueError: If ``product_name`` lacks a numeric prefix or if ``client``
-            is missing when ``combine_mode`` requires HATS/margin generation.
+    Behavior:
+      - If combine_mode == "concatenate": return "" (no collection).
+      - Else: call _build_collection_with_retry(out_path, ...) which will write the
+        collection alongside the parquet as "<out_path>_hats" and return that path.
     """
-    hats_path, margin_cache_path = "", ""
-    if combine_mode != "concatenate":
-        if client is None:
-            raise ValueError(
-                f"❌ Dask client is required for combine_mode='{combine_mode}' "
-                f"(needed to run import_catalog and generate_margin_cache)."
-            )
-        m = re.match(r"(\d+)_", product_name)
-        if not m:
-            raise ValueError(f"❌ Could not extract numeric prefix from internal_name '{product_name}'")
-        prefix = m.group(1)
-        art_hats, art_margin = f"cat{prefix}_hats", f"cat{prefix}_margin"
+    # Silence linters about unused parameters kept for compatibility.
+    _ = (product_name, temp_dir)
 
-        import_catalog(
-            out_path,
-            "ra",
-            "dec",
-            art_hats,
-            temp_dir,
-            logs_dir,
-            logger,
-            client,
-            schema_hints=schema_hints,  # repassa hints
-        )
-        generate_margin_cache_safe(
-            os.path.join(temp_dir, art_hats),
-            temp_dir,
-            art_margin,
-            logs_dir,
-            logger,
-            client,
-        )
+    if combine_mode == "concatenate":
+        return ""
 
-        hats_path = os.path.join(temp_dir, art_hats)
-        margin_cache_path = os.path.join(temp_dir, art_margin)
-    return hats_path, margin_cache_path
+    return _build_collection_with_retry(
+        parquet_path=out_path,
+        logs_dir=logs_dir,
+        logger=logger,
+        client=client,
+        try_margin=True,
+        schema_hints=schema_hints,
+        size_threshold_mb=size_threshold_mb,
+    )
 
 
 # =======================
@@ -2055,52 +1753,27 @@ def prepare_catalog(
     logs_dir: str,
     temp_dir: str,
     combine_mode: str = "concatenate_and_mark_duplicates",
-) -> tuple[str, str, str, str, str, str]:
+) -> tuple[str, str, str, str, str]:
     """Prepare a spectroscopic catalog for the CRC pipeline.
 
     High-level flow:
-      1) Load product via :class:`ProductHandle` → Dask DataFrame.
+      1) Load product via ProductHandle → Dask DataFrame.
       2) YAML validation & safe renaming (base schema enforced).
       3) Respect user-provided homogenized fields if mapped in YAML.
       4) Normalize dtypes/values; map survey-specific z_flag encodings.
-      5) Generate stable ``CRD_ID`` and initialize ``tie_result=1``.
-      6) Compute homogenized columns.
-      7) **Persist + repartition** to stabilize memory and improve shuffle throughput.
-      8) Apply tie-breaking (if enabled), collecting duplicate edges.
+      5) Generate stable CRD_IDs.
+      6) Compute homogenized columns (no decisions taken here).
+      7) Persist + repartition to stabilize memory and shuffle throughput.
+      8) Initialize an empty 'compared_to' column (skip intra-catalog association).
       9) Strict RA/DEC validation and DP1 field flagging.
-      10) Select final columns and write prepared Parquet (coalesced partitions).
-      11) Optionally build HATS + margin cache artifacts.
+      10) Select final columns and write Parquet.
+      11) Optionally build a HATS Collection (with margin fallback).
 
-    Performance notes:
-      * Persisting after homogenization pins the cleaned dataframe in worker
-        memory and avoids re-reading from storage during the upcoming shuffle.
-      * Repartitioning to medium-large partitions (~256MB) balances throughput
-        and memory pressure for your workers (25 cores, 50GB).
-
-    Args:
-        entry: YAML node for the product. Required keys:
-            - ``internal_name`` (str)
-            - ``path`` (str or structured path for ProductHandle)
-            - ``columns`` (mapping of standard->source; nulls allowed)
-        translation_config: Configuration with translation rules and tie-breaking
-            settings (e.g., ``tiebreaking_priority``, ``instrument_type_priority``,
-            ``delta_z_threshold``, optional ``save_expr_columns`` and
-            ``expr_column_schema``).
-        logs_dir: Directory for log files.
-        temp_dir: Directory for temporary and output artifacts.
-        combine_mode: One of
-            ``"concatenate"``,
-            ``"concatenate_and_mark_duplicates"``,
-            ``"concatenate_and_remove_duplicates"``.
-
-    Returns:
-        (hats_path, ra_col, dec_col, product_name, margin_cache_path, compared_to_path)
-
-    Raises:
-        ValueError: On malformed YAML mapping, missing required columns, invalid
-            tie-breaking configuration, or invalid coordinates.
+    Note:
+      - No tie-breaking (neither by columns nor Δz) happens in this module.
+        Actual deduplication is performed later by the 'deduplication' module.
     """
-    from dask.distributed import get_client as _get_client, wait  # local import
+    from dask.distributed import get_client as _get_client, wait
 
     client = _get_client()
 
@@ -2122,17 +1795,16 @@ def prepare_catalog(
     # 4) Normalize dtypes/values (strings, floats, optional `type`, and z_flag mapping).
     df, type_cast_ok = _normalize_types(df, product_name, logger)
 
-    # 5) Assign CRD_IDs and init tie bookkeeping.
-    df, compared_to_path = _generate_crd_ids(df, product_name, temp_dir)
-    compared_to_dict_solo: dict[str, set[str]] = defaultdict(set)
+    # 5) Assign CRD_IDs
+    df = _generate_crd_ids(df, product_name, temp_dir)
 
     # 6) Compute homogenized fields (vectorized translations / fast-paths).
     df, used_type_fastpath, tiebreaking_priority, instrument_type_priority, translation_rules_uc = _homogenize(
         df, translation_config, product_name, logger, type_cast_ok=type_cast_ok
     )
 
-    # 7) Persist + repartition BEFORE the tie-breaking shuffle.
-    part_size = "256MB"  # hardcoded: good default for 25 cores / 50GB workers
+    # 7) Persist + repartition BEFORE heavy shuffles.
+    part_size = "256MB"  # good default for ~25 cores / 50 GB workers
     try:
         df = df.persist(); wait(df)
         with dask.config.set({"dataframe.shuffle.method": "tasks"}):
@@ -2142,21 +1814,15 @@ def prepare_catalog(
     except Exception as e:
         logger.warning(f"⚠️ {product_name} persist/repartition step failed or was skipped: {e}")
 
-    # 8) Resolve duplicates and collect pair links (if requested).
-    if combine_mode in ["concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"]:
-        df = _apply_tiebreaking_and_collect(
-            df,
-            translation_config,
-            tiebreaking_priority,
-            instrument_type_priority,
-            compared_to_dict_solo,
-            product_name,
-            logger,
-        )
+    # 8) Add empty compared_to column
+    df = _add_missing_with_dtype(df, "compared_to", DTYPE_STR)
 
-    # Persist the local `compared_to` graph even if empty (diagnostics/repro).
-    with open(compared_to_path, "w") as f:
-        json.dump({k: sorted(v) for k, v in compared_to_dict_solo.items()}, f)
+    # Ensure 'tie_result' exists and is stable-typed; no decisions are taken here.
+    df = _add_missing_with_dtype(df, "tie_result", DTYPE_INT8)
+    df["tie_result"] = df["tie_result"].map_partitions(
+        lambda s: pd.to_numeric(s, errors="coerce").fillna(1).astype(DTYPE_INT8),
+        meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
+    )
 
     # 9) Validate geometry early to fail fast on malformed inputs.
     _validate_ra_dec_or_fail(df, product_name)
@@ -2174,7 +1840,7 @@ def prepare_catalog(
         schema_hints=_normalize_schema_hints(translation_config.get("expr_column_schema")),
     )
 
-    # Coalesce partitions before writing to reduce small-file counts and speed up HATS import.
+    # Coalesce partitions before writing to reduce small-file counts and speed up import.
     try:
         nworkers = len(client.scheduler_info()["workers"]) or 1
     except Exception:
@@ -2188,21 +1854,22 @@ def prepare_catalog(
         logger.warning(f"⚠️ {product_name} output repartition failed; writing with current npartitions. Reason: {e}")
         df_to_write = df
 
-    # 12) Write prepared parquet.
+    # 12) Write prepared parquet..
     out_path = _save_parquet(df_to_write, temp_dir, product_name)
 
-    # 13) Optionally produce HATS + margin artifacts.
+    # 13) Build Collection (always). The builder writes to "<out_path>_hats"
+    # and returns that absolute path. It contains its own fast-path/fallback.
     schema_hints_raw = translation_config.get("expr_column_schema")
-    hats_path, margin_cache_path = _maybe_hats_and_margin(
-        out_path,
-        product_name,
-        logs_dir,
-        temp_dir,
-        logger,
-        client,
-        combine_mode,
+
+    collection_path = _build_collection_with_retry(
+        parquet_path=out_path,
+        logs_dir=logs_dir,
+        logger=logger,
+        client=client,
+        try_margin=True,
         schema_hints=schema_hints_raw,
+        size_threshold_mb=200,
     )
 
     logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: prepare_catalog id={product_name}")
-    return hats_path, "ra", "dec", product_name, margin_cache_path, compared_to_path
+    return collection_path, "ra", "dec", product_name, ""
