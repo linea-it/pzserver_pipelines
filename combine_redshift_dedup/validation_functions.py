@@ -285,7 +285,6 @@ we show up to **{samples_per_source}** cells (the largest ones) and list their o
                 "z_flag_homogenized",
                 "instrument_type_homogenized",  # preferred
                 "type_homogenized",             # fallback, if it exists
-                "tie_result",
                 "compared_to",
             ]
             cols_present = [c for c in col_candidates if c in df_base.columns]

@@ -1,32 +1,27 @@
 from __future__ import annotations
 """
-Crossmatch and `compared_to` updater for Combine Redshift Catalogs (CRC).
+Crossmatch and `compared_to` updater for CRC.
 
-This module performs a spatial crossmatch between two catalogs **without any
-tie-breaking or Δz logic**. It updates the `compared_to` column on both inputs
-by adding newly crossmatched CRD_IDs (comma-separated, symmetric neighbors),
-writes a merged Parquet, and (optionally) imports it as an LSDB **Collection**
-(using `_build_collection_with_retry`, which tries a fast path and falls back
-to the hats-import pipeline with margin-first retry).
+Performs a spatial crossmatch between two catalogs (no tie-breaking / Δz),
+updates `compared_to` symmetrically on both inputs, writes a merged Parquet,
+and optionally imports it as an LSDB Collection (margin-first retry).
 
 Public API:
-    - crossmatch_tiebreak(...)       # name kept for compatibility; no tie-breaking is done
-    - crossmatch_tiebreak_safe(...)  # safe wrapper that concatenates on known empty-overlap errors
+    - crossmatch_tiebreak(...)
+    - crossmatch_tiebreak_safe(...)
 """
 
 # -----------------------
 # Standard library
 # -----------------------
-import logging
 import os
-import pathlib
-from datetime import datetime
-from typing import TYPE_CHECKING, Dict, Iterable, List, Set, Optional
+import time
+import logging
+from typing import Dict, Iterable, List, Set
 
 # -----------------------
 # Third-party
 # -----------------------
-import dask
 import dask.dataframe as dd
 import numpy as np
 import pandas as pd
@@ -41,55 +36,107 @@ from combine_redshift_dedup.packages.specz import (
     _add_missing_with_dtype,
     DTYPE_STR, DTYPE_FLOAT, DTYPE_INT, DTYPE_BOOL, DTYPE_INT8,
 )
+from combine_redshift_dedup.packages.utils import get_phase_logger
 
-if TYPE_CHECKING:
-    # from dask.distributed import Client
-    pass
-
-# -----------------------
-# Module exports & constants
-# -----------------------
 __all__ = ["crossmatch_tiebreak", "crossmatch_tiebreak_safe"]
 
-LOGGER_NAME = "crossmatch_and_merge_logger"
-LOG_FILE = "crossmatch_and_merge_all.log"
+LOGGER_NAME = "crc.crossmatch"  # child of the pipeline root logger ("crc")
 
 
 # -----------------------
-# Logging utilities
+# Centralized logging
 # -----------------------
-def _build_logger(logs_dir: str, name: str, file_name: str) -> logging.Logger:
-    """Create and configure a file-based logger (single FileHandler, INFO)."""
-    log_dir = pathlib.Path(logs_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
+def _get_logger() -> logging.LoggerAdapter:
+    """Return a phase-aware logger ('crc.crossmatch' with phase='crossmatch')."""
+    base = logging.getLogger(LOGGER_NAME)
+    base.propagate = True
+    return get_phase_logger("crossmatch", base)
 
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    if logger.hasHandlers():
-        logger.handlers.clear()
 
-    fh = logging.FileHandler(log_dir / file_name, encoding="utf-8", delay=True)
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
-    logger.addHandler(fh)
-    return logger
+# -----------------------
+# Type utilities
+# -----------------------
+def _coerce_optional_columns_for_import(
+    df: dd.DataFrame,
+    schema_hints: dict | None = None,
+) -> dd.DataFrame:
+    """Coerce prev/expr columns to consistent Arrow dtypes across partitions.
 
+    Args:
+        df: Merged Dask dataframe.
+        schema_hints: Mapping {col_name: 'str'|'float'|'int'|'bool'}.
+
+    Returns:
+        dd.DataFrame with coerced/added columns.
+    """
+    # 1) Prev columns → string
+    prev_like = [c for c in df.columns if str(c).startswith("CRD_ID_prev")]
+    prev_like += [c for c in df.columns if str(c).startswith("compared_to_prev")]
+    for c in prev_like:
+        df[c] = df[c].map_partitions(
+            _normalize_string_series_to_na,
+            meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
+        )
+
+    # 2) Expr columns guided by hints
+    hints = dict(schema_hints or {})
+    if not hints:
+        return df
+
+    for col, kind in hints.items():
+        k = str(kind).lower()
+        if col not in df.columns:
+            # create missing with target dtype (so partições vazias não viram null[pyarrow])
+            if k == "str":
+                df = _add_missing_with_dtype(df, col, DTYPE_STR)
+            elif k == "float":
+                df = _add_missing_with_dtype(df, col, DTYPE_FLOAT)
+            elif k == "int":
+                df = _add_missing_with_dtype(df, col, DTYPE_INT)
+            elif k == "bool":
+                df = _add_missing_with_dtype(df, col, DTYPE_BOOL)
+            continue
+
+        # cast existing
+        if k == "str":
+            df[col] = df[col].map_partitions(
+                _normalize_string_series_to_na,
+                meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
+            )
+        elif k == "float":
+            coerced = dd.to_numeric(df[col], errors="coerce")
+            df[col] = coerced.map_partitions(
+                lambda s: s.astype(DTYPE_FLOAT),
+                meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
+            )
+        elif k == "int":
+            coerced = dd.to_numeric(df[col], errors="coerce")
+            df[col] = coerced.map_partitions(
+                lambda s: s.astype(DTYPE_INT),
+                meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
+            )
+        elif k == "bool":
+            # conservador: apenas dtype target; upstream já deve ter saneado valores
+            df[col] = df[col].map_partitions(
+                lambda s: s.astype(DTYPE_BOOL),
+                meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
+            )
+
+    return df
 
 # -----------------------
 # Saving utilities
 # -----------------------
 def _safe_to_parquet(ddf, path, **kwargs) -> None:
-    """Write parquet robustly across dd.DataFrame and nested_dask frames.
+    """Write Parquet robustly for both plain Dask and nested_dask frames.
 
-    Attempts `engine="pyarrow"`. If the backend already injects `engine`
-    (nested_dask), retry without explicitly setting `engine`.
+    Tries engine="pyarrow"; if backend already sets an engine, retries without it.
     """
     try:
         ddf.to_parquet(path, engine="pyarrow", **kwargs)
     except TypeError as e:
         if "multiple values for keyword argument 'engine'" in str(e):
-            ddf.to_parquet(path, **kwargs)  # nested_dask path
+            ddf.to_parquet(path, **kwargs)
         else:
             raise
 
@@ -98,7 +145,15 @@ def _safe_to_parquet(ddf, path, **kwargs) -> None:
 # Internal helpers
 # -----------------------
 def _adjacency_from_pairs(left_ids: pd.Series, right_ids: pd.Series) -> Dict[str, Set[str]]:
-    """Build an undirected adjacency dict from left-right crossmatch pairs."""
+    """Build an undirected adjacency from left-right crossmatch pairs.
+
+    Args:
+        left_ids: Series of left CRD_IDs.
+        right_ids: Series of right CRD_IDs.
+
+    Returns:
+        Mapping CRD_ID -> set of neighbor CRD_IDs.
+    """
     adj: Dict[str, Set[str]] = {}
     L = left_ids.astype(str).to_numpy(dtype=object, copy=False)
     R = right_ids.astype(str).to_numpy(dtype=object, copy=False)
@@ -123,9 +178,12 @@ def _merge_compared_to_partition(
 ) -> pd.DataFrame:
     """Partition-wise update of `compared_to` by unioning existing entries with new pairs.
 
-    Defensive to odd dtypes (Arrow/Pandas NA, lists/tuples/sets, booleans).
-    NA semantics are preserved: empty neighbor set -> NA; otherwise a sorted,
-    comma-separated string. Output dtype is Arrow-backed `DTYPE_STR`.
+    Args:
+        part: Partition dataframe.
+        pairs_adj: Mapping CRD_ID -> iterable of neighbors.
+
+    Returns:
+        Partition with updated `compared_to` (Arrow string dtype), NA if empty.
     """
     p = part.copy()
 
@@ -163,15 +221,14 @@ def _merge_compared_to_partition(
             return _to_str_set(val)
         return _to_str_set([val])
 
-    # Build NEW neighbor sets (pure Python), parse OLD cells, then union per row.
+    # Build NEW neighbor sets, parse OLD cells, then union per row.
     new_sets: List[Set[str]] = [_to_str_set(pairs_adj.get(k, ())) for k in crd_list]
     old_sets: List[Set[str]] = [_parse_existing(v) for v in p["compared_to"].tolist()]
 
     merged_vals: List[object] = []
     for k, old_set, new_set in zip(crd_list, old_sets, new_sets):
         nxt = set().union(old_set, new_set)
-        if k in nxt:
-            nxt.discard(k)
+        nxt.discard(k)
         merged_vals.append(", ".join(sorted(nxt)) if nxt else pd.NA)
 
     p["compared_to"] = pd.Series(pd.array(merged_vals, dtype=DTYPE_STR), index=p.index)
@@ -187,62 +244,60 @@ def crossmatch_tiebreak(
     logs_dir: str,
     temp_dir: str,
     step,
-    client,
+    client,  # required if do_import=True
     translation_config: dict | None = None,
     do_import: bool = True,
 ):
     """Crossmatch two catalogs, update `compared_to`, and save/import the merged result.
 
     Steps:
-      1) Crossmatch `left_cat` vs. `right_cat` within `crossmatch_radius_arcsec` (default 0.75).
-      2) Build an undirected adjacency (CRD_ID ↔ CRD_ID) from pairs (no self-pairs).
-      3) Partition-wise update of `compared_to` on **both** sides by unioning neighbors.
-      4) Concatenate left/right, harmonize key dtypes, and write a merged Parquet.
-      5) If `do_import=True`:
-           - USE_COLLECTION=True: import as a **Collection** (margin-first fallback) and
-             return the collection path.
-           - USE_COLLECTION=False: import as a **HATS** catalog and return its artifact path.
-         Else, return the merged Parquet folder path.
-
-    Notes:
-      - There is no tie-breaking or Δz logic here.
-      - `tie_result` is not interpreted; it is just carried through.
+      1) Crossmatch `left_cat` vs `right_cat` (default radius 0.75 arcsec).
+      2) Build undirected adjacency (CRD_ID ↔ CRD_ID) without self-pairs.
+      3) Update `compared_to` on both sides by unioning neighbors.
+      4) Concatenate, harmonize key dtypes, and write Parquet.
+      5) Optionally import as a Collection (margin-first fallback).
 
     Returns:
-      str: Collection path (new mode), HATS path (legacy mode), or merged Parquet path if `do_import=False`.
+      Collection path (if imported) or merged Parquet folder path if `do_import=False`.
     """
-    logger = _build_logger(logs_dir, LOGGER_NAME, LOG_FILE)
+    logger = _get_logger()
+    t0_all = time.time()
     radius = float((translation_config or {}).get("crossmatch_radius_arcsec", 0.75))
 
     logger.info(
-        "%s: Starting: XMATCH_AND_UPDATE_COMPARED_TO id=merged_step%s",
-        datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
+        "START crossmatch_update_compared_to: step=%s radius=%.3f\" import=%s",
         step,
+        radius,
+        bool(do_import),
     )
 
     # 1) Spatial crossmatch
+    t0 = time.time()
     xmatched = left_cat.crossmatch(
         right_cat,
         radius_arcsec=radius,
         n_neighbors=10,
         suffixes=("left", "right"),
     )
+    logger.info("Crossmatch done (%.2fs)", time.time() - t0)
 
     # 2) Build adjacency from CRD_ID pairs
+    t0 = time.time()
     pair_cols = ["CRD_IDleft", "CRD_IDright"]
     pairs_df = xmatched._ddf[pair_cols].compute()
     if len(pairs_df) == 0:
         pairs_adj: Dict[str, Set[str]] = {}
-        logger.info("No pairs found in crossmatch; `compared_to` remains unchanged.")
+        logger.info("No pairs found; `compared_to` remains unchanged.")
     else:
         pairs_df = pairs_df.astype({"CRD_IDleft": "string", "CRD_IDright": "string"})
         pairs_df = pairs_df[pairs_df["CRD_IDleft"] != pairs_df["CRD_IDright"]].drop_duplicates()
         pairs_adj = _adjacency_from_pairs(pairs_df["CRD_IDleft"], pairs_df["CRD_IDright"])
-
+    total_links = sum(len(v) for v in pairs_adj.values())
     logger.info(
-        "Compared_to update: %d total links across %d nodes",
-        sum(len(v) for v in pairs_adj.values()),
+        "Adjacency built: links=%d nodes=%d (%.2fs)",
+        total_links,
         len(pairs_adj),
+        time.time() - t0,
     )
 
     # 3) Ensure `compared_to` meta and update both catalogs partition-wise
@@ -254,13 +309,16 @@ def crossmatch_tiebreak(
             m["compared_to"] = pd.Series(pd.array([], dtype=DTYPE_STR))
         return m
 
+    t0 = time.time()
     left_meta = _meta_with_compared_to(left_cat._ddf._meta)
     right_meta = _meta_with_compared_to(right_cat._ddf._meta)
 
     left_updated = left_cat.map_partitions(_merge_compared_to_partition, pairs_adj, meta=left_meta)
     right_updated = right_cat.map_partitions(_merge_compared_to_partition, pairs_adj, meta=right_meta)
+    logger.info("Compared_to updated on partitions (%.2fs)", time.time() - t0)
 
     # 4) Concatenate the updated frames
+    t0 = time.time()
     merged = dd.concat([left_updated._ddf, right_updated._ddf])
 
     # 5) Normalize expected dtypes (focus on compared_to; keep others if present)
@@ -289,22 +347,22 @@ def crossmatch_tiebreak(
                     _normalize_string_series_to_na,
                     meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
                 )
-            elif dtype in (DTYPE_FLOAT,):
+            elif dtype is DTYPE_FLOAT:
                 merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
                     lambda s: s.astype(DTYPE_FLOAT),
                     meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
                 )
-            elif dtype in (DTYPE_INT8,):
+            elif dtype is DTYPE_INT8:
                 merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
                     lambda s: s.astype(DTYPE_INT8),
                     meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
                 )
-            elif dtype in (DTYPE_INT,):
+            elif dtype is DTYPE_INT:
                 merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
                     lambda s: s.astype(DTYPE_INT),
                     meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
                 )
-            elif dtype == DTYPE_BOOL:
+            elif dtype is DTYPE_BOOL:
                 merged[col] = merged[col].map_partitions(
                     lambda s: s.astype(DTYPE_BOOL),
                     meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
@@ -312,41 +370,51 @@ def crossmatch_tiebreak(
         except Exception as e:
             logger.warning("Failed to cast column '%s' to %s: %s", col, dtype, e)
 
+    # 5b) Coerce prev/expr columns to stable Arrow dtypes across partitions
+    schema_hints_local = (translation_config or {}).get("expr_column_schema", {}) or {}
+    merged = _coerce_optional_columns_for_import(merged, schema_hints_local)
+
+    logger.info("Type normalization complete (%.2fs)", time.time() - t0)
+
     # 6) Save merged parquet
+    t0 = time.time()
     merged_path = os.path.join(temp_dir, f"merged_step{step}")
     _safe_to_parquet(merged, merged_path, write_index=False)
+    logger.info("Parquet written: path=%s (%.2fs)", merged_path, time.time() - t0)
 
-    # 7) Optional import (Collection only)
+    # 7) Optional import (Collection)
     if do_import:
-        logger.info(
-            "%s: Starting: COLLECTION_IMPORT id=merged_step%s",
-            datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
-            step,
-        )
+        t0 = time.time()
+        logger.info("START import_collection: step=%s parquet=%s", step, merged_path)
         schema_hints = (translation_config or {}).get("expr_column_schema")
 
-        # New builder: derives "<merged_path>_hats" and writes there
         collection_path = _build_collection_with_retry(
             parquet_path=merged_path,
-            logs_dir=logs_dir,
+            logs_dir=logs_dir,         # interface symmetry; central logger is used
             logger=logger,
             client=client,
             try_margin=True,
             schema_hints=schema_hints,
         )
+        logger.info("END import_collection: step=%s path=%s (%.2fs)", step, collection_path, time.time() - t0)
         logger.info(
-            "%s: Finished: COLLECTION_IMPORT id=merged_step%s path=%s",
-            datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
+            "END crossmatch_update_compared_to: step=%s links=%d nodes=%d output=%s (%.2fs)",
             step,
+            total_links,
+            len(pairs_adj),
             collection_path,
-        )
-        logger.info(
-            "%s: Finished: xmatch_update_compared_to id=merged_step%s",
-            datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
-            step,
+            time.time() - t0_all,
         )
         return collection_path
 
+    logger.info(
+        "END crossmatch_update_compared_to: step=%s links=%d nodes=%d output=%s (%.2fs)",
+        step,
+        total_links,
+        len(pairs_adj),
+        merged_path,
+        time.time() - t0_all,
+    )
     return merged_path
 
 
@@ -356,27 +424,22 @@ def crossmatch_tiebreak_safe(
     logs_dir: str,
     temp_dir: str,
     step,
-    client,                        # required if do_import=True
+    client,  # required if do_import=True
     translation_config: dict | None = None,
     do_import: bool = True,
 ):
-    """Wrapper around `crossmatch_tiebreak` with graceful fallback.
+    """Wrapper around `crossmatch_tiebreak` with graceful empty-overlap fallback.
 
-    If crossmatch raises a known "no overlap / empty result" error, this wrapper:
-      - concatenates inputs (no new `compared_to` links),
-      - writes merged Parquet,
-      - optionally imports as Collection (new mode) or HATS (legacy mode),
-      - and returns the corresponding path.
+    If the crossmatch yields a known empty-overlap condition, concatenates inputs
+    (no new `compared_to` links), writes the merged Parquet, optionally imports
+    as a Collection, and returns the path.
     """
-    logger = _build_logger(logs_dir, LOGGER_NAME, LOG_FILE)
-    logger.info(
-        "%s: Starting: xmatch_update_compared_to (safe) id=merged_step%s",
-        datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
-        step,
-    )
+    logger = _get_logger()
+    t0_safe = time.time()
+    logger.info("START xmatch_update_compared_to_safe: step=%s import=%s", step, bool(do_import))
 
     try:
-        return crossmatch_tiebreak(
+        out = crossmatch_tiebreak(
             left_cat=left_cat,
             right_cat=right_cat,
             logs_dir=logs_dir,
@@ -386,12 +449,13 @@ def crossmatch_tiebreak_safe(
             translation_config=translation_config,
             do_import=do_import,
         )
+        logger.info("END xmatch_update_compared_to_safe: step=%s output=%s (%.2fs)", step, out, time.time() - t0_safe)
+        return out
 
     except RuntimeError as e:
-        # Known conditions: non-overlapping catalogs / empty crossmatch
         msg = str(e)
         if ("The output catalog is empty" in msg) or ("Catalogs do not overlap" in msg):
-            logger.info("%s Proceeding by merging left and right without crossmatching.", msg)
+            logger.info("Empty-overlap condition detected: %s", msg)
 
             # Ensure `compared_to` exists with Arrow string dtype on both sides
             lddf = left_cat._ddf
@@ -401,18 +465,16 @@ def crossmatch_tiebreak_safe(
             if "compared_to" not in rddf.columns:
                 rddf = _add_missing_with_dtype(rddf, "compared_to", DTYPE_STR)
 
-            merged = dd.concat([lddf, rddf])
-
             # Save merged result
+            t0 = time.time()
+            merged = dd.concat([lddf, rddf])
             merged_path = os.path.join(temp_dir, f"merged_step{step}")
             _safe_to_parquet(merged, merged_path, write_index=False)
+            logger.info("Parquet written (safe path): %s (%.2fs)", merged_path, time.time() - t0)
 
             if do_import:
-                logger.info(
-                    "%s: Starting: COLLECTION_IMPORT (safe) id=merged_step%s",
-                    datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
-                    step,
-                )
+                t0 = time.time()
+                logger.info("START import_collection_safe: step=%s parquet=%s", step, merged_path)
                 schema_hints = (translation_config or {}).get("expr_column_schema")
 
                 collection_path = _build_collection_with_retry(
@@ -423,25 +485,25 @@ def crossmatch_tiebreak_safe(
                     try_margin=True,
                     schema_hints=schema_hints,
                 )
-
                 logger.info(
-                    "%s: Finished: COLLECTION_IMPORT (safe) id=merged_step%s path=%s",
-                    datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
+                    "END import_collection_safe: step=%s path=%s (%.2fs)",
                     step,
                     collection_path,
+                    time.time() - t0,
                 )
                 logger.info(
-                    "%s: Finished: xmatch_update_compared_to (safe) id=merged_step%s",
-                    datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
+                    "END xmatch_update_compared_to_safe: step=%s output=%s (%.2fs)",
                     step,
+                    collection_path,
+                    time.time() - t0_safe,
                 )
                 return collection_path
 
-            # If not importing, return the parquet path
             logger.info(
-                "%s: Finished: xmatch_update_compared_to (safe) id=merged_step%s",
-                datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
+                "END xmatch_update_compared_to_safe: step=%s output=%s (%.2fs)",
                 step,
+                merged_path,
+                time.time() - t0_safe,
             )
             return merged_path
 

@@ -1,11 +1,11 @@
-# specz.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
+"""
+Combine Redshift Catalogs – catalog preparation.
 
-"""Combine Redshift Catalogs – catalog preparation.
-
-This module loads a raw spectroscopic catalog, validates/normalizes schema,
-derives standardized fields (IDs, homogenized flags, DP1 flags), optionally
-imports HATS + generates margin cache, and writes a prepared Parquet artifact.
+Loads a raw spectroscopic catalog, validates/normalizes schema, derives
+standardized fields (IDs, homogenized flags, DP1 flags), optionally imports
+HATS and generates margin cache, and writes a prepared Parquet artifact.
 
 Public API:
     - prepare_catalog(entry, translation_config, logs_dir, temp_dir, combine_mode)
@@ -34,7 +34,7 @@ import dask
 import dask.dataframe as dd
 import numpy as np
 import pandas as pd
-from dask.distributed import get_client
+from dask.distributed import get_client as _get_client, wait
 
 dask.config.set({"dataframe.shuffle.method": "tasks"})
 os.environ.setdefault("DASK_DISTRIBUTED__SHUFFLE__METHOD", "tasks")
@@ -42,20 +42,21 @@ os.environ.setdefault("DASK_DISTRIBUTED__SHUFFLE__METHOD", "tasks")
 # -----------------------
 # Project (lsdb/hats/CRC)
 # -----------------------
-import hats
+import hats  # noqa: F401
 import lsdb
 from combine_redshift_dedup.packages.product_handle import ProductHandle
+from combine_redshift_dedup.packages.utils import ensure_crc_logger
 from hats_import import CollectionArguments
 from hats_import.collection.run_import import run as run_collection_import
 
 if TYPE_CHECKING:
-    # Avoid heavy imports at runtime just for typing
     from dask.distributed import Client  # noqa: F401
 
 # -----------------------
 # Arrow-backed dtypes (pandas >= 2.x)
 # -----------------------
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 USE_ARROW_TYPES = True
 
@@ -77,7 +78,7 @@ else:
 # -----------------------
 __all__ = ["prepare_catalog"]
 
-LOGGER_NAME = "prepare_catalog_logger"
+LOGGER_NAME = "crc.specz"
 
 DP1_REGIONS = [
     (6.02, -72.08, 2.5),   # 47 Tuc
@@ -98,93 +99,48 @@ VIMOS_FLAG_TO_SCORE = {
 }
 
 # -----------------------
-# Logging utilities
+# Centralized logging
 # -----------------------
-def _build_logger(logs_dir: str, name: str, file_name: str) -> logging.Logger:
-    """Create and configure a file‐based logger for this module.
-
-    The logger writes INFO+ messages to ``<logs_dir>/<file_name>`` using a
-    timestamped single-line format. Existing handlers with the same logger
-    name are cleared to prevent duplicate outputs when the function is
-    called multiple times (e.g., in notebooks or retries).
-
-    Args:
-        logs_dir (str): Directory where the log file will be written. The
-            directory is created if it does not exist.
-        name (str): Logger name (e.g., ``LOGGER_NAME``).
-        file_name (str): Log file name (e.g., ``"prepare_all.log"``).
-
-    Returns:
-        logging.Logger: Configured logger instance with a single FileHandler.
-
-    Raises:
-        OSError: If the log directory cannot be created or the file handler
-            cannot be initialized.
-
-    Notes:
-        - ``propagate`` is disabled to avoid duplicate messages on root handlers.
-        - The file handler uses ``encoding='utf-8'`` and ``delay=True`` so the
-          file is created only on first write.
-    """
-    log_dir = pathlib.Path(logs_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False  # keep logs local to this file-based handler
-
-    # Remove previous handlers to avoid duplicates in repeated runs.
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    fh = logging.FileHandler(log_dir / file_name, encoding="utf-8", delay=True)
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
-
-    logger.addHandler(fh)
+def _get_logger() -> logging.Logger:
+    """Return a child logger that propagates to the root 'crc' logger."""
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.propagate = True
     return logger
+
+
+def _phase_logger(base_logger: logging.Logger, phase: str, product: str | None = None) -> logging.LoggerAdapter:
+    """Return a LoggerAdapter injecting phase (and product if provided)."""
+    extra = {"phase": phase}
+    if product:
+        extra["product"] = product
+    return logging.LoggerAdapter(base_logger, extra)
 
 
 # -----------------------
 # YAML mapping validation
 # -----------------------
 def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) -> dd.DataFrame:
-    """Validate column mapping from YAML and perform safe renaming.
+    """Validate YAML column mapping and apply conflict-safe renames.
 
-    This function verifies that all non-null source columns declared in the YAML
-    mapping exist in the input dataframe, suggests close matches for missing
-    sources, and then applies a *conflict-safe* rename:
-    if the target name already exists in the dataframe and differs from the
-    mapped source, the existing target is temporarily parked as
-    ``<target>__orig`` (or ``__orig1``, ``__orig2``, ...) before renaming.
-
-    It also tags the catalog ``source`` with the product internal name and
-    ensures a minimal base schema is present with pandas *nullable dtypes*.
+    Verifies existence of non-null source columns, suggests close matches,
+    and safely parks conflicting targets as ``<target>__origN`` before renaming.
 
     Args:
-        df (dd.DataFrame): Input Dask DataFrame read from the product handle.
-        entry (dict): YAML entry for the product. Must include:
-            - ``internal_name`` (str)
-            - ``columns`` (mapping of standard->source; null/''/'null' ignored)
-        logger (logging.Logger): Module logger.
+        df: Input Dask DataFrame.
+        entry: YAML entry with ``internal_name`` and ``columns`` mapping.
+        logger: Logger.
 
     Returns:
         dd.DataFrame: DataFrame with validated/renamed columns and base schema.
 
     Raises:
-        ValueError: If any required source column is missing, with suggestions.
-
-    Notes:
-        - Only non-null mappings are enforced; null/empty entries are ignored.
-        - The rename map is built as {source -> standard}.
-        - Base schema ensures downstream stability when certain fields are absent.
+        ValueError: If required source columns are missing.
     """
     product_name = entry["internal_name"]
     columns_cfg = (entry.get("columns") or {})
     non_null_map = {std: src for std, src in columns_cfg.items() if src not in (None, "", "null")}
     input_cols = list(map(str, df.columns))
 
-    # Check that all declared sources exist in the input
     missing_sources = [src for src in non_null_map.values() if src not in input_cols]
     if missing_sources:
         suggestions = {src: difflib.get_close_matches(src, input_cols, n=3, cutoff=0.6) for src in missing_sources}
@@ -195,8 +151,7 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
             f"Available columns (sample): {sorted(input_cols)[:30]} ..."
         )
 
-    # Resolve rename target collisions proactively:
-    # if a target already exists (and differs from its source), park it aside.
+    # Resolve collisions: if target exists and differs from its source, park it aside.
     for std, src in non_null_map.items():
         tgt = std
         if src != tgt and tgt in df.columns:
@@ -208,22 +163,20 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
                 parked = f"{base}{i}"
                 i += 1
             logger.info(
-                f"{product_name} Resolving rename collision: target '{tgt}' already exists; "
-                f"renaming existing '{tgt}' → '{parked}' so '{src}' can become '{tgt}'."
+                f"{product_name} Resolve rename collision: '{tgt}' already exists; "
+                f"'{tgt}' → '{parked}' before mapping '{src}'→'{tgt}'"
             )
             df = df.rename(columns={tgt: parked})
 
-    # Apply the YAML rename: source -> standard
     col_map = {src: std for std, src in non_null_map.items()}
     if col_map:
-        logger.info(f"{product_name} rename map OK (up to 6): {list(col_map.items())[:6]}")
+        logger.info(f"{product_name} Rename map (sample up to 6): {list(col_map.items())[:6]}")
         df = df.rename(columns=col_map)
     else:
-        logger.info(f"{product_name} no non-null column mappings; proceeding without renaming.")
+        logger.info(f"{product_name} No non-null column mappings; skipping rename.")
 
-    # Tag the catalog source and ensure a minimal base schema with nullable dtypes
+    # Tag source and ensure minimal base schema
     df["source"] = product_name
-
     base_schema = {
         "id": DTYPE_STR,
         "instrument_type": DTYPE_STR,
@@ -234,7 +187,6 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
         "z_flag": DTYPE_FLOAT,
         "z_err": DTYPE_FLOAT,
     }
-
     for col, pd_dtype in base_schema.items():
         if col not in df.columns:
             df = _add_missing_with_dtype(df, col, pd_dtype)
@@ -243,17 +195,14 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
 
 
 def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger) -> dd.DataFrame:
-    """Ensure unique column names across Dask partitions.
-
-    Preserves the first occurrence of each column name and renames subsequent
-    duplicates to "<name>__dupN" within each partition.
+    """Make column names unique across partitions by appending __dupN.
 
     Args:
-        df (dd.DataFrame): Input Dask DataFrame.
-        logger (logging.Logger): Logger used to emit rename warnings.
+        df: Input Dask DataFrame.
+        logger: Logger.
 
     Returns:
-        dd.DataFrame: DataFrame with unique column names per partition.
+        dd.DataFrame: DataFrame with unique column names.
     """
     def _renamer(pdf: pd.DataFrame) -> pd.DataFrame:
         cols = list(map(str, pdf.columns))
@@ -263,11 +212,9 @@ def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger) -> dd
 
         for c in cols:
             if c not in seen:
-                # First occurrence: keep as-is.
                 seen[c] = 0
                 new_cols.append(c)
             else:
-                # Subsequent duplicates: append __dupN.
                 seen[c] += 1
                 new_name = f"{c}__dup{seen[c]}"
                 while new_name in seen:
@@ -280,7 +227,7 @@ def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger) -> dd
         if renamed_pairs:
             sample = ", ".join([f"{a}->{b}" for a, b in renamed_pairs[:6]])
             logger.warning(
-                f"⚠️ Renamed duplicate columns in partition: {sample}"
+                f"Renamed duplicate columns in partition: {sample}"
                 f"{' ...' if len(renamed_pairs) > 6 else ''}"
             )
 
@@ -293,14 +240,11 @@ def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger) -> dd
 
 
 def _rename_duplicate_columns_pd(pdf: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
-    """Ensure unique column names for a pandas DataFrame.
-
-    Preserves the first occurrence of each column name and renames subsequent
-    duplicates to "<name>__dupN".
+    """Make pandas columns unique by appending __dupN.
 
     Args:
-        pdf (pd.DataFrame): Input pandas DataFrame.
-        logger (logging.Logger): Logger used to emit rename warnings.
+        pdf: Input pandas DataFrame.
+        logger: Logger.
 
     Returns:
         pd.DataFrame: DataFrame with unique column names.
@@ -313,11 +257,9 @@ def _rename_duplicate_columns_pd(pdf: pd.DataFrame, logger: logging.Logger) -> p
 
         for c in cols:
             if c not in seen:
-                # First occurrence: keep as-is.
                 seen[c] = 0
                 new_cols.append(c)
             else:
-                # Subsequent duplicates: append __dupN.
                 seen[c] += 1
                 new = f"{c}__dup{seen[c]}"
                 while new in seen:
@@ -330,7 +272,7 @@ def _rename_duplicate_columns_pd(pdf: pd.DataFrame, logger: logging.Logger) -> p
         if renamed:
             sample = ", ".join([f"{a}->{b}" for a, b in renamed[:6]])
             logger.warning(
-                f"⚠️ Renamed duplicate columns (pandas): {sample}"
+                f"Renamed duplicate columns (pandas): {sample}"
                 f"{' ...' if len(renamed) > 6 else ''}"
             )
 
@@ -341,17 +283,14 @@ def _rename_duplicate_columns_pd(pdf: pd.DataFrame, logger: logging.Logger) -> p
 
 
 def _next_available_prev_name(existing: list[str], base: str) -> str:
-    """Return a unique column name for previous results.
-
-    If the given base name (e.g., "CRD_ID_prev") already exists in the list
-    of columns, appends a numeric suffix (2, 3, ...) until a free name is found.
+    """Return a unique previous-result column name based on base.
 
     Args:
-        existing (list[str]): List of current column names.
-        base (str): Desired base name.
+        existing: Current columns.
+        base: Desired base name.
 
     Returns:
-        str: A column name that does not conflict with `existing`.
+        Unique column name.
     """
     if base not in existing:
         return base
@@ -361,88 +300,64 @@ def _next_available_prev_name(existing: list[str], base: str) -> str:
     return f"{base}{i}"
 
 
-def _stash_previous_results(
-    df: dd.DataFrame,
-    entry: dict,
-    logger: logging.Logger,
-) -> dd.DataFrame:
-    """Stash previous pipeline results by renaming or duplicating selected columns.
-
-    Preserves prior-run results when present, using YAML to decide if the previous
-    CRD IDs were mapped into the standard ``id`` column:
-
-    - If YAML maps ``id <- CRD_ID`` and ``id`` exists, duplicate it to
-      ``CRD_ID_prev`` (or ``CRD_ID_prev2``, etc.) while keeping ``id`` intact.
-    - If a real ``CRD_ID`` column exists, rename it to ``CRD_ID_prev*``.
-    - If a ``compared_to`` column exists, rename it to ``compared_to_prev*``.
-    - ``tie_result`` is not renamed; it will be reused later (filled with 1 where
-      missing).
+def _stash_previous_results(df: dd.DataFrame, entry: dict, logger: logging.Logger) -> dd.DataFrame:
+    """Stash previous-run results into CRD_ID_prev*/compared_to_prev*.
 
     Args:
-        df (dd.DataFrame): Input Dask DataFrame (after _validate_and_rename()).
-        entry (dict): YAML entry for the product; used to inspect column mapping.
-        logger (logging.Logger): Logger for informational messages.
+        df: Frame after rename.
+        entry: YAML node for product.
+        logger: Logger.
 
     Returns:
-        dd.DataFrame: DataFrame with renamed/duplicated columns where necessary.
+        dd.DataFrame: Frame with stashed previous columns when applicable.
     """
     cols = list(map(str, df.columns))
     columns_cfg = (entry.get("columns") or {})
-    # Only consider explicit, non-empty mappings
     non_null_map = {str(std): str(src) for std, src in columns_cfg.items()
                     if src not in (None, "", "null")}
 
-    # Special case: YAML explicitly mapped id <- CRD_ID
     mapped_id_from_crd = str(non_null_map.get("id", "")).strip().lower() == "crd_id"
 
     if mapped_id_from_crd and "id" in cols:
-        # Do not rename 'id'; create a copy as CRD_ID_prevN
         new_name = _next_available_prev_name(cols, "CRD_ID_prev")
-        logger.info(f"Stashing CRD_ID from YAML-mapped 'id' → {new_name} (keeping 'id' intact)")
+        logger.info(f"Stash CRD_ID from YAML-mapped 'id' → {new_name} (keep 'id')")
         df[new_name] = df["id"]
         cols.append(new_name)
 
-    # Normal case: if an actual CRD_ID column exists, stash it as CRD_ID_prev*
     if "CRD_ID" in cols:
         new_name = _next_available_prev_name(cols, "CRD_ID_prev")
         if new_name != "CRD_ID":
-            logger.info(f"Stashing previous CRD_ID → {new_name}")
+            logger.info(f"Stash previous CRD_ID → {new_name}")
             df = df.rename(columns={"CRD_ID": new_name})
             cols.append(new_name)
 
-    # Stash compared_to as compared_to_prev*
     if "compared_to" in cols:
         new_name = _next_available_prev_name(cols, "compared_to_prev")
         if new_name != "compared_to":
-            logger.info(f"Stashing previous compared_to → {new_name}")
+            logger.info(f"Stash previous compared_to → {new_name}")
             df = df.rename(columns={"compared_to": new_name})
             cols.append(new_name)
 
-    # tie_result is not renamed; its values will be reused during initialization
     return df
+
 
 # -----------------------
 # Type helpers
 # -----------------------
 def _add_missing_with_dtype(_df: dd.DataFrame, col: str, pd_dtype: Any) -> dd.DataFrame:
-    """Add a missing column with a nullable/extension dtype and correct Dask meta.
-
-    If `col` already exists, returns `_df` unchanged.
+    """Add missing column with a specific dtype and valid Dask meta.
 
     Args:
-      _df: Input Dask DataFrame.
-      col: Column name to add if missing.
-      pd_dtype: Target pandas dtype (e.g., "Float64", "Int64", "string", "boolean",
-        or a pandas ExtensionDtype such as `pd.ArrowDtype(pa.float64())`).
+        _df: Input DataFrame.
+        col: Column to add.
+        pd_dtype: Target pandas/Arrow dtype.
 
     Returns:
-      dd.DataFrame: `_df` if `col` exists; otherwise a new DataFrame with `col`
-      filled with <NA> and typed as `pd_dtype`.
+        dd.DataFrame: Frame with column added (if missing).
     """
     if col in _df.columns:
         return _df
 
-    # Accurate meta via empty Series of the requested dtype.
     meta_added = _df._meta.assign(**{col: pd.Series(pd.array([], dtype=pd_dtype))})
 
     def _adder(part: pd.DataFrame) -> pd.DataFrame:
@@ -454,18 +369,13 @@ def _add_missing_with_dtype(_df: dd.DataFrame, col: str, pd_dtype: Any) -> dd.Da
 
 
 def _normalize_string_series_to_na(s: pd.Series) -> pd.Series:
-    """Normalize to StringDtype and coerce placeholders to <NA>.
-
-    Operations:
-      * cast to string dtype
-      * strip whitespace
-      * map '', None, 'none', 'null', 'nan' (case-insensitive) to <NA>
+    """Normalize to string dtype and coerce placeholders to <NA>.
 
     Args:
-      s: Input Series.
+        s: Input series.
 
     Returns:
-      pd.Series: StringDtype series with canonical missing values.
+        pd.Series: Normalized string series.
     """
     s = s.astype(DTYPE_STR).str.strip()
     low = s.fillna("").str.lower()
@@ -474,16 +384,13 @@ def _normalize_string_series_to_na(s: pd.Series) -> pd.Series:
 
 
 def _to_nullable_boolean_strict(s: pd.Series) -> pd.Series:
-    """Convert to nullable boolean with strict semantics.
-
-    Only `True`/`False` (bool or numpy.bool_) are preserved. Other values,
-    including string equivalents, become <NA>.
+    """Convert to nullable boolean strictly (non-bool → <NA>).
 
     Args:
-      s: Input Series.
+        s: Input series.
 
     Returns:
-      pd.Series: Boolean nullable series with values in {True, False, <NA>}.
+        Nullable boolean series.
     """
     if s.dtype == object or str(s.dtype).startswith("string"):
         s = s.astype(DTYPE_STR).str.strip()
@@ -504,10 +411,10 @@ def _normalize_schema_hints(hints: dict | None) -> dict:
     """Normalize YAML dtype hints to {'int','float','str','bool'}.
 
     Args:
-      hints: Mapping column -> dtype string.
+        hints: Mapping column -> dtype.
 
     Returns:
-      dict: Normalized mapping; unknown dtypes are ignored.
+        dict: Normalized hints.
     """
     if not hints:
         return {}
@@ -531,47 +438,26 @@ def _normalize_schema_hints(hints: dict | None) -> dict:
 def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger) -> tuple[dd.DataFrame, bool]:
     """Normalize core dtypes and clean values.
 
-    Steps:
-      1) String-like cols -> normalized string dtype with canonical <NA>.
-      2) Optional `type` -> normalized string, lower-cased.
-      3) z_flag special-cases for JADES/VIMOS (string encodings -> numeric).
-      4) Float-like cols -> numeric, cast to target float dtype with checks.
-
     Args:
-      df: Dask DataFrame after YAML rename.
-      product_name: Catalog identifier for log context.
-      logger: Logger.
+        df: Frame after YAML rename.
+        product_name: Catalog identifier.
+        logger: Logger.
 
     Returns:
-      Tuple[dd.DataFrame, bool]: (normalized df, type_cast_ok).
-
-    Raises:
-      ValueError: On string normalization failure or non-numeric residues during
-        float coercion.
-
-    Notes:
-      - `survey` is upper-cased after normalization to stabilize rule lookups.
-      - Non-numeric residues are detected via `dd.to_numeric(..., errors="coerce")`
-        and reported with a small value sample.
+        Tuple[dd.DataFrame, bool]: (normalized frame, whether 'type' normalized).
     """
-    # 1) Normalize string-like columns
+    # 1) Normalize string-like
     string_like = ["id", "instrument_type", "survey", "instrument_type_homogenized", "source"]
     for col in string_like:
         if col in df.columns:
-            try:
-                df[col] = df[col].map_partitions(
-                    _normalize_string_series_to_na,
-                    meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
-                )
-                if col == "survey":
-                    df[col] = df[col].str.upper()
-            except Exception as e:
-                raise ValueError(
-                    f"[{product_name}] Failed to normalize string column '{col}'. "
-                    f"Original error: {e}"
-                ) from e
+            df[col] = df[col].map_partitions(
+                _normalize_string_series_to_na,
+                meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
+            )
+            if col == "survey":
+                df[col] = df[col].str.upper()
 
-    # 2) Optional auxiliary 'type'
+    # 2) Optional 'type'
     type_cast_ok = False
     if "type" in df.columns:
         try:
@@ -581,10 +467,10 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
             ).str.lower()
             type_cast_ok = True
         except Exception as e:
-            logger.warning(f"⚠️ {product_name} Failed to normalize 'type' to lower-case: {e}")
+            logger.warning(f"{product_name} Failed to normalize 'type' to lower-case: {e}")
             type_cast_ok = False
 
-    # 3) z_flag mapping for JADES/VIMOS
+    # 3) JADES/VIMOS z_flag mapping if needed
     def _map_special_partition(partition: pd.DataFrame) -> pd.DataFrame:
         p = partition.copy()
         if "survey" not in p or "z_flag" not in p:
@@ -625,32 +511,23 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
     if "z_flag" in df.columns and "survey" in df.columns:
         df = df.map_partitions(_map_special_partition)
 
-    # 4) Coerce float-like columns with diagnostics
+    # 4) Float-like coercion
     float_like = ["ra", "dec", "z", "z_err", "z_flag", "z_flag_homogenized"]
     for col in float_like:
         if col in df.columns:
-            try:
-                coerced = dd.to_numeric(df[col], errors="coerce")
-                invalid_mask = dd.isna(coerced) & ~dd.isna(df[col])
-                invalid_count = dask.compute(invalid_mask.sum())[0]
-                if invalid_count > 0:
-                    sample_vals = df[col].loc[invalid_mask].head(5, compute=True).tolist()
-                    raise ValueError(
-                        f"[{product_name}] Failed to convert '{col}' to numeric: "
-                        f"{invalid_count} non-numeric value(s). Examples: {sample_vals}. "
-                        f"Tip: fix or drop non-numeric entries before running."
-                    )
-                df[col] = coerced.map_partitions(
-                    lambda s: s.astype(DTYPE_FLOAT),
-                    meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
-                )
-            except ValueError:
-                raise
-            except Exception as e:
+            coerced = dd.to_numeric(df[col], errors="coerce")
+            invalid_mask = dd.isna(coerced) & ~dd.isna(df[col])
+            invalid_count = dask.compute(invalid_mask.sum())[0]
+            if invalid_count > 0:
+                sample_vals = df[col].loc[invalid_mask].head(5, compute=True).tolist()
                 raise ValueError(
-                    f"[{product_name}] Unexpected failure converting '{col}' to numeric. "
-                    f"Original error: {e}"
-                ) from e
+                    f"[{product_name}] Failed to convert '{col}' to numeric: "
+                    f"{invalid_count} non-numeric value(s). Examples: {sample_vals}."
+                )
+            df[col] = coerced.map_partitions(
+                lambda s: s.astype(DTYPE_FLOAT),
+                meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
+            )
 
     return df, type_cast_ok
 
@@ -658,44 +535,31 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
 # -----------------------
 # CRD_ID generation
 # -----------------------
-def _generate_crd_ids(df: dd.DataFrame, product_name: str, temp_dir: str) -> tuple[dd.DataFrame, str]:
+def _generate_crd_ids(df: dd.DataFrame, product_name: str, temp_dir: str) -> dd.DataFrame:
     """Assign stable, catalog-scoped CRD_IDs.
 
-    The CRD_ID has the form ``CRD{NNN}_{i}``, where ``NNN`` is the numeric
-    prefix extracted from ``product_name`` (``entry['internal_name']``) and
-    ``i`` is a 1-based, contiguous counter across all partitions.
-
     Args:
-        df (dd.DataFrame): Input Dask DataFrame after schema normalization.
-        product_name (str): Product internal name, expected to start with a
-            numeric prefix (e.g., ``"492_vltvimos_v201"``).
-        temp_dir (str): Unused here, kept for signature stability during refactor.
+        df: Input frame after schema normalization.
+        product_name: Internal name (expects numeric prefix before underscore).
+        temp_dir: Unused, kept for signature stability.
 
     Returns:
-        dd.DataFrame: DataFrame with a new ``CRD_ID`` column (Arrow string dtype).
+        dd.DataFrame: Frame with CRD_ID column (Arrow string dtype).
 
     Raises:
-        ValueError: If a numeric prefix cannot be extracted from ``product_name``.
-
-    Notes:
-        - The assignment strategy is partition-local to avoid reindexing/shuffling
-          the entire Dask collection.
-        - CRD_IDs are stable for a given partitioning and row order; if the input
-          partitioning/order changes, IDs may change accordingly.
+        ValueError: If numeric prefix cannot be extracted from product_name.
     """
     m = re.match(r"(\d+)_", product_name)
     if not m:
-        raise ValueError(f"❌ Could not extract numeric prefix from internal_name '{product_name}'")
+        raise ValueError(f"Could not extract numeric prefix from internal_name '{product_name}'")
     catalog_prefix = m.group(1)
 
-    # Compute partition sizes on the driver to derive contiguous offsets.
     sizes = df.map_partitions(len).compute().tolist()
     offsets = [0]
     for s in sizes[:-1]:
         offsets.append(offsets[-1] + s)
 
     def _add_crd(part: pd.DataFrame, start: int) -> pd.DataFrame:
-        # Partition-local ID assignment using a contiguous range seeded by `start`.
         p = part.copy()
         n = len(p)
         p["CRD_ID"] = [f"CRD{catalog_prefix}_{start + i + 1}" for i in range(n)]
@@ -709,12 +573,11 @@ def _generate_crd_ids(df: dd.DataFrame, product_name: str, temp_dir: str) -> tup
         for i, offset in enumerate(offsets)
     ]
     df = dd.concat(parts)
-    
     return df
 
 
 # -----------------------
-# Homogenization (respect user-provided columns)
+# Homogenization
 # -----------------------
 def _honor_user_homogenized_mapping(
     df: dd.DataFrame,
@@ -722,67 +585,41 @@ def _honor_user_homogenized_mapping(
     product_name: str,
     logger: logging.Logger,
 ) -> dd.DataFrame:
-    """Recreate canonical homogenized columns when YAML maps to homogenized sources.
-
-    Some inputs may already provide homogenized fields and choose to expose
-    them through the standard names via YAML mapping. This function detects
-    those cases and mirrors the values to the canonical homogenized columns
-    expected by downstream logic:
-
-      - If YAML declares ``z_flag <- z_flag_homogenized``, then create/overwrite
-        ``z_flag_homogenized`` from the (renamed) ``z_flag``.
-      - If YAML declares ``instrument_type <- instrument_type_homogenized``,
-        then create/overwrite ``instrument_type_homogenized`` from
-        ``instrument_type``.
-
-    A protective check prevents silent duplication if the rename step resulted
-    in two columns named the same (should not happen if `_validate_and_rename`
-    handled collisions).
+    """Mirror user-provided homogenized columns declared in YAML.
 
     Args:
-        df (dd.DataFrame): DataFrame after YAML rename.
-        entry (dict): Product YAML node containing the ``columns`` mapping.
-        product_name (str): Internal name for logging context.
-        logger (logging.Logger): Logger.
+        df: Frame after YAML rename.
+        entry: YAML node.
+        product_name: Catalog identifier.
+        logger: Logger.
 
     Returns:
-        dd.DataFrame: DataFrame with canonical homogenized columns present
-        (if derivable from the YAML mapping).
-
-    Raises:
-        ValueError: If duplicate columns with the same name are detected after
-            YAML rename (indicates a misconfigured mapping or a collision).
+        dd.DataFrame: Frame with canonical homogenized columns mirrored.
     """
-
     def _ensure_single_series(df: dd.DataFrame, name: str):
-        # Fail fast if a rename collision left duplicated columns with identical names.
         if list(df.columns).count(name) > 1:
             raise ValueError(
-                f"[{product_name}] Detected duplicate '{name}' columns after YAML rename. "
-                f"This typically happens when the file already had '{name}' and you also mapped "
-                f"another source to '{name}'. The pipeline expects unique column names. "
-                f"Tip: let the pipeline resolve collisions (see logs) or adjust the YAML."
+                f"[{product_name}] Duplicate '{name}' after YAML rename; "
+                "ensure unique column names."
             )
         return df[name]
 
     cols_cfg = (entry.get("columns") or {})
     norm = lambda x: (str(x).strip().lower() if x is not None else None)
 
-    # z_flag <- z_flag_homogenized ?
     if norm(cols_cfg.get("z_flag")) == "z_flag_homogenized":
         if "z_flag" in df.columns:
             df["z_flag_homogenized"] = _ensure_single_series(df, "z_flag")
-            logger.info(f"{product_name} YAML maps 'z_flag' <- 'z_flag_homogenized'; using user-provided homogenized z_flag.")
+            logger.info(f"{product_name} Using user-provided homogenized z_flag via YAML mapping.")
         else:
-            logger.warning(f"⚠️ {product_name} YAML claims 'z_flag' comes from 'z_flag_homogenized', but 'z_flag' is missing after rename.")
+            logger.warning(f"{product_name} YAML says z_flag<-z_flag_homogenized, but 'z_flag' missing.")
 
-    # instrument_type <- instrument_type_homogenized ?
     if norm(cols_cfg.get("instrument_type")) == "instrument_type_homogenized":
         if "instrument_type" in df.columns:
             df["instrument_type_homogenized"] = _ensure_single_series(df, "instrument_type")
-            logger.info(f"{product_name} YAML maps 'instrument_type' <- 'instrument_type_homogenized'; using user-provided homogenized instrument_type.")
+            logger.info(f"{product_name} Using user-provided homogenized instrument_type via YAML mapping.")
         else:
-            logger.warning(f"⚠️ {product_name} YAML claims 'instrument_type' comes from 'instrument_type_homogenized', but 'instrument_type' is missing after rename.")
+            logger.warning(f"{product_name} YAML says instrument_type<-instrument_type_homogenized, but missing.")
 
     return df
 
@@ -796,29 +633,23 @@ def _homogenize(
 ) -> tuple[dd.DataFrame, bool, list, dict, dict]:
     """Compute homogenized columns for tie-breaking.
 
-    Strategy:
-      1) Fast-paths: reuse quality-like `z_flag` and validated `type` when possible.
-      2) Otherwise, apply YAML translations per partition (vectorized).
-
     Args:
-      df: Frame after type normalization.
-      translation_config: Config with priorities and translation rules.
-      product_name: Catalog identifier for log context.
-      logger: Logger.
-      type_cast_ok: Whether `type` was normalized.
+        df: Frame after type normalization.
+        translation_config: Config with priorities and rules.
+        product_name: Catalog identifier.
+        logger: Logger.
+        type_cast_ok: Whether `type` was normalized.
 
     Returns:
-      Tuple[df, used_type_fastpath, tiebreaking_priority, instrument_type_priority, translation_rules_uc].
+        Tuple: (df, used_type_fastpath, tiebreaking_priority, instrument_type_priority, translation_rules_uc)
     """
     tiebreaking_priority = translation_config.get("tiebreaking_priority", [])
     instrument_type_priority = translation_config.get("instrument_type_priority", {})
     translation_rules_uc = {k.upper(): v for k, v in translation_config.get("translation_rules", {}).items()}
 
-    # -----------------------
-    # Vectorized translator
-    # -----------------------
+    # ---- vectorized translator ----
     def _translate_column_vectorized(df: dd.DataFrame, key: str, out_col: str, out_kind: str) -> dd.DataFrame:
-        """Apply YAML translation rules per partition (no row-wise Python loops)."""
+        """Apply YAML translation rules per partition."""
         assert key in {"z_flag", "instrument_type"}
         assert out_col in {"z_flag_homogenized", "instrument_type_homogenized"}
         assert out_kind in {"float", "str"}
@@ -835,15 +666,12 @@ def _homogenize(
             s = p.copy()
             survey_uc = s["survey"].astype(str).str.upper()
 
-            # Initialize output series.
             if out_kind == "float":
                 out = pd.Series(pd.array([pd.NA] * len(s), dtype=DTYPE_FLOAT), index=s.index)
             else:
                 out = pd.Series(pd.array([pd.NA] * len(s), dtype=DTYPE_STR), index=s.index)
 
-            # --- helpers for vectorized exprs ---
             class StrSeriesProxy:
-                """Elementwise string slicing via .str accessors."""
                 def __init__(self, ser: pd.Series):
                     self._s = ser.astype(DTYPE_STR)
                 def __getitem__(self, key):
@@ -879,9 +707,7 @@ def _homogenize(
                     return pd.to_numeric(x, errors="coerce").astype(DTYPE_FLOAT)
                 return builtins.float(x)
 
-
             class _BoolToBitwise(_ast.NodeTransformer):
-                """Rewrite boolean ops and chained comparisons to bitwise equivalents."""
                 def visit_BoolOp(self, node):
                     self.generic_visit(node)
                     op = _ast.BitAnd() if isinstance(node.op, _ast.And) else _ast.BitOr()
@@ -904,7 +730,6 @@ def _homogenize(
                         expr = _ast.BinOp(left=expr, op=_ast.BitAnd(), right=cmp_i)
                     return expr
 
-            # Apply rules per survey.
             for sname, ruleset in translation_rules_uc.items():
                 rule = (ruleset.get(f"{key}_translation") or {})
                 if not isinstance(rule, dict) or not len(rule):
@@ -916,21 +741,18 @@ def _homogenize(
 
                 default_val = rule.get("default", (np.nan if out_kind == "float" else ""))
 
-                # Default fill.
                 if out_kind == "float":
                     out.loc[mask_s] = out.loc[mask_s].fillna(default_val)
                 else:
                     fill_vals = pd.Series([default_val] * int(mask_s.sum()), index=out.index[mask_s], dtype=DTYPE_STR)
                     out.loc[mask_s] = out.loc[mask_s].fillna(fill_vals)
 
-                # Direct mappings.
                 direct = {k: v for k, v in rule.items() if k not in {"conditions", "default"}}
                 if direct:
                     col = s.loc[mask_s, key]
                     is_num = pd.api.types.is_numeric_dtype(col)
                     if key == "z_flag":
-                        is_num = True  # allow numeric path even if dtype looks object
-
+                        is_num = True
                     if is_num:
                         col_num = pd.to_numeric(col, errors="coerce")
                         num_map = {}
@@ -953,7 +775,6 @@ def _homogenize(
                         take = mapped_str.notna()
                         out.loc[take.index] = out.loc[take.index].where(~take, mapped_str)
 
-                # Conditional rules.
                 for cond in (rule.get("conditions") or []):
                     expr = cond.get("expr")
                     if not expr:
@@ -997,28 +818,21 @@ def _homogenize(
                     else:
                         out.loc[mlocal] = (pd.NA if pd.isna(val) else str(val))
 
-            # Finalize dtype.
             if out_col == "z_flag_homogenized":
                 s[out_col] = pd.to_numeric(out, errors="coerce").astype(DTYPE_FLOAT)
             else:
                 s[out_col] = pd.Series(out, dtype=DTYPE_STR).str.lower()
-
             return s
 
-        # Accurate meta for new column.
         meta = df._meta.copy()
         if out_kind == "float":
             meta[out_col] = pd.Series(pd.array([], dtype=DTYPE_FLOAT))
         else:
             meta[out_col] = pd.Series(pd.array([], dtype=DTYPE_STR))
-
         return df.map_partitions(_partition, meta=meta)
 
-    # -----------------------
     # z_flag_homogenized
-    # -----------------------
     def can_use_zflag_as_quality() -> bool:
-        """Return True if `z_flag` looks like a [0,1] quality score with fractional values."""
         if "z_flag" not in df.columns:
             return False
         try:
@@ -1033,11 +847,10 @@ def _homogenize(
                 return False
             return frac_cnt > 0
         except Exception as e:
-            logger.warning(f"⚠️ {product_name} Could not validate 'z_flag' as quality-like: {e}")
+            logger.warning(f"{product_name} Could not validate 'z_flag' as quality-like: {e}")
             return False
 
     def quality_like_to_flag(x):
-        """Map a [0,1] quality score to VVDS-like flags {0..4}."""
         if pd.isna(x):
             return np.nan
         x = float(x)
@@ -1056,24 +869,21 @@ def _homogenize(
     if "z_flag_homogenized" in tiebreaking_priority:
         if "z_flag_homogenized" not in df.columns:
             if can_use_zflag_as_quality():
-                logger.info(f"{product_name} Using 'z_flag' (quality-like) fast path for z_flag_homogenized.")
+                logger.info(f"{product_name} Using 'z_flag' fast path for z_flag_homogenized.")
                 df["z_flag_homogenized"] = df["z_flag"].map_partitions(
                     lambda s: s.apply(quality_like_to_flag).astype(DTYPE_FLOAT),
                     meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
                 )
             else:
-                logger.info(f"{product_name} z_flag not quality-like; using YAML translation for z_flag_homogenized.")
+                logger.info(f"{product_name} Using YAML translation for z_flag_homogenized.")
                 df = _translate_column_vectorized(df, key="z_flag", out_col="z_flag_homogenized", out_kind="float")
         else:
-            logger.warning(f"{product_name} Column 'z_flag_homogenized' already exists. Skipping recompute.")
+            logger.warning(f"{product_name} 'z_flag_homogenized' already exists; skipping recompute.")
 
-    # -----------------------
     # instrument_type_homogenized
-    # -----------------------
     used_type_fastpath = False
 
     def can_use_type_for_instrument() -> bool:
-        """Reuse normalized `type` only if values are a subset of {s,g,p}."""
         if not type_cast_ok or "type" not in df.columns:
             return False
         try:
@@ -1084,7 +894,7 @@ def _homogenize(
                 return False
             return all(u in allowed for u in uniques)
         except Exception as e:
-            logger.warning(f"⚠️ {product_name} Could not validate 'type' values: {e}")
+            logger.warning(f"{product_name} Could not validate 'type' values: {e}")
             return False
 
     if "instrument_type_homogenized" in tiebreaking_priority:
@@ -1097,14 +907,14 @@ def _homogenize(
                 ).str.lower()
                 used_type_fastpath = True
             else:
-                logger.info(f"{product_name} 'type' not suitable; using YAML translation for instrument_type_homogenized.")
+                logger.info(f"{product_name} Using YAML translation for instrument_type_homogenized.")
                 df = _translate_column_vectorized(df, key="instrument_type", out_col="instrument_type_homogenized", out_kind="str")
                 df["instrument_type_homogenized"] = df["instrument_type_homogenized"].map_partitions(
                     _normalize_string_series_to_na,
                     meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
                 ).str.lower()
         else:
-            logger.warning(f"{product_name} Column 'instrument_type_homogenized' already exists. Skipping recompute.")
+            logger.warning(f"{product_name} 'instrument_type_homogenized' already exists; skipping recompute.")
 
     return df, used_type_fastpath, tiebreaking_priority, instrument_type_priority, translation_rules_uc
 
@@ -1113,23 +923,17 @@ def _homogenize(
 # RA/DEC strict validation (fail fast)
 # -----------------------
 def _validate_ra_dec_or_fail(df: dd.DataFrame, product_name: str) -> None:
-    """Validate RA/DEC for finiteness and range; fail fast with details.
-
-    Checks (using float64 views):
-      * missing values (NaN / <NA>)
-      * non-finite values (±inf)
-      * RA out of [0, 360)
-      * DEC out of [-90, 90]
+    """Validate RA/DEC finiteness and ranges; raise on invalid rows.
 
     Args:
-      df: DataFrame with columns 'ra' and 'dec'.
-      product_name: Catalog identifier for error context.
+        df: Frame with 'ra' and 'dec'.
+        product_name: Catalog identifier.
 
     Raises:
-      ValueError: If any invalid RA/DEC entries are detected.
+        ValueError: If invalid RA/DEC entries are detected.
     """
     def _isfinite_series(s: pd.Series) -> pd.Series:
-        arr = s.astype("float64")  # Extension -> float64 (NaN where <NA>)
+        arr = s.astype("float64")
         return pd.Series(np.isfinite(arr), index=s.index)
 
     isfinite_ra  = df["ra"].map_partitions(_isfinite_series,  meta=("ra", "bool"))
@@ -1160,12 +964,12 @@ def _validate_ra_dec_or_fail(df: dd.DataFrame, product_name: str) -> None:
         cols = [c for c in ["CRD_ID", "id", "source", "survey", "ra", "dec"] if c in df.columns]
         sample_records = df[invalid_mask][cols].head(5, compute=True).to_dict(orient="records")
         raise ValueError(
-            f"[{product_name}] Found invalid RA/DEC rows before DP1 flagging: {invalid_total}\n"
-            f"  - RA NaN: {na_ra}, DEC NaN: {na_dec}\n"
-            f"  - RA non-finite (±inf): {nonfinite_ra}, DEC non-finite (±inf): {nonfinite_dec}\n"
-            f"  - RA out-of-range (<0): {oor_ra_low}, RA out-of-range (>=360): {oor_ra_high}\n"
-            f"  - DEC out-of-range (<-90): {oor_dec_low}, DEC out-of-range (>90): {oor_dec_high}\n"
-            f"  - Sample of bad rows (up to 5): {sample_records}"
+            f"[{product_name}] Invalid RA/DEC rows: {invalid_total}\n"
+            f"  RA NaN={na_ra}, DEC NaN={na_dec}\n"
+            f"  RA non-finite={nonfinite_ra}, DEC non-finite={nonfinite_dec}\n"
+            f"  RA <0={oor_ra_low}, RA >=360={oor_ra_high}\n"
+            f"  DEC <-90={oor_dec_low}, DEC >90={oor_dec_high}\n"
+            f"  Sample (up to 5): {sample_records}"
         )
 
 
@@ -1175,13 +979,11 @@ def _validate_ra_dec_or_fail(df: dd.DataFrame, product_name: str) -> None:
 def _flag_dp1(df: dd.DataFrame) -> dd.DataFrame:
     """Flag rows within predefined DP1 circular fields.
 
-    Geometry: spherical law of cosines with clipping before arccos.
-
     Args:
-      df: DataFrame with columns 'ra' and 'dec' in degrees.
+        df: Frame with 'ra' and 'dec' (degrees).
 
     Returns:
-      dd.DataFrame: Input plus 'is_in_DP1_fields' (0/1) as nullable int dtype.
+        dd.DataFrame: Adds 'is_in_DP1_fields' (nullable int).
     """
     ra_centers  = np.deg2rad([r[0] for r in DP1_REGIONS])
     dec_centers = np.deg2rad([r[1] for r in DP1_REGIONS])
@@ -1197,25 +999,24 @@ def _flag_dp1(df: dd.DataFrame) -> dd.DataFrame:
                        np.cos(dec_c) * np.cos(dec_rad) * np.cos(ra_rad - ra_c))
             ang_deg = np.rad2deg(np.arccos(np.clip(cos_ang, -1.0, 1.0)))
             in_any |= (ang_deg <= rdeg)
-        # Use Arrow/int nullable dtype if configured.
         p["is_in_DP1_fields"] = pd.Series(in_any, index=p.index, dtype=DTYPE_INT)
         return p
 
-    # Accurate meta with desired dtype for the new column.
     meta = df._meta.assign(is_in_DP1_fields=pd.Series(pd.array([], dtype=DTYPE_INT)))
     return df.map_partitions(_compute, meta=meta)
+
 
 # -----------------------
 # Column selection
 # -----------------------
 def _extract_variables_from_expr(expr: str) -> set[str]:
-    """Extract variable names referenced in a boolean/arithmetic expression.
+    """Extract variable names referenced in an expression.
 
     Args:
-      expr: Expression string (e.g., "0 < z_err < 5e-4 and len(flag) > 1").
+        expr: Expression string.
 
     Returns:
-      Set of identifier names referenced in the expression.
+        Set of variable names.
     """
     try:
         tree = _ast.parse(expr, mode="eval")
@@ -1244,46 +1045,39 @@ def _select_output_columns(
 ) -> dd.DataFrame:
     """Assemble final output schema and coerce optional expression columns.
 
-    This function builds a deterministic list of columns for the final output,
-    optionally includes variables referenced in YAML expressions, and adds any
-    previous-run columns (e.g., CRD_ID_prev, CRD_ID_prev2, compared_to_prev*).
-
     Args:
-        df (dd.DataFrame): Frame after tie-breaking and DP1 flagging.
-        translation_rules_uc (dict): Upper-cased translation rules (for expr discovery).
-        tiebreaking_priority (list): Priority columns to append if present.
-        used_type_fastpath (bool): If True, copy normalized `type` into `instrument_type`.
-        save_expr_columns (bool): Whether to keep variables used in YAML expressions.
-        schema_hints (dict | None): Normalized hints {'int','float','str','bool'} for expr cols.
+        df: Frame after tie-breaking and DP1 flagging.
+        translation_rules_uc: Upper-cased translation rules.
+        tiebreaking_priority: Priority columns to append if present.
+        used_type_fastpath: Whether `type` was reused for instrument_type.
+        save_expr_columns: Keep variables used in YAML expressions.
+        schema_hints: Normalized hints {'int','float','str','bool'}.
 
     Returns:
-        dd.DataFrame: Subset of `df` with deterministic column order and coerced dtypes.
+        dd.DataFrame: Subset with deterministic column order.
     """
     final_cols = [
         "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err",
-        "instrument_type", "survey", "source", "tie_result", "is_in_DP1_fields", "compared_to"
+        "instrument_type", "survey", "source", "tie_result",
+        "is_in_DP1_fields", "compared_to"
     ]
     if "z_flag_homogenized" in df.columns:
         final_cols.append("z_flag_homogenized")
     if "instrument_type_homogenized" in df.columns:
         final_cols.append("instrument_type_homogenized")
 
-    # Ensure Arrow-backed string for 'compared_to' if present
     if "compared_to" in df.columns:
         df["compared_to"] = df["compared_to"].map_partitions(
             _normalize_string_series_to_na,
             meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
         )
 
-    # Preserve normalized string semantics when fast-path was used.
     if used_type_fastpath and "type" in df.columns:
         df["instrument_type"] = df["type"].astype(DTYPE_STR)
 
-    # Include tiebreaking columns if present.
     extra = [c for c in tiebreaking_priority if c not in final_cols and c in df.columns]
     final_cols += extra
 
-    # Determine additional columns referenced by YAML expressions.
     extra_expr_cols = set()
     if save_expr_columns:
         for ruleset in translation_rules_uc.values():
@@ -1300,14 +1094,12 @@ def _select_output_columns(
     if save_expr_columns:
         final_cols += needed
 
-    # Include any previous-run columns (CRD_ID_prev*, compared_to_prev*), preserving order.
     prev_like = [c for c in df.columns if str(c).startswith("CRD_ID_prev")]
     prev_like += [c for c in df.columns if str(c).startswith("compared_to_prev")]
     for c in prev_like:
         if c not in final_cols:
             final_cols.append(c)
 
-    # Coerce hinted expr columns to requested dtypes.
     schema_hints = schema_hints or {}
     if save_expr_columns and schema_hints:
         target_cols = [c for c in needed if c in schema_hints]
@@ -1337,7 +1129,6 @@ def _select_output_columns(
                         meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
                     )
             else:
-                # Create hinted column with <NA> to stabilize schema.
                 if kind == "str":
                     df = _add_missing_with_dtype(df, col, DTYPE_STR)
                 elif kind == "float":
@@ -1347,11 +1138,10 @@ def _select_output_columns(
                 elif kind == "bool":
                     df = _add_missing_with_dtype(df, col, DTYPE_BOOL)
 
-    # Deduplicate while preserving order, then subset.
     final_cols = list(dict.fromkeys(final_cols))
     df = df[[c for c in final_cols if c in df.columns]]
     return df
-    
+
 
 # -----------------------
 # Save parquet
@@ -1359,37 +1149,33 @@ def _select_output_columns(
 def _save_parquet(df: dd.DataFrame, temp_dir: str, product_name: str) -> str:
     """Write a partitioned Parquet artifact for the prepared catalog.
 
-    The function ensures unique column names per partition and writes the
-    result to a directory named "prepared_<product_name>" under `temp_dir`.
-
     Args:
-        df (dd.DataFrame): Prepared dataframe to persist.
-        temp_dir (str): Base directory for temporary artifacts.
-        product_name (str): Product internal name.
+        df: Prepared dataframe.
+        temp_dir: Base temp directory.
+        product_name: Internal name.
 
     Returns:
-        str: Absolute path to the output directory containing Parquet files.
+        str: Output directory path with Parquet files.
     """
     out_path = os.path.join(temp_dir, f"prepared_{product_name}")
     logger = logging.getLogger(LOGGER_NAME)
 
-    # Ensure unique column names per partition (first occurrence kept, others renamed to __dupN)
     df = _rename_duplicate_columns_dd(df, logger)
-
     with dask.config.set({"dataframe.shuffle.method": "tasks"}):
         df.to_parquet(out_path, write_index=False, engine="pyarrow")
     return out_path
 
 
-# ---- Helper: build a stable Arrow schema for our prepared catalog ----
-def _build_arrow_schema_for_catalog(
-    df: pd.DataFrame,
-    schema_hints: dict | None = None,
-) -> pa.Schema:
-    """Build a robust pyarrow Schema for LSDB.from_dataframe.
+# ---- Arrow schema builder ----
+def _build_arrow_schema_for_catalog(df: pd.DataFrame, schema_hints: dict | None = None) -> pa.Schema:
+    """Build a robust Arrow schema for lsdb.from_dataframe.
 
-    Declares explicit Arrow types for standard columns, historical prev-columns,
-    and (optionally) expression columns per `schema_hints` to prevent null-typed drift.
+    Args:
+        df: Sample pandas frame to infer types.
+        schema_hints: Optional hints for expression columns.
+
+    Returns:
+        pa.Schema: Arrow schema.
     """
     canonical = {
         "CRD_ID": pa.string(),
@@ -1406,9 +1192,8 @@ def _build_arrow_schema_for_catalog(
         "z_flag_homogenized": pa.float64(),
         "tie_result": pa.int8(),
         "is_in_DP1_fields": pa.int64(),
-        "compared_to": pa.string(),  # <- ADD
+        "compared_to": pa.string(),
     }
-
 
     def _hint_to_pa(dt: str) -> pa.DataType:
         k = str(dt).lower()
@@ -1428,22 +1213,18 @@ def _build_arrow_schema_for_catalog(
     for col in df.columns:
         name = str(col)
 
-        # 1) canonical mapeamento
         if name in canonical:
             fields.append(pa.field(name, canonical[name], nullable=True))
             continue
 
-        # 2) históricos: forçar string
         if name.startswith("CRD_ID_prev") or name.startswith("compared_to_prev"):
             fields.append(pa.field(name, pa.string(), nullable=True))
             continue
 
-        # 3) hints de expr: se fornecidos, forçar tipo
         if name in schema_hints:
             fields.append(pa.field(name, _hint_to_pa(schema_hints[name]), nullable=True))
             continue
 
-        # 4) fallback: inferir a partir do dtype do pandas
         dt = df[name].dtype
         if isinstance(dt, pd.ArrowDtype):
             fields.append(pa.field(name, dt.pyarrow_dtype, nullable=True))
@@ -1459,7 +1240,6 @@ def _build_arrow_schema_for_catalog(
         else:
             fields.append(pa.field(name, pa.string(), nullable=True))
 
-    # Deduplicar preservando ordem
     seen = set()
     uniq_fields = []
     for f in fields:
@@ -1469,10 +1249,10 @@ def _build_arrow_schema_for_catalog(
 
     return pa.schema(uniq_fields)
 
+
 # =======================
 # Collections
 # =======================
-
 def _write_schema_file_for_collection(
     parquet_path: str,
     schema_out_path: str,
@@ -1481,24 +1261,18 @@ def _write_schema_file_for_collection(
 ) -> str:
     """Create a minimal Parquet file containing only the desired Arrow schema.
 
-    Reads a small sample from the first Parquet found under `parquet_path`
-    (supports optional `base/`) to infer pandas dtypes, builds a robust
-    Arrow schema via `_build_arrow_schema_for_catalog(...)`, and writes an
-    **empty** Parquet file with that schema at `schema_out_path`.
-
     Args:
-        parquet_path: Directory with prepared Parquet files (flat or `base/`).
-        schema_out_path: Destination file path for the schema-only Parquet.
-        logger: Logger for progress/warnings.
-        schema_hints: Optional hints for expression columns ({col: 'int'|'float'|'str'|'bool'}).
+        parquet_path: Directory with prepared Parquet files.
+        schema_out_path: Destination file for schema-only Parquet.
+        logger: Logger.
+        schema_hints: Optional expr hints.
 
     Returns:
-        str: Absolute path to the written schema Parquet file.
+        str: Path to the written schema file.
 
     Raises:
         ValueError: If no Parquet files are found.
     """
-    # discover parquet files
     base_path = os.path.join(parquet_path, "base")
     pattern = os.path.join(base_path, "*.parquet") if os.path.exists(base_path) \
         else os.path.join(parquet_path, "*.parquet")
@@ -1507,26 +1281,21 @@ def _write_schema_file_for_collection(
     if not files:
         raise ValueError(f"No Parquet files found at '{parquet_path}' to infer schema")
 
-    # read a small sample to get pandas dtypes (enough to drive the schema builder)
-    # We read the first file entirely; it's fine for metadata-scale.
     sample_df = pd.read_parquet(files[0])
     sample_df = _rename_duplicate_columns_pd(sample_df, logger)
 
-    # build the Arrow schema
     schema = _build_arrow_schema_for_catalog(sample_df, schema_hints=schema_hints or {})
 
-    # ensure parent exists and write an EMPTY table with this schema
     os.makedirs(os.path.dirname(schema_out_path), exist_ok=True)
     empty_tbl = pa.Table.from_arrays(
         [pa.array([], type=f.type) for f in schema],
         names=[f.name for f in schema],
     )
-    import pyarrow.parquet as pq
     pq.write_table(empty_tbl, schema_out_path)
 
-    logger.info(f"🧩 Wrote schema file for collection: {schema_out_path}")
+    logger.info(f"Wrote schema file for collection: {schema_out_path}")
     return schema_out_path
-    
+
 
 def _build_collection_with_retry(
     parquet_path: str,
@@ -1538,24 +1307,29 @@ def _build_collection_with_retry(
     schema_hints: dict | None = None,
     size_threshold_mb: int = 200,
 ) -> str:
-    """
-    Build a Collection from a Parquet folder.
+    """Build a HATS Collection from a Parquet folder.
 
-    Naming rule (requested):
-      - If `parquet_path` is ".../merged_stepX", the output collection is
-        ".../merged_stepX_hats".
+    Args:
+        parquet_path: Prepared parquet path (e.g., .../merged_stepX or prepared_*).
+        logs_dir: Logs directory (unused here, kept for parity).
+        logger: Logger.
+        client: Dask client or None.
+        try_margin: Try margin import first.
+        schema_hints: Expr hints for importer schema.
+        size_threshold_mb: Fast-path threshold.
 
-    Fast-path: pandas -> lsdb.from_dataframe(...).to_hats(destination)
-    Fallback: hats import pipeline (with/without margin), using the same destination.
+    Returns:
+        str: Collection path written as "<parquet_path>_hats".
+
+    Raises:
+        RuntimeError: If both fast-path and importer fallback fail.
     """
-    # 0) Normalize paths and derive artifact naming from `parquet_path`
     parquet_path = os.path.normpath(parquet_path)
     parent_dir = os.path.dirname(parquet_path) or "."
     base_name = os.path.basename(parquet_path)
     output_artifact_name = f"{base_name}_hats"
     collection_path = os.path.join(parent_dir, output_artifact_name)
 
-    # 1) Discover parquet files (accepts <parquet>/base/*.parquet or <parquet>/*.parquet)
     base_path = os.path.join(parquet_path, "base")
     pattern = os.path.join(base_path, "*.parquet") if os.path.exists(base_path) \
         else os.path.join(parquet_path, "*.parquet")
@@ -1564,23 +1338,17 @@ def _build_collection_with_retry(
     if not in_file_paths:
         raise ValueError(f"No Parquet files found at '{parquet_path}'")
 
-    # 2) FAST PATH
     try:
         total_size_mb = sum(os.path.getsize(f) for f in in_file_paths) / 1024**2
     except Exception:
         total_size_mb = float("inf")
 
+    # FAST PATH
     if total_size_mb <= size_threshold_mb:
         try:
-            logger.info(
-                "⚡ Small catalog detected (%.1f MB). Building COLLECTION via fast path → %s",
-                total_size_mb, collection_path
-            )
-            # Load to pandas
+            logger.info(f"Small catalog ({total_size_mb:.1f} MB). Building collection via fast path → {collection_path}")
             pdf_list = [pd.read_parquet(p) for p in in_file_paths]
             dfp = pd.concat(pdf_list, ignore_index=True) if len(pdf_list) > 1 else pdf_list[0]
-
-            # Ensure stable column names and dtypes
             dfp = _rename_duplicate_columns_pd(dfp, logger)
 
             for col, pd_dtype in [
@@ -1613,48 +1381,32 @@ def _build_collection_with_retry(
                     except Exception:
                         pass
 
-            # Build robust Arrow schema
-            schema = _build_arrow_schema_for_catalog(
-                dfp, schema_hints=_normalize_schema_hints(schema_hints or {})
-            )
+            schema = _build_arrow_schema_for_catalog(dfp, schema_hints=_normalize_schema_hints(schema_hints or {}))
 
-            # Create in-memory catalog and write to the *final path* "<parquet_path>_hats"
             catalog = lsdb.from_dataframe(
                 dfp,
-                catalog_name=output_artifact_name,  # only metadata; path is controlled by to_hats below
+                catalog_name=output_artifact_name,
                 ra_column="ra",
                 dec_column="dec",
                 use_pyarrow_types=True,
                 schema=schema,
             )
-            catalog.to_hats(                       # write directly to the destination folder
-                collection_path,
-                as_collection=True,
-                overwrite=True,
-            )
+            catalog.to_hats(collection_path, as_collection=True, overwrite=True)
 
-            logger.info(
-                "%s: Finished: COLLECTION fast-path path=%s",
-                datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f"),
-                collection_path,
-            )
+            logger.info(f"Finished collection fast-path: {collection_path}")
             return collection_path
 
         except Exception as e:
-            logger.warning(
-                "⚠️ COLLECTION fast-path failed for %s (%s: %s). Falling back to hats_import.",
-                output_artifact_name, type(e).__name__, e
-            )
+            logger.warning(f"Collection fast-path failed for {output_artifact_name} ({type(e).__name__}: {e}). Falling back to hats_import.")
 
-    # 3) FALLBACK: hats_import (margin → no-margin)
+    # FALLBACK
     def _clean_partial():
         try:
             if os.path.isdir(collection_path):
                 shutil.rmtree(collection_path)
         except Exception as e:
-            logger.warning("Failed to remove partial '%s': %s", collection_path, e)
+            logger.warning(f"Failed to remove partial '{collection_path}': {e}")
 
-    # Prepare a schema-only Parquet to stabilize Arrow types for the importer
     schema_file = os.path.join(parent_dir, f"{output_artifact_name}_schema.parquet")
     try:
         _write_schema_file_for_collection(
@@ -1664,10 +1416,7 @@ def _build_collection_with_retry(
             schema_hints=_normalize_schema_hints(schema_hints or {}),
         )
     except Exception as e:
-        logger.warning(
-            "⚠️ Could not build schema file for fallback import (%s: %s). Proceeding without it.",
-            type(e).__name__, e
-        )
+        logger.warning(f"Could not build schema file for fallback import ({type(e).__name__}: {e}). Proceeding without it.")
         schema_file = None
 
     def _make_args(with_margin: bool):
@@ -1679,30 +1428,26 @@ def _build_collection_with_retry(
         )
         if schema_file:
             kw["use_schema_file"] = schema_file
-
-        # IMPORTANT: output_path = parent_dir, output_artifact_name = "<basename>_hats"
-        args = (
-            CollectionArguments(
-                output_artifact_name=output_artifact_name,
-                output_path=parent_dir,
-                resume=False,
-            ).catalog(**kw)
-        )
+        args = (CollectionArguments(
+            output_artifact_name=output_artifact_name,
+            output_path=parent_dir,
+            resume=False,
+        ).catalog(**kw))
         if with_margin:
             args = args.add_margin(margin_threshold=5.0, is_default=True)
         return args
 
     if try_margin:
         try:
-            logger.info("Building collection %s WITH margin (import pipeline)...", output_artifact_name)
+            logger.info(f"Building collection WITH margin (import pipeline): {output_artifact_name}")
             run_collection_import(_make_args(with_margin=True), client)
             return collection_path
         except Exception as e:
-            logger.warning("WITH margin failed: %s. Retrying without margin...", e)
+            logger.warning(f"WITH margin failed: {e}. Retrying WITHOUT margin...")
             _clean_partial()
 
     try:
-        logger.info("Building collection %s WITHOUT margin (import pipeline)...", output_artifact_name)
+        logger.info(f"Building collection WITHOUT margin (import pipeline): {output_artifact_name}")
         run_collection_import(_make_args(with_margin=False), client)
         return collection_path
     except Exception as e:
@@ -1722,17 +1467,20 @@ def _maybe_collection(
 ) -> str:
     """Optionally build a Collection from prepared Parquet.
 
-    Behavior:
-      - If combine_mode == "concatenate": return "" (no collection).
-      - Else: call _build_collection_with_retry(out_path, ...) which will write the
-        collection alongside the parquet as "<out_path>_hats" and return that path.
-    """
-    # Silence linters about unused parameters kept for compatibility.
-    _ = (product_name, temp_dir)
+    Args:
+        out_path: Prepared parquet path.
+        logs_dir: Logs directory.
+        logger: Logger.
+        client: Dask client.
+        combine_mode: Combine mode.
+        schema_hints: Expr hints.
+        size_threshold_mb: Fast-path threshold.
 
+    Returns:
+        str: Collection path or empty string for concatenate mode.
+    """
     if combine_mode == "concatenate":
         return ""
-
     return _build_collection_with_retry(
         parquet_path=out_path,
         logs_dir=logs_dir,
@@ -1756,81 +1504,87 @@ def prepare_catalog(
 ) -> tuple[str, str, str, str, str]:
     """Prepare a spectroscopic catalog for the CRC pipeline.
 
-    High-level flow:
-      1) Load product via ProductHandle → Dask DataFrame.
-      2) YAML validation & safe renaming (base schema enforced).
-      3) Respect user-provided homogenized fields if mapped in YAML.
-      4) Normalize dtypes/values; map survey-specific z_flag encodings.
-      5) Generate stable CRD_IDs.
-      6) Compute homogenized columns (no decisions taken here).
-      7) Persist + repartition to stabilize memory and shuffle throughput.
-      8) Initialize an empty 'compared_to' column (skip intra-catalog association).
-      9) Strict RA/DEC validation and DP1 field flagging.
-      10) Select final columns and write Parquet.
-      11) Optionally build a HATS Collection (with margin fallback).
+    Args:
+        entry: Product descriptor with keys like {"path", "internal_name", ...}.
+        translation_config: YAML-derived rules.
+        logs_dir: Logs directory.
+        temp_dir: Temp workspace for artifacts.
+        combine_mode: Combine strategy (kept for compatibility).
 
-    Note:
-      - No tie-breaking (neither by columns nor Δz) happens in this module.
-        Actual deduplication is performed later by the 'deduplication' module.
+    Returns:
+        Tuple[str, str, str, str, str]: (collection_path, "ra", "dec", internal_name, "").
     """
-    from dask.distributed import get_client as _get_client, wait
+    # Ensure central logger in this process (worker-safe)
+    try:
+        ensure_crc_logger(logs_dir)
+    except Exception:
+        pass
 
-    client = _get_client()
+    try:
+        client = _get_client()
+    except Exception:
+        client = None
 
     product_name = entry["internal_name"]
-    logger = _build_logger(logs_dir, LOGGER_NAME, "prepare_all.log")
-    logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Starting: prepare_catalog id={product_name}")
+    base_logger = _get_logger()
+    lg = _phase_logger(base_logger, phase="preparation", product=product_name)
 
-    # 1) Load product into a Dask DataFrame.
+    # ===== START PHASE (per catalog) =====
+    lg.info(f"START prepare_catalog product={product_name}")
+
+    # 1) Load product
     ph = ProductHandle(entry["path"])
     df = ph.to_ddf()
 
-    # 2) Validate & rename according to YAML mapping; enforce base schema.
-    df = _validate_and_rename(df, entry, logger)
-    df = _stash_previous_results(df, entry, logger)
+    # 2) Validate & rename, base schema
+    df = _validate_and_rename(df, entry, lg)
+    df = _stash_previous_results(df, entry, lg)
 
-    # 3) Honor already-homogenized columns declared via YAML (if any).
-    df = _honor_user_homogenized_mapping(df, entry, product_name, logger)
+    # 3) Honor user-provided homogenized columns
+    df = _honor_user_homogenized_mapping(df, entry, product_name, lg)
 
-    # 4) Normalize dtypes/values (strings, floats, optional `type`, and z_flag mapping).
-    df, type_cast_ok = _normalize_types(df, product_name, logger)
+    # 4) Normalize types and values
+    df, type_cast_ok = _normalize_types(df, product_name, lg)
 
     # 5) Assign CRD_IDs
     df = _generate_crd_ids(df, product_name, temp_dir)
 
-    # 6) Compute homogenized fields (vectorized translations / fast-paths).
-    df, used_type_fastpath, tiebreaking_priority, instrument_type_priority, translation_rules_uc = _homogenize(
-        df, translation_config, product_name, logger, type_cast_ok=type_cast_ok
-    )
+    # 6) Homogenized fields
+    (
+        df,
+        used_type_fastpath,
+        tiebreaking_priority,
+        instrument_type_priority,   # noqa: F841
+        translation_rules_uc,
+    ) = _homogenize(df, translation_config, product_name, lg, type_cast_ok=type_cast_ok)
 
-    # 7) Persist + repartition BEFORE heavy shuffles.
-    part_size = "256MB"  # good default for ~25 cores / 50 GB workers
+    # 7) Persist + repartition
+    part_size = "256MB"
     try:
-        df = df.persist(); wait(df)
+        if client is not None:
+            df = df.persist()
+            wait(df)
         with dask.config.set({"dataframe.shuffle.method": "tasks"}):
             df = df.repartition(partition_size=part_size)
-        logger.info(f"{product_name} persisted and repartitioned with partition_size={part_size}. "
-                    f"npartitions={df.npartitions}")
+        lg.info(f"Persisted and repartitioned: partition_size={part_size} npartitions={df.npartitions}")
     except Exception as e:
-        logger.warning(f"⚠️ {product_name} persist/repartition step failed or was skipped: {e}")
+        lg.warning(f"Persist/repartition skipped or failed: {e}")
 
-    # 8) Add empty compared_to column
+    # 8) Init compared_to/tie_result
     df = _add_missing_with_dtype(df, "compared_to", DTYPE_STR)
-
-    # Ensure 'tie_result' exists and is stable-typed; no decisions are taken here.
     df = _add_missing_with_dtype(df, "tie_result", DTYPE_INT8)
     df["tie_result"] = df["tie_result"].map_partitions(
         lambda s: pd.to_numeric(s, errors="coerce").fillna(1).astype(DTYPE_INT8),
         meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
     )
 
-    # 9) Validate geometry early to fail fast on malformed inputs.
+    # 9) Geometry validation
     _validate_ra_dec_or_fail(df, product_name)
 
-    # 10) Flag DP1 fields.
+    # 10) DP1 flag
     df = _flag_dp1(df)
 
-    # 11) Assemble final columns.
+    # 11) Assemble final columns
     df = _select_output_columns(
         df,
         translation_rules_uc,
@@ -1840,36 +1594,39 @@ def prepare_catalog(
         schema_hints=_normalize_schema_hints(translation_config.get("expr_column_schema")),
     )
 
-    # Coalesce partitions before writing to reduce small-file counts and speed up import.
+    # Coalesce partitions for write
     try:
-        nworkers = len(client.scheduler_info()["workers"]) or 1
+        if client is not None:
+            nworkers = max(len(client.scheduler_info().get("workers", {})), 1)
+        else:
+            nworkers = 1
     except Exception:
         nworkers = 1
     target_out_parts = max(2 * nworkers, 8)
     try:
         with dask.config.set({"dataframe.shuffle.method": "tasks"}):
             df_to_write = df.repartition(npartitions=target_out_parts)
-        logger.info(f"{product_name} output repartitioned for write: npartitions={df_to_write.npartitions}")
+        lg.info(f"Output repartitioned for write: npartitions={df_to_write.npartitions}")
     except Exception as e:
-        logger.warning(f"⚠️ {product_name} output repartition failed; writing with current npartitions. Reason: {e}")
+        lg.warning(f"Output repartition failed; writing current npartitions. Reason: {e}")
         df_to_write = df
 
-    # 12) Write prepared parquet..
+    # 12) Write prepared parquet
     out_path = _save_parquet(df_to_write, temp_dir, product_name)
 
-    # 13) Build Collection (always). The builder writes to "<out_path>_hats"
-    # and returns that absolute path. It contains its own fast-path/fallback.
+    # 13) Build collection (always)
     schema_hints_raw = translation_config.get("expr_column_schema")
-
     collection_path = _build_collection_with_retry(
         parquet_path=out_path,
         logs_dir=logs_dir,
-        logger=logger,
+        logger=lg,
         client=client,
         try_margin=True,
         schema_hints=schema_hints_raw,
         size_threshold_mb=200,
     )
 
-    logger.info(f"{datetime.now():%Y-%m-%d-%H:%M:%S.%f}: Finished: prepare_catalog id={product_name}")
+    # ===== END PHASE (per catalog) =====
+    lg.info(f"END prepare_catalog product={product_name} path={collection_path}")
+
     return collection_path, "ra", "dec", product_name, ""

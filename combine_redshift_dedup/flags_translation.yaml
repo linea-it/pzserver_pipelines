@@ -43,14 +43,14 @@ instrument_type_priority:
 save_expr_columns: false
 
 expr_column_schema:
-  z_best_s: int
+  z_best_s: float
   z_spec: float
-  use_zgrism: int
-  flag1: int
-  use_phot: int
+  use_zgrism: float
+  flag1: float
+  use_phot: float
   zspec_survey: str
   zspec: float
-  z_flag: int
+  z_flag: float
   ZCAT_PRIMARY: bool
 
 translation_rules:
