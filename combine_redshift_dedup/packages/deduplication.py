@@ -355,6 +355,55 @@ def _to_numeric(series_like) -> pd.Series:
 
 
 # ==============================
+# Guard Restore
+# ==============================
+def _only_star_neighbors_series(col: pd.Series, star_ids: set[str]) -> pd.Series:
+    """True when compared_to is non-empty AND all neighbors are star IDs."""
+    s = col.astype("string").fillna("")
+    lst = s.str.split(",")
+    out = []
+    for tokens in lst:
+        toks = [t.strip() for t in tokens if t and t.strip()]
+        out.append(bool(toks) and all((tok in star_ids) for tok in toks))
+    return pd.Series(out, index=col.index, dtype="boolean")
+
+
+def _apply_guard_restore_local(
+    df: pd.DataFrame,
+    *,
+    crd_col: str,
+    compared_col: str,
+    zf_series: Optional[pd.Series],
+    tie_col: str,
+    tie_col_orig: str,
+) -> pd.DataFrame:
+    """Restore original tie_result for non-stars with empty compared_to OR only-star neighbors."""
+    if tie_col_orig not in df.columns:
+        return df  # nada a restaurar
+
+    # estrela (fixos em 3) e máscara de compared_to vazio
+    is_star = pd.Series(False, index=df.index)
+    if zf_series is not None:
+        is_star = pd.to_numeric(zf_series, errors="coerce").eq(6.0)
+
+    cmp_str   = df[compared_col].astype("string")
+    cmp_empty = cmp_str.isna() | cmp_str.str.strip().eq("")
+
+    # conjunto local de IDs de estrelas nesta partição/view
+    star_ids = set(df.loc[is_star, crd_col].astype("string"))
+
+    only_star_neighbors = (~cmp_empty) & _only_star_neighbors_series(df[compared_col], star_ids)
+
+    # regra pedida:
+    # - se objeto é estrela -> mantém tie=3 (não restaurar)
+    # - se não-estrela e (compared_to vazio OU só vizinhos estrelas) -> restaurar
+    restore_mask = (~is_star) & (cmp_empty | only_star_neighbors)
+
+    # aplica restauração
+    df.loc[restore_mask, tie_col] = df.loc[restore_mask, tie_col_orig]
+    return df
+
+# ==============================
 # Per-group resolver
 # ==============================
 def _resolve_group(
@@ -449,6 +498,13 @@ def deduplicate_pandas(
 
     out = df.copy()
 
+    tie_col_orig = f"{tie_col}_orig"
+    if tie_col in out.columns:
+        try:
+            out[tie_col_orig] = out[tie_col].astype("Int8")
+        except Exception:
+            out[tie_col_orig] = out[tie_col]
+
     crd_norm = out[crd_col].astype("string").str.strip()
     priority_set = set(tiebreaking_priority)
 
@@ -535,8 +591,9 @@ def deduplicate_pandas(
     is_star_np = is_star.to_numpy(dtype=bool, na_value=False)
 
     tr = np.zeros(len(out), dtype=np.int8)
-    tr[is_singleton_np] = 1
-    tr[is_singleton_np & is_star_np] = 3
+    tr[is_star_np] = 3
+    tr[is_singleton_np & ~is_star_np] = 1
+
 
     is_multi = ~is_singleton
     non_star = ~is_star
@@ -700,7 +757,23 @@ def deduplicate_pandas(
             else:
                 out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array([2, 2], dtype=np.int8)
 
-    out.drop(columns=["__group__"], inplace=True)
+    out = _apply_guard_restore_local(
+        out,
+        crd_col=crd_col,
+        compared_col=compared_col,
+        zf_series=zf_series,
+        tie_col=tie_col,
+        tie_col_orig=tie_col_orig,
+    )
+
+    drop_cols = ["__group__"]
+    if tie_col_orig in out.columns:
+        drop_cols.append(tie_col_orig)
+    out.drop(columns=drop_cols, inplace=True, errors="ignore")
+
+    if zf_series is not None:
+        out.loc[zf_series.eq(6).fillna(False), tie_col] = np.int8(3)
+    
     return out
 
 
@@ -780,7 +853,8 @@ def _dedup_local_with_margin(
     pm = _to_pandas(part_main)
     mg = _to_pandas(part_margin)
 
-    needed = {crd_col, compared_col, z_col, "_src"} | set(tiebreaking_priority or [])
+    needed = {crd_col, compared_col, z_col, tie_col} | set(tiebreaking_priority or [])
+
     if instrument_type_priority is not None:
         needed.add("instrument_type_homogenized")
 
@@ -830,7 +904,8 @@ def _dedup_local_no_margin(
     """Solve dedup using only the main partition."""
     pm = _to_pandas(part_main)
 
-    needed = {crd_col, compared_col, z_col} | set(tiebreaking_priority or [])
+    needed = {crd_col, compared_col, z_col, "_src", tie_col} | set(tiebreaking_priority or [])
+
     if instrument_type_priority is not None:
         needed.add("instrument_type_homogenized")
 

@@ -1,16 +1,23 @@
 # validation_functions.py
 from __future__ import annotations
 
+# ==============================
+# Standard library
+# ==============================
 import math
-import pandas as pd
-import numpy as np
 from collections import defaultdict
 from itertools import combinations
-from typing import Dict
+from typing import Dict, List, Tuple
 
+# ==============================
+# Third-party libraries
+# ==============================
+import numpy as np
+import pandas as pd
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from IPython.display import display, Markdown
 
-from IPython.display import display, Markdown
 
 def _norm_str(s):
     """Normalize strings; NA-like -> None."""
@@ -34,7 +41,6 @@ def _parse_cmp_list_fast(s: str) -> list[str]:
     if not s or s.lower() in {"na", "nan", "<na>", "none", "null"}:
         return []
     return [x.strip() for x in s.split(",") if x.strip()]
-
 
 def validate_intra_source_cells_fast(
     df_final: pd.DataFrame,
@@ -393,74 +399,113 @@ def validate_tie_results_fast(
     threshold: float = 0.0005,
     max_groups: int | None = None,
     include_rows: bool = False,
-):
-    """Unified-graph validator (stars do not connect).
+) -> Dict[str, object]:
+    """
+    Unified-graph validator (stars do not connect).
 
     * Build a single graph EXCLUDING any edge/node that touches a star.
-    * z_flag rank: star(6) = -2, NaN = -1, others = numeric (used for rules).
-    * Within each component (non-stars only), apply all rules among non-stars.
+    * Stars for validation are ONLY those with z_flag_homogenized == 6
+      (do not infer stars from tie_result == 3).
+    * Within each component (non-stars only), apply rules among non-stars.
       Stars do not connect groups nor influence 1/2.
 
     Args:
       df_final: Input dataframe.
-      threshold: Delta-z threshold.
-      max_groups: Optional cap on scanned components.
-      include_rows: Include violating rows in payload.
+      threshold: Delta-z threshold (pairs with Δz <= threshold count as "too close").
+      max_groups: Optional cap on scanned components (non-star components).
+      include_rows: Include violating rows (dataframes) in payload.
 
     Returns:
       Dict with summary and violations.
     """
-    import numpy as np
-    import math
-    from scipy.sparse import coo_matrix
-    from scipy.sparse.csgraph import connected_components
-
     # ---------------------------
     # Input prep
     # ---------------------------
     df = df_final.copy()
-    req = ["CRD_ID", "compared_to", "z_flag_homogenized", "tie_result",
-           "instrument_type_homogenized", "z"]
+
+    # Ensure columns exist
+    req = [
+        "CRD_ID",
+        "compared_to",
+        "z_flag_homogenized",
+        "tie_result",
+        "instrument_type_homogenized",
+        "z",
+    ]
     for c in req:
         if c not in df.columns:
             df[c] = np.nan
 
+    # Canonical dtypes for core columns
     df["CRD_ID"] = df["CRD_ID"].astype(str)
     df["compared_to"] = df["compared_to"].astype("string")
 
-    # Global masks for stars (for summary and global checks)
+    # Global numeric views
     zf_all = pd.to_numeric(df["z_flag_homogenized"], errors="coerce")
     tr_all = pd.to_numeric(df["tie_result"], errors="coerce")
-    is_star_row = (zf_all == 6) | (tr_all == 3)
+
+    # Stars for VALIDATION = z_flag_homogenized == 6 ONLY
+    is_star_row = zf_all.eq(6.0)
     star_ids = set(df.loc[is_star_row, "CRD_ID"].astype(str))
 
     violations: list[dict] = []
 
     # ---------------------------
-    # Build edges (EXCLUDE stars as A and as B)
+    # Global star consistency checks
+    # ---------------------------
+    star_must_be_3 = df[is_star_row & ~tr_all.eq(3.0)]
+    if not star_must_be_3.empty:
+        violations.append(
+            {
+                "rule": "STAR_MUST_BE_3",
+                "message": "Rows with z_flag_homogenized==6 must have tie_result==3.",
+                "group_ids": tuple(star_must_be_3["CRD_ID"].astype(str).tolist()),
+                "rows": star_must_be_3 if include_rows else None,
+            }
+        )
+
+    nonstar_cant_be_3 = df[~is_star_row & tr_all.eq(3.0)]
+    if not nonstar_cant_be_3.empty:
+        violations.append(
+            {
+                "rule": "NONSTAR_MUST_NOT_BE_3",
+                "message": "Rows with z_flag_homogenized!=6 must not have tie_result==3.",
+                "group_ids": tuple(nonstar_cant_be_3["CRD_ID"].astype(str).tolist()),
+                "rows": nonstar_cant_be_3 if include_rows else None,
+            }
+        )
+
+    # ---------------------------
+    # Build edges (EXCLUDE stars as A and as B, and drop B not in df)
     # ---------------------------
     base = df[["CRD_ID", "compared_to"]].copy()
     cmp_df = (
-        base.assign(_cmp_list=base["compared_to"].map(_parse_cmp_list_fast))
-            [["CRD_ID", "_cmp_list"]]
-            .explode("_cmp_list", ignore_index=True)
-            .rename(columns={"CRD_ID": "A", "_cmp_list": "B"})
+        base.assign(_cmp_list=base["compared_to"].map(_parse_cmp_list_fast))[["CRD_ID", "_cmp_list"]]
+        .explode("_cmp_list", ignore_index=True)
+        .rename(columns={"CRD_ID": "A", "_cmp_list": "B"})
     )
+
     cmp_df["A"] = cmp_df["A"].astype(str)
-    cmp_df["B"] = cmp_df["B"].astype("string")
+    cmp_df["B"] = cmp_df["B"].astype("string").str.strip()
     cmp_df = cmp_df[cmp_df["B"].notna() & (cmp_df["B"] != "")]
 
-    # EXCLUDE any edge that touches a star
+    # Keep only edges to B that actually exist in df (prevents phantom NaN nodes)
+    valid_ids = set(df["CRD_ID"].astype(str))
+    if valid_ids:
+        cmp_df = cmp_df[cmp_df["B"].isin(valid_ids)]
+
+    # EXCLUDE edges that touch a star (either endpoint)
     if star_ids:
         cmp_df = cmp_df[~cmp_df["A"].isin(star_ids) & ~cmp_df["B"].isin(star_ids)]
 
+    # No edges → no non-star components to validate (still return star stats).
     if cmp_df.empty:
         summary = {
-            "n_components": 0,
+            "n_components": 0,  # only among non-stars
             "n_pairs": 0,
             "n_groups": 0,
             "n_violations": len(violations),
-            "by_rule": pd.Series([v["rule"] for v in violations]).value_counts().to_dict() if violations else {},
+            "by_rule": (pd.Series([v["rule"] for v in violations]).value_counts().to_dict() if violations else {}),
             "n_stars_excluded": int(len(star_ids)),
         }
         return {"summary": summary, "violations": violations}
@@ -477,38 +522,43 @@ def validate_tie_results_fast(
     hi = np.maximum(ai, bi)
     und = np.stack([lo, hi], axis=1)
     und = und[und[:, 0] != und[:, 1]]
-    undv = und.view([("x", und.dtype), ("y", und.dtype)])
-    und = np.unique(undv).view(und.dtype).reshape(-1, 2)
 
-    n_nodes = nodes.size
-    data = np.ones(len(und), dtype=np.int8)
-    A = coo_matrix((data, (und[:, 0], und[:, 1])), shape=(n_nodes, n_nodes))
-    A = A + A.T
-    n_comp_all, labels = connected_components(A, directed=False, return_labels=True)
+    if und.size == 0:
+        # All edges were self-loops (after cleaning) → every node is its own component
+        n_comp_all = nodes.size
+        labels = np.arange(nodes.size, dtype=np.int64)
+    else:
+        # Unique undirected edges
+        undv = und.view([("x", und.dtype), ("y", und.dtype)])
+        und = np.unique(undv).view(und.dtype).reshape(-1, 2)
+
+        n_nodes = nodes.size
+        data = np.ones(len(und), dtype=np.int8)
+        A = coo_matrix((data, (und[:, 0], und[:, 1])), shape=(n_nodes, n_nodes))
+        A = A + A.T
+        n_comp_all, labels = connected_components(A, directed=False, return_labels=True)
 
     # ---------------------------
-    # Precompute arrays aligned to `nodes` (non-stars only)
+    # Precompute arrays aligned to `nodes` (non-stars only set)
     # ---------------------------
+    # node_df is a view of df aligned to ordered 'nodes'
     node_df = df.set_index(df["CRD_ID"].astype(str), drop=False).reindex(nodes, copy=False)
 
     zf = pd.to_numeric(node_df["z_flag_homogenized"], errors="coerce").to_numpy()
     tr = pd.to_numeric(node_df["tie_result"], errors="coerce").to_numpy()
+    z  = pd.to_numeric(node_df["z"], errors="coerce").to_numpy()
 
-    # rank: star(6)=-2, NaN=-1, others=numeric (stars não deveriam aparecer aqui, mas mantemos a codificação)
-    zf_rank_nodes = np.where(np.isnan(zf), -1.0, zf)
-    zf_rank_nodes[zf == 6] = -2.0
+    # Rank for flags (keep the mapping even though stars should not be present here);
+    # star(6)=-2, NaN=-1, others numeric.
+    zf_rank = np.where(np.isnan(zf), -1.0, zf)
+    zf_rank[zf == 6] = -2.0
 
-    # type priority
+    # Instrument type priority (example mapping; adjust if you use a different one)
     type_map = {"s": 3, "g": 2, "p": 1}
-    it_nodes = node_df["instrument_type_homogenized"].map(
-        lambda t: type_map.get(_norm_str(t), 0)
-    ).astype(np.int16).to_numpy()
+    it = node_df["instrument_type_homogenized"].map(lambda t: type_map.get(_norm_str(t), 0)).astype(np.int16).to_numpy()
 
-    # redshift
-    z_nodes = pd.to_numeric(node_df["z"], errors="coerce").to_numpy()
-
-    # (Todos os nós aqui são não-estrelas, pois removemos os que tocavam estrela ao montar as arestas)
-    # Ainda assim, guardamos a máscara por segurança:
+    # Non-star mask among nodes (redundant because we filtered edges to avoid stars,
+    # but kept as a safety net if rows slip in).
     nonstar_mask_nodes = (zf != 6) & (tr != 3)
 
     # ---------------------------
@@ -527,25 +577,25 @@ def validate_tie_results_fast(
             break
 
         start, end = boundaries[b], boundaries[b + 1]
-        comp_idx = order[start:end]                     # node indices (non-star nodes)
+        comp_idx = order[start:end]            # node indices (non-star nodes set)
         comp_ids_str = tuple(nodes[comp_idx].tolist())
 
-        # Payload once per component (non-stars only — matches group_ids)
         rows_payload_all = node_df.iloc[comp_idx].copy() if include_rows else None
 
-        # Non-star nodes inside the component (redundant but safe)
+        # Non-star guard (should be all non-stars anyway)
         ns_mask_local = nonstar_mask_nodes[comp_idx]
         ns_idx = comp_idx[ns_mask_local]
 
+        # Components with <2 non-star nodes have no pair/group rules to check
         if ns_idx.size < 2:
             comps_scanned += 1
             continue
 
-        # Slice arrays for the component
+        # Slice arrays for the component (non-stars)
         tr_c = np.nan_to_num(tr[ns_idx], nan=-1.0).astype(np.int16)
-        it_c = it_nodes[ns_idx]
-        zf_c = zf_rank_nodes[ns_idx]
-        z_c  = z_nodes[ns_idx]
+        it_c = it[ns_idx]
+        zf_c = zf_rank[ns_idx]
+        z_c  = z[ns_idx]
 
         m = ns_idx.size
         if m == 2:
@@ -558,63 +608,83 @@ def validate_tie_results_fast(
             za, zb = z_c[a], z_c[b_]
             dz = np.inf if (np.isnan(za) or np.isnan(zb)) else abs(za - zb)
 
-            vios_local = []
+            vios_local: List[Tuple[str, str]] = []
             if (tr_a in (0, 1)) and (tr_b in (0, 1)) and (tr_a != tr_b):
+                # winner must dominate in flag or (if equal) in type;
+                # if still tied in flag+type, Δz must be <= threshold to justify a single winner;
+                # otherwise this is suspicious.
                 win_is_a = (tr_a == 1)
                 win_zf, los_zf = (zf_a, zf_b) if win_is_a else (zf_b, zf_a)
                 win_ts, los_ts = (ts_a, ts_b) if win_is_a else (ts_b, ts_a)
                 cond = (
                     (win_zf > los_zf) or
                     (win_zf == los_zf and win_ts > los_ts) or
-                    (win_zf == los_zf and win_ts == los_ts and dz < threshold)
+                    (win_zf == los_zf and win_ts == los_ts and (dz <= threshold))
                 )
                 if not cond:
-                    vios_local.append(("PAIR_1v0_PRIORITY",
-                                       "Winner lacks higher flag/type or Δz<threshold when tie persists."))
+                    vios_local.append((
+                        "PAIR_1v0_PRIORITY",
+                        "Winner lacks higher flag/type, and Δz is not <= threshold when flag/type tie persists.",
+                    ))
             elif (tr_a == 2) and (tr_b == 2):
-                cond = (zf_a == zf_b) and (ts_a == ts_b) and (dz > threshold or math.isinf(dz))
+                # a proper 2–2 requires equal flag/type; and if both z are defined, they should be > threshold apart
+                cond = (zf_a == zf_b) and (ts_a == ts_b) and (np.isinf(dz) or (dz > threshold))
                 if not cond:
-                    vios_local.append(("PAIR_2v2_TIE_CONSISTENCY",
-                                       "Tie (2,2) requires equal flag/type and Δz>threshold (or undefined)."))
+                    vios_local.append((
+                        "PAIR_2v2_TIE_CONSISTENCY",
+                        "Tie (2,2) requires equal flag/type and Δz>threshold (or undefined z).",
+                    ))
             elif (tr_a == 0) and (tr_b == 0):
-                vios_local.append(("PAIR_0v0_SUSPECT",
-                                   "Both eliminated (0,0); check upstream logic."))
+                vios_local.append((
+                    "PAIR_0v0_SUSPECT",
+                    "Both eliminated (0,0); check upstream logic.",
+                ))
             else:
-                vios_local.append(("PAIR_INVALID_TIE_PATTERN",
-                                   f"Unexpected tie_result pattern: ({tr_a},{tr_b})."))
+                vios_local.append((
+                    "PAIR_INVALID_TIE_PATTERN",
+                    f"Unexpected tie_result pattern: ({tr_a},{tr_b}).",
+                ))
 
             if vios_local:
                 for rule, msg in vios_local:
-                    violations.append({
-                        "rule": rule, "message": msg,
-                        "group_ids": comp_ids_str,
-                        "rows": rows_payload_all,
-                    })
+                    violations.append(
+                        {
+                            "rule": rule,
+                            "message": msg,
+                            "group_ids": comp_ids_str,
+                            "rows": rows_payload_all,
+                        }
+                    )
 
         else:
             n_groups += 1
+            # Survivors among non-stars are 1 or 2
             surv = np.isin(tr_c, (1, 2))
 
-            # Flag dominance (NaN=-1 in zf_c; stars never appear here)
+            # Flag dominance (NaN -> -1 in zf_c; stars never appear here)
             max_flag = np.max(zf_c) if zf_c.size else -np.inf
             if np.any(surv & (zf_c < max_flag)):
-                violations.append({
-                    "rule": "GROUP_FLAG_DOMINANCE",
-                    "message": "Survivors include members with lower z_flag than group max (rank: star=-2 < NaN=-1 < others).",
-                    "group_ids": comp_ids_str,
-                    "rows": rows_payload_all,
-                })
+                violations.append(
+                    {
+                        "rule": "GROUP_FLAG_DOMINANCE",
+                        "message": "Survivors include members with lower z_flag than group max (rank: star=-2 < NaN=-1 < others).",
+                        "group_ids": comp_ids_str,
+                        "rows": rows_payload_all,
+                    }
+                )
 
             # Type dominance among top-flag
             cand_flag = (zf_c == max_flag)
             max_type = np.max(it_c[cand_flag]) if np.any(cand_flag) else -1
             if np.any(surv & (it_c < max_type)):
-                violations.append({
-                    "rule": "GROUP_TYPE_DOMINANCE",
-                    "message": "Survivors include members with lower instrument_type than group max among top-flag.",
-                    "group_ids": comp_ids_str,
-                    "rows": rows_payload_all,
-                })
+                violations.append(
+                    {
+                        "rule": "GROUP_TYPE_DOMINANCE",
+                        "message": "Survivors include members with lower instrument_type than group max among top-flag.",
+                        "group_ids": comp_ids_str,
+                        "rows": rows_payload_all,
+                    }
+                )
 
             # Δz independence among top-flag & top-type survivors
             cand = cand_flag & (it_c == max_type)
@@ -626,44 +696,52 @@ def validate_tie_results_fast(
                     zi = zS[i]
                     if np.isnan(zi):
                         continue
-                    d = np.abs(zS[i+1:] - zi)
-                    if np.any(~np.isnan(d) & (d < threshold)):
+                    d = np.abs(zS[i + 1 :] - zi)
+                    if np.any(~np.isnan(d) & (d <= threshold)):
                         too_close = True
                         break
                 if too_close:
-                    violations.append({
-                        "rule": "GROUP_DELTZ_INDEPENDENCE",
-                        "message": "Two survivors are closer than threshold among max-flag & max-type.",
-                        "group_ids": comp_ids_str,
-                        "rows": rows_payload_all,
-                    })
+                    violations.append(
+                        {
+                            "rule": "GROUP_DELTZ_INDEPENDENCE",
+                            "message": "Two survivors are <= threshold apart among max-flag & max-type.",
+                            "group_ids": comp_ids_str,
+                            "rows": rows_payload_all,
+                        }
+                    )
 
             # Survivor count (among non-stars)
             n_surv = int(np.sum(surv))
             if n_surv == 0:
-                violations.append({
-                    "rule": "GROUP_NO_SURVIVOR_SUSPECT",
-                    "message": "No survivors among non-stars inside a star-excluded component.",
-                    "group_ids": comp_ids_str,
-                    "rows": rows_payload_all,
-                })
+                violations.append(
+                    {
+                        "rule": "GROUP_NO_SURVIVOR_SUSPECT",
+                        "message": "No survivors among non-stars inside a star-excluded component.",
+                        "group_ids": comp_ids_str,
+                        "rows": rows_payload_all,
+                    }
+                )
             elif n_surv == 1:
                 only_idx = int(np.where(surv)[0][0])
                 if int(tr_c[only_idx]) != 1:
-                    violations.append({
-                        "rule": "GROUP_SINGLE_SURVIVOR_MUST_BE_1",
-                        "message": "Exactly one survivor among non-stars but not labeled tie_result == 1.",
-                        "group_ids": comp_ids_str,
-                        "rows": rows_payload_all,
-                    })
+                    violations.append(
+                        {
+                            "rule": "GROUP_SINGLE_SURVIVOR_MUST_BE_1",
+                            "message": "Exactly one survivor among non-stars but not labeled tie_result == 1.",
+                            "group_ids": comp_ids_str,
+                            "rows": rows_payload_all,
+                        }
+                    )
             else:
                 if not np.all(tr_c[surv] == 2):
-                    violations.append({
-                        "rule": "GROUP_MULTI_SURVIVOR_MUST_BE_2",
-                        "message": "Multiple survivors among non-stars but not all labeled tie_result == 2.",
-                        "group_ids": comp_ids_str,
-                        "rows": rows_payload_all,
-                    })
+                    violations.append(
+                        {
+                            "rule": "GROUP_MULTI_SURVIVOR_MUST_BE_2",
+                            "message": "Multiple survivors among non-stars but not all labeled tie_result == 2.",
+                            "group_ids": comp_ids_str,
+                            "rows": rows_payload_all,
+                        }
+                    )
 
         comps_scanned += 1
 
@@ -672,7 +750,7 @@ def validate_tie_results_fast(
         "n_pairs": int(n_pairs),
         "n_groups": int(n_groups),
         "n_violations": len(violations),
-        "by_rule": pd.Series([v["rule"] for v in violations]).value_counts().to_dict() if violations else {},
+        "by_rule": (pd.Series([v["rule"] for v in violations]).value_counts().to_dict() if violations else {}),
         "n_stars_excluded": int(len(star_ids)),
     }
     return {"summary": summary, "violations": violations}
@@ -683,46 +761,56 @@ def explain_tie_validation_output(
     show_per_rule: int = 3,
     prefer_cols: list[str] | None = None,
 ):
-    """Explain and display results from validate_tie_results()."""
+    """Explain and display results from validate_tie_results_fast().
+
+    The validator builds a single graph **excluding any edge that touches a star**
+    (rows where `z_flag_homogenized == 6` or `tie_result == 3`). All rules are
+    applied only among **non-star** nodes inside each connected component.
+    Stars must have `tie_result == 3`, never connect groups, and never influence
+    1/2 decisions among non-stars.
+    """
     if prefer_cols is None:
         prefer_cols = [
             "CRD_ID", "ra", "dec", "z",
             "z_flag_homogenized",
-            "instrument_type_homogenized",  # preferred name
-            "type_homogenized",             # fallback, if it exists
+            "instrument_type_homogenized",  # preferred
+            "type_homogenized",             # optional fallback if present
             "tie_result",
             "compared_to",
         ]
 
-    summary = report.get("summary", {}) or {}
-    violations = report.get("violations", []) or []
+    summary = report.get("summary") or {}
+    violations = report.get("violations") or []
 
     # ---------------------------
     # Header + Global Summary
     # ---------------------------
     display(Markdown("### Tie-results validation"))
-    display(Markdown(
-f"""
+    display(
+        Markdown(
+            f"""
 #### Summary
-- **Analyzed components**: `{summary.get("n_components", 0)}`
-- **Pairs (size=2)**: `{summary.get("n_pairs", 0)}`
-- **Groups (size≥3)**: `{summary.get("n_groups", 0)}`
+- **Analyzed components (non-stars only)**: `{summary.get("n_components", 0)}`
+- **Pairs (size = 2)**: `{summary.get("n_pairs", 0)}`
+- **Groups (size ≥ 3)**: `{summary.get("n_groups", 0)}`
 - **Total violations**: `{summary.get("n_violations", 0)}`
-- **Stars present** (`z_flag_homogenized==6` or `tie_result==3`): `{summary.get("n_stars_excluded", 0)}`
+- **Stars excluded from the graph** (`z_flag_homogenized==6` or `tie_result==3`): `{summary.get("n_stars_excluded", 0)}`
 """
-    ))
+        )
+    )
 
     # ---------------------------
     # Count by Rule
     # ---------------------------
-    by_rule = summary.get("by_rule", {}) or {}
+    by_rule = summary.get("by_rule") or {}
     display(Markdown("#### Violations by rule"))
     if by_rule:
-        by_rule_df = pd.DataFrame(
-            [(k, v) for k, v in by_rule.items()],
-            columns=["rule", "count"]
-        ).sort_values("count", ascending=False, kind="mergesort")
-        display(by_rule_df.reset_index(drop=True))
+        by_rule_df = (
+            pd.DataFrame([(k, v) for k, v in by_rule.items()], columns=["rule", "count"])
+            .sort_values("count", ascending=False, kind="mergesort")
+            .reset_index(drop=True)
+        )
+        display(by_rule_df)
     else:
         display(Markdown("_No violations — everything consistent ✅_"))
 
@@ -734,41 +822,41 @@ f"""
     # Samples per Rule
     # ---------------------------
     display(Markdown("### Samples per rule"))
-    # group by rule
-    vio_by_rule = {}
+
+    # Group violations by rule
+    vio_by_rule: dict[str, list[dict]] = {}
     for v in violations:
         vio_by_rule.setdefault(v.get("rule", "UNKNOWN_RULE"), []).append(v)
 
-    # order by count
-    ordered_rules = list(vio_by_rule.keys())
+    # Order rules by frequency if available
     if by_rule:
         ordered_rules = [r for r, _ in sorted(by_rule.items(), key=lambda x: x[1], reverse=True)]
+    else:
+        ordered_rules = list(vio_by_rule.keys())
 
     for rule in ordered_rules:
-        V = vio_by_rule[rule]
-        display(Markdown(f"### Rule: `{rule}`  —  {len(V)} occurrence(s)"))
-        # typical message (first one)
-        msg = V[0].get("message", "")
+        V = vio_by_rule.get(rule, [])
+        display(Markdown(f"### Rule: `{rule}` — {len(V)} occurrence(s)"))
+
+        # Typical message (from the first occurrence)
+        msg = V[0].get("message", "") if V else ""
         if msg:
             display(Markdown(f"> _{msg}_"))
 
-        # show up to show_per_rule examples
-        for i, viol in enumerate(V[:show_per_rule], start=1):
+        # Show up to `show_per_rule` examples
+        for i, viol in enumerate(V[:max(0, int(show_per_rule))], start=1):
             group_ids = viol.get("group_ids", ())
             rows_obj = viol.get("rows", None)
             rows = rows_obj.copy() if isinstance(rows_obj, pd.DataFrame) else pd.DataFrame()
 
             display(Markdown(f"**Example {i}** — `group_ids`: `{group_ids}`"))
 
-            # select columns present in rows, preserving preferred order
+            # Select columns that exist, preserving the preferred order
             cols_present = [c for c in prefer_cols if c in rows.columns]
-            if cols_present:
-                to_show = rows[cols_present].reset_index(drop=True)
-            else:
-                to_show = rows.reset_index(drop=True)
+            to_show = (rows[cols_present] if cols_present else rows).reset_index(drop=True)
 
-            # light sorting for readability
-            sort_cols = []
+            # Light sorting for readability
+            sort_cols: list[tuple[str, bool]] = []
             if "z_flag_homogenized" in to_show.columns:
                 sort_cols.append(("z_flag_homogenized", False))
             if "tie_result" in to_show.columns:
@@ -776,7 +864,7 @@ f"""
             if "CRD_ID" in to_show.columns:
                 sort_cols.append(("CRD_ID", True))
 
-            if sort_cols:
+            if sort_cols and len(to_show) > 0:
                 by = [c for c, _ in sort_cols]
                 asc = [a for _, a in sort_cols]
                 to_show = to_show.sort_values(by=by, ascending=asc, kind="mergesort")
@@ -786,31 +874,35 @@ f"""
     # ---------------------------
     # Final Notes
     # ---------------------------
-    display(Markdown(
-"""
-> **Useful Notes**
+    display(
+        Markdown(
+            """
+> **Notes**
 >
 > - **Star handling (graph construction)**  
->   Stars **do not** connect objects: any edge touching a star is removed from the graph.  
->   They **must** have `tie_result == 3` and **do not** influence decisions among non-stars.
+>   Any edge that touches a star is removed. Stars are isolated from the
+>   non-star connected components and must have `tie_result == 3`.
 >
-> - **`z_flag_homogenized` ranking (applies only to non-stars)**  
->   `star (6) → -2`  <  `NaN → -1`  <  `other flags → numeric`.  
->   Thus, `NaN` participates in tiebreaks (loses to any valid flag), while
->   star is always the lowest rank.
+> - **`z_flag_homogenized` ranking (non-stars)**  
+>   For non-stars inside a component, flags are ranked as:  
+>   `NaN → -1` (lowest) < `other numeric flags` (their numeric value).  
+>   (Stars are not present in the component graph.)
 >
 > - **PAIR_1v0_PRIORITY**  
->   For (1,0), the winner must have a higher flag; if equal, a better `instrument_type`;  
->   if still tied, require `Δz < threshold`.
+>   For a 2-node component with tie pattern `(1,0)`, the winner must have a
+>   strictly higher flag; if equal, a better `instrument_type`; if still tied,
+>   require `Δz < threshold`.
 >
 > - **PAIR_2v2_TIE_CONSISTENCY**  
->   For (2,2), require **same flag** and **same `instrument_type`**, and `Δz > threshold`  
->   (or undefined).
+>   For a 2-node component with tie pattern `(2,2)`, both members must share
+>   the same flag and `instrument_type`, and `Δz > threshold` (or undefined).
 >
-> - **GROUP_* rules (applied only to non-stars inside the component)**  
->   Check flag/type dominance and Δz independence when multiple top survivors exist.
+> - **GROUP_* rules (size ≥ 3, non-stars only)**  
+>   Check flag/type dominance and Δz independence among survivors within the
+>   same component.
 """
-    ))
+        )
+    )
 
 
 def render_na_compared_to_validation(
@@ -1030,10 +1122,7 @@ def analyze_groups_by_compared_to_fast(
     Returns:
       Dict with processed_groups, groups_by_case, case_descriptions, summary_counts.
     """
-    import numpy as np
-    from scipy.sparse import coo_matrix
-    from scipy.sparse.csgraph import connected_components
-
+    
     # --------- display defaults
     if desired_order is None:
         desired_order = [

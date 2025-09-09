@@ -174,26 +174,79 @@ def _resume_get(resume_log_path: str, key: str) -> str | None:
         return None
 
 
-def _cleanup_previous_step(step_index: int, prepared_info: list[dict[str, Any]], temp_dir: str, lg: logging.LoggerAdapter) -> None:
-    """Delete artifacts from the previous step to save disk space."""
-    prev_step = step_index - 1
-    prev_merged = os.path.join(temp_dir, f"merged_step{prev_step}")
-    if os.path.exists(prev_merged):
-        shutil.rmtree(prev_merged, ignore_errors=True)
-        lg.info("Deleted merged parquet: %s", prev_merged)
-    if 0 <= prev_step < len(prepared_info):
-        prev_info = prepared_info[prev_step]
-        core = [prev_info.get("prepared_path"), prev_info.get("collection_path")]
-        for path in core:
-            if path and os.path.exists(path):
-                try:
-                    if os.path.isdir(path):
-                        shutil.rmtree(path, ignore_errors=True)
-                    else:
-                        os.remove(path)
-                    lg.info("Deleted previous artifact: %s", path)
-                except Exception as e:
-                    lg.warning("Could not delete %s: %s", path, e)
+def _cleanup_previous_step(
+    step_index: int,
+    prepared_info: list[dict[str, Any]],
+    temp_dir: str,
+    lg: logging.LoggerAdapter
+) -> None:
+    """Delete artifacts from *all* previous steps to save disk space.
+
+    For every step k < step_index, removes:
+      - prepared_<internal_name>
+      - prepared_<internal_name>_hats
+      - prepared_<internal_name>_hats_auto
+      - merged_step<k>
+      - merged_step<k>_hats
+    Also removes any recorded collection_path for previous prepared entries.
+    """
+
+    def _rm_path(p: str) -> None:
+        if not p:
+            return
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            elif os.path.isfile(p):
+                os.remove(p)
+            else:
+                return
+            lg.info("Deleted artifact: %s", p)
+        except Exception as e:
+            lg.warning("Could not delete %s: %s", p, e)
+
+    # 1) Remove all merged_step<k> and merged_step<k>_hats for k < step_index
+    try:
+        for entry in os.listdir(temp_dir):
+            full = os.path.join(temp_dir, entry)
+            if not os.path.isdir(full):
+                continue
+
+            # Accept both patterns:
+            #   - merged_step<k>
+            #   - merged_step<k>_hats
+            name = entry.strip()
+            if not name.startswith("merged_step"):
+                continue
+
+            tail = name.replace("merged_step", "", 1)
+            # tail can be like "5" or "5_hats"
+            num_str = tail.split("_", 1)[0].strip()
+            try:
+                k = int(num_str)
+            except Exception:
+                continue
+
+            if k < step_index:
+                _rm_path(full)
+    except Exception as e:
+        lg.warning("Could not list merged_step folders under %s: %s", temp_dir, e)
+
+    # 2) Remove prepared artifacts for all previous prepared entries
+    for i in range(0, min(step_index, len(prepared_info))):
+        prev = prepared_info[i]
+
+        # Base prepared_<internal_name>
+        base_prepared = prev.get("prepared_path")
+        if base_prepared:
+            _rm_path(base_prepared)
+            _rm_path(base_prepared + "_hats")
+            _rm_path(base_prepared + "_hats_auto")
+
+        # Recorded collection_path (may point to hats/auto variants)
+        coll = prev.get("collection_path")
+        if coll:
+            _rm_path(coll)
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +666,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             # -----------------------------------------------------------
             log_dedup = _phase_logger(base_logger, "deduplication")
             log_dedup.info("START deduplication: LSDB graph labeling and tie consolidation")
-
+            
             # Ensure final collection root for dedup
             if not final_collection_path:
                 resumed = _resume_get(resume_log, f"crossmatch_step{final_step}.collection_path")
@@ -626,26 +679,26 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     if guessed:
                         final_collection_path = guessed
                         log_dedup.info("Guessed final collection root from disk: %s", final_collection_path)
-
+            
             final_merged_path = os.path.join(temp_dir, f"merged_step{final_step}")
             if not os.path.exists(final_merged_path):
                 log_dedup.error("Final merged Parquet folder not found: %s", final_merged_path)
                 client.close()
                 cluster.close()
                 return
-
+            
             n_before = int(dd.read_parquet(final_merged_path).shape[0].compute())
             log_dedup.info("Rows before dedup (final_merged): %d", n_before)
-
+            
             use_distributed = final_collection_path is not None and _is_collection_root(final_collection_path)
-
+            
             # --- Safe config parsing ---
             tiebreaking_priority_cfg = translation_config.get("tiebreaking_priority")
             if isinstance(tiebreaking_priority_cfg, (str, bytes)):
                 tiebreaking_priority_cfg = [str(tiebreaking_priority_cfg)]
             if not isinstance(tiebreaking_priority_cfg, (list, tuple)) or not tiebreaking_priority_cfg:
                 raise TypeError("tiebreaking_priority must be a non-empty list of column names.")
-
+            
             instrument_type_priority_cfg = translation_config.get("instrument_type_priority")
             if "instrument_type_homogenized" in set(tiebreaking_priority_cfg) and not isinstance(instrument_type_priority_cfg, dict):
                 raise TypeError(
@@ -653,25 +706,25 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     "'instrument_type_homogenized' is present in tiebreaking_priority."
                 )
             delta_z_threshold_cfg = float(translation_config.get("delta_z_threshold", 0.0))
-
+            
             if use_distributed:
                 log_dedup.info("Running graph-based dedup on final merged collection (map_partitions)")
                 final_collection_path = _normalize_collection_root(final_collection_path)
                 log_dedup.info("final_collection_root: %s", final_collection_path)
-
+            
                 if not _is_collection_root(final_collection_path):
                     raise RuntimeError(f"Expected collection root at: {final_collection_path}")
-
+            
                 # Discover subcatalogs
                 base = os.path.basename(final_collection_path.rstrip("/"))
                 main_subcat_path = os.path.join(final_collection_path, base)
                 log_dedup.info("Expected main subcatalog path: %s", main_subcat_path)
                 if not _is_hats_subcatalog(main_subcat_path):
                     raise RuntimeError(f"Main subcatalog not found: {main_subcat_path}")
-
+            
                 final_cat = lsdb.open_catalog(main_subcat_path)
                 log_dedup.info("Opened main subcatalog.")
-
+            
                 # Optional margin (*arcs), prefer 5arcs if present
                 arcs_candidates = [p for p in glob.glob(os.path.join(final_collection_path, "*arcs")) if _is_hats_subcatalog(p)]
                 if arcs_candidates:
@@ -687,10 +740,11 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 else:
                     log_dedup.info("No *arcs margin found; proceeding without margin.")
                     final_cat.margin = None
-
+            
                 if not hasattr(final_cat, "_ddf"):
                     raise RuntimeError("Main subcatalog does not expose _ddf.")
-
+            
+                # Labels are computed per partition; guard-restore now happens inside deduplicate_pandas
                 labels = run_dedup_with_lsdb_map_partitions(
                     final_cat,
                     tiebreaking_priority=tiebreaking_priority_cfg,
@@ -701,8 +755,8 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     z_col="z",
                     tie_col="tie_result",
                 )
-
-                # Read the final merged parquet once; keep original tie_result for later restore
+            
+                # Read once for the final merge
                 df_all = dd.read_parquet(final_merged_path)
                 try:
                     df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
@@ -710,19 +764,19 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 except Exception:
                     df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
                     labels = labels.assign(CRD_ID=labels["CRD_ID"].astype("string"))
-
-                orig_tr_dd = df_all.loc[:, ["CRD_ID", "tie_result"]].rename(columns={"tie_result": "tie_result_orig"})
-
+            
                 rhs_dd = labels.rename(columns={"tie_result": "tie_result_new"})
-
+            
                 # Keep clear_divisions only right before merges
                 for obj in (df_all, rhs_dd):
-                    try: obj = obj.clear_divisions()
-                    except Exception: pass
-
+                    try:
+                        obj = obj.clear_divisions()
+                    except Exception:
+                        pass
+            
                 with dask.config.set({"dataframe.shuffle.method": "tasks"}):
                     merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
-
+            
             else:
                 log_dedup.warning(
                     "final_collection_path missing or not a collection root; falling back to driver-side pandas dedup."
@@ -733,146 +787,66 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 missing_base = sorted(required_base - available)
                 if missing_base:
                     raise KeyError(f"Missing required columns: {missing_base}")
-
+            
                 priority_set = set(tiebreaking_priority_cfg or [])
                 missing_priority = sorted([c for c in priority_set if c not in available])
                 if missing_priority:
                     raise KeyError(f"Missing priority columns: {missing_priority}")
-
+            
                 optional_candidates = {"z_flag_homogenized", "instrument_type_homogenized"}
                 optional_present = (optional_candidates - priority_set) & available
-                maybe_tie_result = {"tie_result"} & available
+                maybe_tie_result = {"tie_result"} & available  # bring original tie_result if present
                 needed = sorted(required_base | priority_set | optional_present | maybe_tie_result)
                 pdf = base_dd[needed].compute()
-
+            
+                # Guard-restore is inside deduplicate_pandas
                 pdf_out = deduplicate_pandas(
                     pdf,
                     tiebreaking_priority=tiebreaking_priority_cfg,
                     instrument_type_priority=instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None,
                     delta_z_threshold=delta_z_threshold_cfg,
                 )
-
-                # Read once and cache the original tie_result.
+            
+                # Merge new labels back
                 df_all = dd.read_parquet(final_merged_path)
-                orig_tr_dd = df_all.loc[:, ["CRD_ID", "tie_result"]].rename(columns={"tie_result": "tie_result_orig"})
-
                 rhs_pdf = pdf_out.loc[:, ["CRD_ID", "tie_result"]].rename(columns={"tie_result": "tie_result_new"})
                 rhs_dd = dd.from_pandas(rhs_pdf, npartitions=max(1, df_all.npartitions))
-
+            
                 for obj in (df_all, rhs_dd):
-                    try: obj = obj.clear_divisions()
-                    except Exception: pass
-
+                    try:
+                        obj = obj.clear_divisions()
+                    except Exception:
+                        pass
+            
                 with dask.config.set({"dataframe.shuffle.method": "tasks"}):
                     merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
-
+            
             # Coalesce tie_result with the newly computed labels
             if "tie_result" in merged.columns:
                 merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
             else:
                 merged = merged.assign(tie_result=merged["tie_result_new"])
             merged = merged.drop(columns=["tie_result_new"])
-
-            try: merged = merged.clear_divisions()
-            except Exception: pass
-
-            # Numeric views for rules below
-            tie_f = dd.to_numeric(merged["tie_result"], errors="coerce").astype("float64")
-            zf_f  = dd.to_numeric(merged["z_flag_homogenized"], errors="coerce").astype("float64")
-
-            # Stars: flag==6 => tie=3
-            is_star = zf_f.eq(6.0)
-            merged["tie_result"] = merged["tie_result"].mask(is_star, 3)
-
-            # Forbid tie=3 when not a star
-            wrong_3 = tie_f.eq(3.0) & ~is_star
-            merged["tie_result"] = merged["tie_result"].mask(wrong_3, 0)
-
-            # --------- GUARD RESTORE (optimized, incl. "only-star neighbors") ----------
-            # Build NA-like mask once
-            cmp_str   = merged["compared_to"].astype("string")
-            cmp_empty = cmp_str.isna() | cmp_str.str.strip().eq("")
-            # Base guard: empty compared_to & NaN z_flag_homogenized -> restore original tie_result
-            guard_empty = cmp_empty & zf_f.isna()
-
-            # Build fast lookup set of star IDs once (from df_all already in memory)
-            star_ids = set(
-                df_all.loc[
-                    dd.to_numeric(df_all["z_flag_homogenized"], errors="coerce").eq(6.0),
-                    "CRD_ID",
-                ]
-                .astype("string")
-                .compute()
-            )
-
-            def _only_star_neighbors_partition(col: pd.Series, star_set: set[str]) -> pd.Series:
-                """Return True if compared_to is non-empty and all neighbors are star IDs."""
-                s = col.astype("string").fillna("")
-                lst = s.str.split(",")
-                out = []
-                for tokens in lst:
-                    if not tokens:
-                        out.append(False)
-                        continue
-                    toks = [t.strip() for t in tokens if t and t.strip()]
-                    out.append(bool(toks) and all((tok in star_set) for tok in toks))
-                return pd.Series(out, index=col.index, dtype="boolean")
-
-            # Compute only-star-neighbors only if there are non-empty compared_to rows
-            needs_only_star = bool((~cmp_empty).any().compute())
-            if needs_only_star:
-                only_star_neighbors = (~cmp_empty) & merged["compared_to"].map_partitions(
-                    _only_star_neighbors_partition, star_ids, meta=("only_star_neighbors", "boolean")
-                ).fillna(False)
-            else:
-                # Fast false column with the same index/partitions
-                only_star_neighbors = tie_f.eq(-9999)  # always False, preserves graph
-
-            # IMPORTANT: do NOT restore stars (they must remain tie_result == 3)
-            restore_mask = (~is_star) & (guard_empty | only_star_neighbors)
-
-            # Materialize once; no extra parquet reads
-            merged = merged.assign(_guard_mask=restore_mask)
-
-            n_restore = int(merged["_guard_mask"].astype("int8").sum().compute())
-            log_dedup.info(
-                "Guard restore count (non-stars with empty compared_to OR only-star neighbors): %d",
-                n_restore,
-            )
-
-            if n_restore > 0:
-                try: merged   = merged.clear_divisions()
-                except Exception: pass
-                try: orig_tr_dd = orig_tr_dd.clear_divisions()
-                except Exception: pass
-                with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-                    merged = dd.merge(merged, orig_tr_dd, on="CRD_ID", how="left")
-                merged["tie_result"] = merged["tie_result"].mask(merged["_guard_mask"], merged["tie_result_orig"])
-                merged = merged.drop(columns=["tie_result_orig"])
-
-            # Drop temp column
-            merged = merged.drop(columns=["_guard_mask"])
-            # --------------------------------------------------------------------------
-
-            # (Optional) recompute metrics AFTER restore (or remove if not needed)
-            # tie_f_fin = dd.to_numeric(merged["tie_result"], errors="coerce").astype("float64")
-            # zf_f_fin  = dd.to_numeric(merged["z_flag_homogenized"], errors="coerce").astype("float64")
-            # _ = (tie_f_fin.eq(3.0) & ~zf_f_fin.eq(6.0)).map_partitions(lambda s: s.astype("int64").sum(), meta=("sum","int64")).sum().compute()
-            # _ = (zf_f_fin.eq(6.0) & ~tie_f_fin.eq(3.0)).map_partitions(lambda s: s.astype("int64").sum(), meta=("sum","int64")).sum().compute()
-
+            
+            try:
+                merged = merged.clear_divisions()
+            except Exception:
+                pass
+            
             # Final dtype
             merged["tie_result"] = merged["tie_result"].astype("Int8")
-
+            
             try:
                 df_final_dd = merged.clear_divisions()
             except Exception:
                 df_final_dd = merged
-
+            
             df_final = df_final_dd.compute()
             log_dedup.info("END deduplication: labels merged back into final dataframe")
-
+            
             # Next phase runs below:
             start_consolidate = True
+
 
         else:
             base_logger.error("Unknown combine_mode: %s", combine_mode, extra={"phase": "crossmatch"})
@@ -933,8 +907,27 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     log_cons.info("Final combined catalog saved at %s.%s", final_base_path, output_format)
 
     relative_path = os.path.join(output_dir, f"{output_name}.{output_format}")
+    
     expected_columns = ["id", "ra", "dec", "z", "z_flag", "z_err", "survey"]
-    columns_assoc = {col: col for col in expected_columns if col in df_final.columns}
+    columns_assoc = {}
+    
+    # Special handling for id
+    if "CRD_ID" in df_final.columns:
+        columns_assoc["id"] = "CRD_ID"
+    elif "id" in df_final.columns:
+        columns_assoc["id"] = "id"
+    
+    # Special handling for z_flag
+    if "z_flag_homogenized" in df_final.columns:
+        columns_assoc["z_flag"] = "z_flag_homogenized"
+    elif "z_flag" in df_final.columns:
+        columns_assoc["z_flag"] = "z_flag"
+    
+    # Identity mapping for the others
+    for col in expected_columns:
+        if col not in ("id", "z_flag") and col in df_final.columns:
+            columns_assoc[col] = col
+
 
     update_process_info(
         process_info,
