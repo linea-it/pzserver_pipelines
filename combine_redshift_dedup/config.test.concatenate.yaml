@@ -66,6 +66,28 @@ inputs:
         z_err: "redshift_err"
         survey: "survey_name"
 
+    - path: "test_data/3dhst_v4.1.5_random_sample.parquet"
+      internal_name: "004_3dhst_v4.1.5"
+      columns:
+        id: "phot_id"
+        ra: "ra"
+        dec: "dec"
+        z: "z_best"
+        z_flag: null
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/6dfgs_dr3_random_sample.parquet"
+      internal_name: "005_6dfgs_dr3"
+      columns:
+        id: "SPECID"
+        ra: "RA_deg"
+        dec: "DEC_deg"
+        z: "Z"
+        z_flag: "QUALITY"
+        z_err: null
+        survey: "survey_name"
+
 output_root_dir: "process001"
 output_dir: "outputs" # Relative directory for final outputs
 output_name: "crd" # Name prefix for the final output files
