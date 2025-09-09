@@ -40,6 +40,19 @@ instrument_type_priority:
 # - instrument_type_translation: how to map original types into a standard label (s, g, p)
 # You can mix value-based mappings and conditional rules (using Python expressions)
 
+save_expr_columns: false
+
+expr_column_schema:
+  z_best_s: float
+  z_spec: float
+  use_zgrism: float
+  flag1: float
+  use_phot: float
+  zspec_survey: str
+  zspec: float
+  z_flag: float
+  ZCAT_PRIMARY: bool
+
 translation_rules:
 
   2DFGRS:

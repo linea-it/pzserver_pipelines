@@ -81,23 +81,38 @@ class ProductHandle:
         return dd.from_pandas(df, npartitions=1)
 
 def save_dataframe(df, output_path, format_):
-    """
-    Save DataFrame to file in the specified format.
-        
+    """Save DataFrame to disk in the requested format.
+
+    For Parquet, writes with engine='pyarrow' to preserve Arrow-backed dtypes.
+    For CSV/HDF5/FITS, uses NumPy-backed dtypes to avoid extension-type issues
+    in downstream writers.
+
     Args:
-        df (pd.DataFrame): DataFrame to save.
-        output_path (str): Full path without extension.
-        format_ (str): Format to save (parquet, csv, hdf5, fits).
+      df: Pandas DataFrame (may contain Arrow-backed dtypes).
+      output_path: Path without extension.
+      format_: One of {"parquet", "csv", "hdf5", "fits"}.
     """
     ext = format_.lower()
+
     if ext == "parquet":
-        df.to_parquet(f"{output_path}.parquet", index=False)
-    elif ext == "csv":
-        df.to_csv(f"{output_path}.csv", index=False)
+        # Keep Arrow-backed dtypes and schema (fast path).
+        df.to_parquet(f"{output_path}.parquet", index=False, engine="pyarrow")
+        return
+
+    # Non-Parquet formats: convert to NumPy-backed dtypes for compatibility.
+    # This avoids issues with pyarrow-backed string/boolean in third-party IO.
+    df_np = df.convert_dtypes(dtype_backend="numpy_nullable")
+
+    if ext == "csv":
+        # CSV is text; NumPy-backed avoids edge cases with extension dtypes.
+        df_np.to_csv(f"{output_path}.csv", index=False)
     elif ext == "hdf5":
-        tables_io.write(df, f"{output_path}.hdf5")
+        # Assumes `tables_io.write` expects NumPy/pandas-native dtypes.
+        tables_io.write(df_np, f"{output_path}.hdf5")
     elif ext == "fits":
-        table = Table.from_pandas(df)
+        # Astropy Table prefers NumPy dtypes; disable index passthrough.
+        table = Table.from_pandas(df_np, preserve_index=False)
         table.write(f"{output_path}.fits", overwrite=True)
     else:
         raise ValueError(f"Unsupported output format: {format_}")
+
