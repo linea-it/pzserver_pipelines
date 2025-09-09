@@ -70,6 +70,21 @@ detect_driver_ip() {
   return 1
 }
 
+# Pick next available process directory under a root (defaults to .)
+pick_next_process_dir() {
+  local root="${1:-.}"
+  local i=1 name path
+  while :; do
+    printf -v name "process%03d" "$i"
+    path="${root}/${name}"
+    if [ ! -e "$path" ]; then
+      echo "$path"
+      return 0
+    fi
+    i=$((i+1))
+  done
+}
+
 # -------- Error Trap --------
 
 # On any error, print a timestamped message and exit with the original code
@@ -83,13 +98,15 @@ trap '{
 
 # -------- Args & basic checks --------
 
-if [ $# -lt 2 ]; then
-  echo "Usage: ./run.sh <config.yaml> <base_dir_override>"
+if [ $# -lt 1 ]; then
+  echo "Usage: ./run.sh <config.yaml> [run_dir]"
+  echo "If [run_dir] is not provided, the script will pick process001, process002, ..."
   exit 1
 fi
 
 CONFIG_PATH="$1"
-BASE_DIR_OVERRIDE="$2"
+# Optional 2nd arg. If empty, we auto-pick processNNN under current dir.
+BASE_DIR_OVERRIDE="${2:-}"
 
 if [ -z "${PIPELINES_DIR:-}" ] || [ ! -d "${PIPELINES_DIR:-/nonexistent}" ]; then
   echo "Error: PIPELINES_DIR not defined or not a directory."
@@ -103,6 +120,15 @@ if [ ! -f "$INSTALL_PIPE" ]; then
   echo "Error: Installation script not found at: $INSTALL_PIPE"
   exit 1
 fi
+
+# Auto-pick run directory if not supplied
+if [ -z "$BASE_DIR_OVERRIDE" ]; then
+  BASE_DIR_OVERRIDE="$(pick_next_process_dir ".")"
+  log "No run directory provided. Using '${BASE_DIR_OVERRIDE}'."
+fi
+
+# Ensure the chosen run directory exists
+mkdir -p "$BASE_DIR_OVERRIDE"
 
 # -------- Logs wiring (shell level) --------
 
@@ -135,10 +161,6 @@ if [ -z "${CRC_LOG_COLLECTOR:-}" ]; then
     log "   If you run a multi-node cluster, export CRC_LOG_COLLECTOR='<driver_ip>:${CRC_LOG_COLLECTOR_PORT}' explicitly."
   fi
   export CRC_LOG_COLLECTOR="${DRIVER_IP}:${CRC_LOG_COLLECTOR_PORT}"
-else
-  # If user provided just a port via CRC_LOG_COLLECTOR_PORT (and full host:port in CRC_LOG_COLLECTOR),
-  # we simply respect the explicit CRC_LOG_COLLECTOR they set.
-  :
 fi
 
 log "CRC_LOG_COLLECTOR=${CRC_LOG_COLLECTOR}"
@@ -154,5 +176,5 @@ set +x
 # -------- Epilogue --------
 
 log "Pipeline exited with code: 0"
-log "✅ Success"
+log "✅ Success (run dir: ${BASE_DIR_OVERRIDE})"
 exit 0

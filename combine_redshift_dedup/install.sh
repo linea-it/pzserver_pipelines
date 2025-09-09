@@ -12,7 +12,7 @@ HASENV=`conda env list | grep pipe_crd`
 
 if [ -z "$HASENV" ]; then
     echo "Create virtual environment..."
-    conda env create -f ${PIPE_BASE}/environment.yaml
+    conda env create -f ${PIPE_BASE}/environment.yaml -y
     echo "Virtual environment created and packages installed."
 # else
 #     if [ "$CONDA_FORCE_UPDATE" == "yes" ]; then
@@ -27,10 +27,10 @@ conda activate pipe_crd || { echo "Failed to activate pipe_crd"; exit 1; }
 # export PATH=$PATH:"$PIPE_BASE/scripts/"
 
 # Set PYTHONPATH so Python can find combine_redshift_dedup
-if [ -z "$PYTHONPATH" ]; then
-    export PYTHONPATH="$PIPELINES_DIR"
+if [ -n "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH=$PYTHONPATH:"$PIPE_BASE/packages/"
 else
-    export PYTHONPATH="$PIPELINES_DIR:$PYTHONPATH"
+    export PYTHONPATH="$PIPE_BASE/packages/"
 fi
 
 echo "Conda Environment: $CONDA_DEFAULT_ENV"
