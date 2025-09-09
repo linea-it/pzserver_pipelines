@@ -6,12 +6,14 @@ import pandas as pd
 import numpy as np
 from collections import defaultdict
 from itertools import combinations
+from typing import Dict
 
 from IPython.display import display, Markdown
 
 from IPython.display import display, Markdown
 
 def _norm_str(s):
+    """Normalize strings; NA-like -> None."""
     if s is None:
         return None
     s = str(s).strip()
@@ -25,6 +27,7 @@ def _norm_str(s):
 # =======================
 # =======================
 def _parse_cmp_list_fast(s: str) -> list[str]:
+    """Parse a comma-separated list into trimmed items; NA-like -> []."""
     if s is None:
         return []
     s = str(s).strip()
@@ -38,24 +41,32 @@ def validate_intra_source_cells_fast(
     ndp: int = 4,
     source_col: str = "source",
     emit_pairs: bool = True,
-    limit_pairs: int | None = None,   # limite opcional p/ evitar explosão
+    limit_pairs: int | None = None,
 ):
+    """Fast intra-source validator on (source, ra4, dec4) cells.
+
+    Builds directed edges inside each cell using explode and counts pair directions.
+
+    Args:
+      df_final: Input dataframe.
+      ndp: Decimals to round RA/DEC.
+      source_col: Source/catalog column.
+      emit_pairs: Whether to emit the pairs dataframe.
+      limit_pairs: Optional cap to avoid materializing all missing pairs.
+
+    Returns:
+      Dict with pairs, cell_summary, totals, violations, diag_sources.
     """
-    Versão acelerada:
-      - Constrói arestas dirigidas por célula (source, ra4, dec4) via explode.
-      - Conta direções por par (0,1,2) -> status: missing / ok_one_way / ok_bi.
-      - Gera 'pairs' completo apenas se emit_pairs=True (pode ser limitado).
-    """
-    # Normalizações mínimas (evita cópias desnecessárias)
+    # Minimal normalization (avoid unnecessary copies)
     df = df_final[[source_col, "CRD_ID", "ra", "dec", "compared_to"]].copy()
     df["CRD_ID"] = df["CRD_ID"].astype(str)
-    # normaliza source como string "limpa"
+    # normalize source
     df[source_col] = df[source_col].map(_norm_str).astype("string")
-    # célula arredondada
+    # rounded cell
     df["ra4"]  = pd.to_numeric(df["ra"], errors="coerce").round(ndp)
     df["dec4"] = pd.to_numeric(df["dec"], errors="coerce").round(ndp)
 
-    # Filtra só células com 2+ objetos
+    # Keep only cells with 2+ objects
     cell_sizes = (
         df.groupby([source_col, "ra4", "dec4"], dropna=False)
           .size().rename("n").reset_index()
@@ -72,11 +83,11 @@ def validate_intra_source_cells_fast(
             "diag_sources": pd.DataFrame(columns=["source","n_cells","cells_2plus"]),
         }
 
-    # Subset só com células 2+
+    # Subset with 2+ cells only
     df2 = df.merge(multi_cells[[source_col, "ra4", "dec4"]].drop_duplicates(),
                    on=[source_col, "ra4", "dec4"], how="inner")
 
-    # Explode compared_to -> arestas dirigidas dentro da célula
+    # Explode compared_to -> directed edges inside the cell
     df2["_cmp_list"] = df2["compared_to"].map(_parse_cmp_list_fast)
     edges = (
         df2[[source_col, "ra4", "dec4", "CRD_ID", "_cmp_list"]]
@@ -84,14 +95,13 @@ def validate_intra_source_cells_fast(
         .rename(columns={"CRD_ID": "A", "_cmp_list": "B"})
     )
     edges = edges[edges["B"].notna() & (edges["B"] != "")]
-    # Mantém apenas arestas cuja B também pertence à mesma célula
+    # Keep only edges whose B also belongs to the same cell
     members = df2[[source_col, "ra4", "dec4", "CRD_ID"]].rename(columns={"CRD_ID":"B"})
     edges = edges.merge(members, on=[source_col, "ra4", "dec4", "B"], how="inner")
 
     if edges.empty:
-        # Não há nenhuma aresta dirigida -> todos os pares são "missing".
-        # Calcula somente agregados sem materializar todos os pares (rápido).
-        # n_pairs esperado = sum C(n,2)
+        # No directed edges -> all pairs are "missing".
+        # Compute aggregates only (fast).
         n_pairs_series = (multi_cells["n"] * (multi_cells["n"] - 1) // 2)
         cell_summary = multi_cells.assign(
             n_pairs=n_pairs_series,
@@ -119,7 +129,7 @@ def validate_intra_source_cells_fast(
             "diag_sources": diag_sources,
         }
 
-    # Colapsa para pares não-dirigidos e conta direções (1=one_way, 2=bi)
+    # Collapse to undirected pairs and count directions (1=one_way, 2=bi)
     a_le_b = (edges["A"] <= edges["B"])
     edges["A_und"] = np.where(a_le_b, edges["A"], edges["B"])
     edges["B_und"] = np.where(a_le_b, edges["B"], edges["A"])
@@ -130,7 +140,7 @@ def validate_intra_source_cells_fast(
     )
     pair_counts["status"] = np.where(pair_counts["n_dir"] >= 2, "ok_bi", "ok_one_way")
 
-    # Agregados por célula (rápido)
+    # Per-cell aggregates (fast)
     per_cell_found = (
         pair_counts.groupby([source_col, "ra4", "dec4"], dropna=False)
                    .agg(n_ok_bi=("status", lambda s: (s == "ok_bi").sum()),
@@ -155,19 +165,17 @@ def validate_intra_source_cells_fast(
         "n_missing": int(cell_summary["n_missing"].sum()),
     }
 
-    # Emissão opcional dos pares (inclui "missing" apenas se solicitado)
+    # Optional pair emission (include "missing" only if requested)
     if not emit_pairs:
         pairs = pd.DataFrame(columns=["source","ra4","dec4","A","B","A_in_B","B_in_A","status"])
         violations = pairs.copy()
     else:
-        # materializa só os encontrados (rápido)
+        # Found pairs (fast)
         pairs_found = pair_counts.rename(columns={"A_und":"A", "B_und":"B"})
-        # A_in_B/B_in_A indicam direções presentes
-        # Reconstroi flags via junção nos dirigidos
+        # Rebuild direction flags via join on directed edges
         dir1 = edges[["A","B",source_col,"ra4","dec4"]].assign(dir=1)
         dir2 = edges.rename(columns={"A":"B","B":"A"})[["A","B",source_col,"ra4","dec4"]].assign(dir=2)
         both_dir = pd.concat([dir1, dir2], ignore_index=True)
-        # Marca direções
         mark = both_dir.drop_duplicates([source_col,"ra4","dec4","A","B"]).assign(val=True)
         pairs_found = pairs_found.merge(
             mark.rename(columns={"A":"A","B":"B","val":"A_in_B"})[[source_col,"ra4","dec4","A","B","A_in_B"]],
@@ -185,15 +193,13 @@ def validate_intra_source_cells_fast(
                        [["source","ra4","dec4","A","B","A_in_B","B_in_A","status"]]
                        .reset_index(drop=True))
 
-        # Se precisar dos "missing", materializa por célula de forma controlada
+        # If "missing" are needed, materialize per cell in a controlled way
         missing_rows = []
         if limit_pairs is None or pairs_found.shape[0] < limit_pairs:
-            # cria conjunto de pares encontrados por célula
             found_key = set(
                 (r.source, r.ra4, r.dec4, r.A, r.B)
                 for r in pairs_found.itertuples(index=False)
             )
-            # gera todos os pares possíveis por célula, só quando necessário
             for rec in multi_cells.itertuples(index=False):
                 src, ra4, dec4, n = getattr(rec, source_col), rec.ra4, rec.dec4, rec.n
                 ids = df2[(df2[source_col]==src) & (df2["ra4"].eq(ra4)) & (df2["dec4"].eq(dec4))]["CRD_ID"].tolist()
@@ -210,7 +216,7 @@ def validate_intra_source_cells_fast(
 
         violations = pairs[pairs["status"] != "ok_bi"].copy()
 
-    # Diagnóstico por source
+    # Diagnostics by source
     diag_sources = (
         multi_cells.groupby(source_col)["n"]
         .agg(n_cells="size", cells_2plus=lambda s: (s >= 2).sum())
@@ -235,7 +241,7 @@ def explain_intra_source_validation_output(
     max_sources: int | None = 5,
     source_col: str = "source",
 ):
-    """Print explanations and show validator outputs (with samples by source)."""
+    """Render explanations and samples for the intra-source validator."""
     # --- TOTALS ---
     tot = res.get("totals", {})
     display(Markdown(
@@ -379,371 +385,8 @@ f"""
 # Cross Sources
 # =======================
 # =======================
-TYPE_PRIORITY = {"s": 3, "g": 2, "p": 1}  # others/NA -> 0
-
-def _type_score(t):
-    """Map instrument_type_homogenized to numeric priority."""
-    t = _norm_str(t)
-    return TYPE_PRIORITY.get(t, 0)
-
-
-def _to_num(x):
-    """Best-effort numeric cast -> float; returns np.nan on failure."""
-    try:
-        return float(x)
-    except Exception:
-        return np.nan
-
-
-def _z_diff(a, b):
-    """Absolute z difference; returns np.inf if either is NA (undefined)."""
-    if a is None or b is None:
-        return np.inf
-    if (isinstance(a, float) and math.isnan(a)) or (isinstance(b, float) and math.isnan(b)):
-        return np.inf
-    return abs(a - b)
-
-
-def _is_na(x):
-    return x is None or (isinstance(x, float) and math.isnan(x))
-
-
 # ------------------------------
-# Graph building from compared_to  (EXCLUDES STARS)
-# ------------------------------
-
-def build_components(df: pd.DataFrame, excluded_ids: set[str] | None = None) -> list[tuple[str, ...]]:
-    """
-    Build undirected components using 'CRD_ID' and 'compared_to' comma-list.
-
-    - Only rows with non-empty compared_to contribute edges.
-    - Any edge touching IDs in `excluded_ids` (e.g., stars) is dropped.
-    - Nodes in `excluded_ids` are not included in the components.
-
-    Args:
-        df: DataFrame with columns CRD_ID, compared_to.
-        excluded_ids: Optional set of IDs to exclude from edges/nodes.
-
-    Returns:
-        List of sorted tuples, one per connected component.
-    """
-    excluded_ids = excluded_ids or set()
-
-    edges = []
-    seen_nodes = set()
-
-    for _, row in df.iterrows():
-        crd = _norm_str(row.get("CRD_ID"))
-        if not crd or crd in excluded_ids:
-            continue
-        cmp_raw = _norm_str(row.get("compared_to"))
-        if not cmp_raw:
-            continue
-
-        for nb in cmp_raw.split(","):
-            nb = _norm_str(nb)
-            if not nb:
-                continue
-            if nb in excluded_ids:
-                # drop edges touching excluded nodes
-                continue
-            edges.append((crd, nb))
-            seen_nodes.add(crd)
-            seen_nodes.add(nb)
-
-    # Disjoint-set (Union-Find)
-    parent = {}
-
-    def find(x):
-        parent.setdefault(x, x)
-        if parent[x] != x:
-            parent[x] = find(parent[x])
-        return parent[x]
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    for a, b in edges:
-        union(a, b)
-
-    for n in seen_nodes:
-        find(n)
-
-    comps = defaultdict(list)
-    for n in parent.keys():
-        comps[find(n)].append(n)
-
-    return [tuple(sorted(v)) for v in comps.values()]
-
-
-# ------------------------------
-# Pair validation rules  (GUARDS AGAINST STARS)
-# ------------------------------
-
-def validate_pair(group_df: pd.DataFrame, threshold: float) -> list[dict]:
-    """
-    Validate a 2-row group against the pair rules.
-    Returns a list of violation dicts (empty if valid).
-
-    New behavior:
-      - If any member is a star (z_flag_homogenized==6) OR tie_result==3,
-        this pair should not exist (stars are excluded from comparisons).
-        A violation 'PAIR_STAR_SHOULD_NOT_BE_COMPARED' is emitted and other
-        checks for this pair are skipped.
-      - Stars must carry tie_result==3; otherwise 'STAR_MUST_BE_3'.
-    """
-    vios = []
-
-    a, b = group_df.iloc[0], group_df.iloc[1]
-
-    tr_a, tr_b = int(_to_num(a["tie_result"])), int(_to_num(b["tie_result"]))
-    zf_a = _to_num(a["z_flag_homogenized"])
-    zf_b = _to_num(b["z_flag_homogenized"])
-
-    # Star checks
-    a_is_star = (zf_a == 6) or (tr_a == 3)
-    b_is_star = (zf_b == 6) or (tr_b == 3)
-
-    if a_is_star and tr_a != 3:
-        vios.append({
-            "rule": "STAR_MUST_BE_3",
-            "message": "Row with z_flag_homogenized==6 must have tie_result==3.",
-            "group_ids": tuple(group_df["CRD_ID"].tolist()),
-            "rows": group_df.copy(),
-        })
-    if b_is_star and tr_b != 3:
-        vios.append({
-            "rule": "STAR_MUST_BE_3",
-            "message": "Row with z_flag_homogenized==6 must have tie_result==3.",
-            "group_ids": tuple(group_df["CRD_ID"].tolist()),
-            "rows": group_df.copy(),
-        })
-
-    if a_is_star or b_is_star:
-        vios.append({
-            "rule": "PAIR_STAR_SHOULD_NOT_BE_COMPARED",
-            "message": "Stars must be excluded from comparisons; this pair should not exist.",
-            "group_ids": tuple(group_df["CRD_ID"].tolist()),
-            "rows": group_df.copy(),
-        })
-        return vios  # skip further pair logic
-
-    # --- original pair logic (unchanged) ---
-    # For comparisons, ignore flag 6 as "quality"
-    zf_a_eff = (-1 if zf_a == 6 else zf_a)
-    zf_b_eff = (-1 if zf_b == 6 else zf_b)
-
-    ts_a = _type_score(a["instrument_type_homogenized"])
-    ts_b = _type_score(b["instrument_type_homogenized"])
-
-    z_a = _to_num(a["z"])
-    z_b = _to_num(b["z"])
-    dz = _z_diff(z_a, z_b)  # np.inf if undefined
-
-    # Case: (1,0) or (0,1)
-    if {tr_a, tr_b} == {0, 1}:
-        win = a if tr_a == 1 else b
-        los = b if tr_a == 1 else a
-
-        win_zf = _to_num(win["z_flag_homogenized"])
-        los_zf = _to_num(los["z_flag_homogenized"])
-        win_zf_eff = (-1 if win_zf == 6 else win_zf)
-        los_zf_eff = (-1 if los_zf == 6 else los_zf)
-
-        win_ts = _type_score(win["instrument_type_homogenized"])
-        los_ts = _type_score(los["instrument_type_homogenized"])
-
-        win_z = _to_num(win["z"])
-        los_z = _to_num(los["z"])
-        win_los_dz = _z_diff(win_z, los_z)
-
-        cond = (
-            (win_zf_eff > los_zf_eff) or
-            (win_zf_eff == los_zf_eff and win_ts > los_ts) or
-            (win_zf_eff == los_zf_eff and win_ts == los_ts and win_los_dz < threshold)
-        )
-        if not cond:
-            vios.append({
-                "rule": "PAIR_1v0_PRIORITY",
-                "message": "Winner does not have higher z_flag (excl. 6), nor better type, nor Δz < threshold on tie.",
-                "group_ids": tuple(group_df["CRD_ID"].tolist()),
-                "rows": group_df.copy(),
-            })
-
-    # Case: (2,2)
-    elif tr_a == 2 and tr_b == 2:
-        cond_equal_quality = (zf_a_eff == zf_b_eff) and (ts_a == ts_b)
-        cond_delta = (dz > threshold) or (math.isinf(dz))
-        if not (cond_equal_quality and cond_delta):
-            vios.append({
-                "rule": "PAIR_2v2_TIE_CONSISTENCY",
-                "message": "Tie (2,2) requires equal z_flag (excl. 6), equal type, and Δz > threshold (or undefined).",
-                "group_ids": tuple(group_df["CRD_ID"].tolist()),
-                "rows": group_df.copy(),
-            })
-
-    # Case: (0,0)
-    elif tr_a == 0 and tr_b == 0:
-        # With star exclusion, (0,0) should be rare; keep original check
-        if not (zf_a == 6 and zf_b == 6):
-            vios.append({
-                "rule": "PAIR_0v0_BOTH_FLAG6",
-                "message": "Both eliminated in a pair must have z_flag_homogenized == 6.",
-                "group_ids": tuple(group_df["CRD_ID"].tolist()),
-                "rows": group_df.copy(),
-            })
-
-    else:
-        vios.append({
-            "rule": "PAIR_INVALID_TIE_PATTERN",
-            "message": f"Unexpected tie_result pattern for pair: ({tr_a},{tr_b}).",
-            "group_ids": tuple(group_df["CRD_ID"].tolist()),
-            "rows": group_df.copy(),
-        })
-
-    return vios
-
-
-# ------------------------------
-# Group validation rules (size >= 3)  (GUARDS AGAINST STARS)
-# ------------------------------
-
-def validate_group(group_df: pd.DataFrame, threshold: float) -> list[dict]:
-    """
-    Validate a group (>=3) with hierarchical constraints.
-
-    New behavior:
-      - If any member is a star (z_flag_homogenized==6 OR tie_result==3),
-        this group should not exist (stars are excluded from comparisons).
-        Emit 'GROUP_STAR_SHOULD_NOT_BE_COMPARED' and skip the rest.
-      - Stars must carry tie_result==3; otherwise 'STAR_MUST_BE_3'.
-    """
-    vios = []
-    df = group_df.copy()
-
-    # Early star checks
-    zf = pd.to_numeric(df["z_flag_homogenized"], errors="coerce")
-    tr = pd.to_numeric(df["tie_result"], errors="coerce").fillna(-1).astype(int)
-    star_mask = (zf == 6) | (tr == 3)
-    if star_mask.any():
-        # Any star must have tie_result==3
-        bad_star = star_mask & (tr != 3)
-        if bad_star.any():
-            vios.append({
-                "rule": "STAR_MUST_BE_3",
-                "message": "Rows with z_flag_homogenized==6 must have tie_result==3.",
-                "group_ids": tuple(df["CRD_ID"].tolist()),
-                "rows": df.copy(),
-            })
-        vios.append({
-            "rule": "GROUP_STAR_SHOULD_NOT_BE_COMPARED",
-            "message": "Stars must be excluded from comparisons; this group should not exist.",
-            "group_ids": tuple(df["CRD_ID"].tolist()),
-            "rows": df.copy(),
-        })
-        return vios  # skip further group logic
-
-    # --- original group logic (unchanged beyond star guard) ---
-    it = df["instrument_type_homogenized"].map(_type_score).astype("Int64")
-    z = pd.to_numeric(df["z"], errors="coerce")
-
-    # Survivors = rows with tie_result in {1,2}
-    survivors_mask = tr.isin({1, 2})
-    survivors_idx = df.index[survivors_mask]
-    losers_idx = df.index[~survivors_mask]
-
-    # 0) All-flag-6 special case: all must be 0 (shouldn't happen now)
-    if zf.notna().all() and (zf == 6).all():
-        if survivors_mask.any():
-            vios.append({
-                "rule": "GROUP_ALL_FLAG6_ALL_ZERO",
-                "message": "All members have flag 6 but there are survivors.",
-                "group_ids": tuple(df["CRD_ID"].tolist()),
-                "rows": df.copy(),
-            })
-        return vios
-
-    # 1) Flag dominance (ignore 6 as quality)
-    zf_eff = zf.where(zf != 6, other=-1)
-    max_flag = zf_eff.max(skipna=True)
-    bad_flag_survivors = survivors_idx[zf_eff.loc[survivors_idx] < max_flag]
-    if len(bad_flag_survivors) > 0:
-        vios.append({
-            "rule": "GROUP_FLAG_DOMINANCE",
-            "message": "Survivors include members with lower z_flag than group max (excluding 6).",
-            "group_ids": tuple(df["CRD_ID"].tolist()),
-            "rows": df.copy(),
-        })
-
-    # 2) Type dominance among max-flag candidates
-    max_flag_mask = (zf_eff == max_flag)
-    if max_flag_mask.any():
-        max_type = it[max_flag_mask].max(skipna=True)
-        bad_type_survivors = survivors_idx[it.loc[survivors_idx] < max_type]
-        if len(bad_type_survivors) > 0:
-            vios.append({
-                "rule": "GROUP_TYPE_DOMINANCE",
-                "message": "Survivors include members with lower instrument_type than group max.",
-                "group_ids": tuple(df["CRD_ID"].tolist()),
-                "rows": df.copy(),
-            })
-
-    # 3) Δz-threshold independence among survivors at max-flag & max-type
-    cand_mask = (zf_eff == max_flag) & (it == it[max_flag_mask].max(skipna=True))
-    cand_idx = df.index[cand_mask]
-    crd = df.loc[cand_idx, "CRD_ID"].astype(str).tolist()
-    zvals = z.loc[cand_idx].to_numpy()
-
-    survivors_crd = set(df.loc[survivors_idx, "CRD_ID"].astype(str))
-
-    for i in range(len(crd)):
-        for j in range(i + 1, len(crd)):
-            zi, zj = zvals[i], zvals[j]
-            if not (np.isnan(zi) or np.isnan(zj)):
-                if abs(zi - zj) < threshold and (crd[i] in survivors_crd) and (crd[j] in survivors_crd):
-                    vios.append({
-                        "rule": "GROUP_DELTZ_INDEPENDENCE",
-                        "message": "Two survivors are closer than threshold (both z defined). Survivors must form an independent set.",
-                        "group_ids": tuple(df["CRD_ID"].tolist()),
-                        "rows": df.copy(),
-                    })
-                    break
-
-    # 4) Final labeling consistency
-    n_survivors = int(survivors_mask.sum())
-    if n_survivors == 0:
-        if not (zf.notna().all() and (zf == 6).all()):
-            vios.append({
-                "rule": "GROUP_NO_SURVIVOR_SUSPECT",
-                "message": "No survivors but group not all flag 6.",
-                "group_ids": tuple(df["CRD_ID"].tolist()),
-                "rows": df.copy(),
-            })
-    elif n_survivors == 1:
-        lone_idx = survivors_idx[0]
-        if int(df.loc[lone_idx, "tie_result"]) != 1:
-            vios.append({
-                "rule": "GROUP_SINGLE_SURVIVOR_MUST_BE_1",
-                "message": "Exactly one survivor but not labeled with tie_result == 1.",
-                "group_ids": tuple(df["CRD_ID"].tolist()),
-                "rows": df.copy(),
-            })
-    else:
-        if not (df.loc[survivors_idx, "tie_result"] == 2).all():
-            vios.append({
-                "rule": "GROUP_MULTI_SURVIVOR_MUST_BE_2",
-                "message": "Multiple survivors but not all labeled tie_result == 2.",
-                "group_ids": tuple(df["CRD_ID"].tolist()),
-                "rows": df.copy(),
-            })
-
-    return vios
-
-
-# ------------------------------
-# Public API  (excludes stars from graph + enforces tie_result==3)
+# Public API  (star-inclusive graph + star consistency)
 # ------------------------------
 def validate_tie_results_fast(
     df_final: pd.DataFrame,
@@ -751,181 +394,175 @@ def validate_tie_results_fast(
     max_groups: int | None = None,
     include_rows: bool = False,
 ):
-    """
-    Fast validator compatible with the semantics of build_components:
-      - Only counts nodes that appear in at least one edge (as the baseline does).
-      - Keeps "dangling" neighbors (mentioned in compared_to but with no row),
-        except if they are in star_ids (same as the baseline).
-      - Components may exist even if they become singletons after filtering
-        to present rows; they still count in n_components (as baseline).
-      - Validation only runs when there are >= 2 PRESENT rows in the component.
-    Assumptions:
-      - Helper functions _parse_cmp_list_fast and _norm_str are available in scope.
+    """Unified-graph validator (stars do not connect).
+
+    * Build a single graph EXCLUDING any edge/node that touches a star.
+    * z_flag rank: star(6) = -2, NaN = -1, others = numeric (used for rules).
+    * Within each component (non-stars only), apply all rules among non-stars.
+      Stars do not connect groups nor influence 1/2.
+
+    Args:
+      df_final: Input dataframe.
+      threshold: Delta-z threshold.
+      max_groups: Optional cap on scanned components.
+      include_rows: Include violating rows in payload.
+
+    Returns:
+      Dict with summary and violations.
     """
     import numpy as np
     import math
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
 
+    # ---------------------------
+    # Input prep
+    # ---------------------------
     df = df_final.copy()
-
-    # Ensure required columns exist
-    cols = ["CRD_ID", "compared_to", "z_flag_homogenized", "tie_result",
-            "instrument_type_homogenized", "z"]
-    for c in cols:
+    req = ["CRD_ID", "compared_to", "z_flag_homogenized", "tie_result",
+           "instrument_type_homogenized", "z"]
+    for c in req:
         if c not in df.columns:
             df[c] = np.nan
 
     df["CRD_ID"] = df["CRD_ID"].astype(str)
     df["compared_to"] = df["compared_to"].astype("string")
 
-    # Stars: z_flag==6 OR tie_result==3 (equivalent definition)
-    zf = pd.to_numeric(df["z_flag_homogenized"], errors="coerce")
-    tr = pd.to_numeric(df["tie_result"], errors="coerce")
-    star_mask = (zf == 6) | (tr == 3)
-    star_ids = set(df.loc[star_mask, "CRD_ID"].astype(str))
+    # Global masks for stars (for summary and global checks)
+    zf_all = pd.to_numeric(df["z_flag_homogenized"], errors="coerce")
+    tr_all = pd.to_numeric(df["tie_result"], errors="coerce")
+    is_star_row = (zf_all == 6) | (tr_all == 3)
+    star_ids = set(df.loc[is_star_row, "CRD_ID"].astype(str))
 
-    violations = []
+    violations: list[dict] = []
 
-    # Consistency: any z_flag==6 must have tie_result==3
-    wrong_tr_mask = (zf == 6) & (tr != 3)
-    if wrong_tr_mask.any():
-        rows = df.loc[wrong_tr_mask, cols].copy() if include_rows else None
-        violations.append({
-            "rule": "STAR_MUST_BE_3",
-            "message": "Rows with z_flag_homogenized==6 must have tie_result==3.",
-            "group_ids": tuple(df.loc[wrong_tr_mask, "CRD_ID"].astype(str).tolist()),
-            "rows": rows,
-        })
-
-    # Build directed edges from compared_to using only non-star A nodes (baseline behavior)
-    base = df.loc[~df["CRD_ID"].isin(star_ids), ["CRD_ID", "compared_to"]].copy()
-    if base.empty:
-        summary = {
-            "n_components": 0, "n_pairs": 0, "n_groups": 0,
-            "n_violations": len(violations),
-            "by_rule": pd.Series([v["rule"] for v in violations]).value_counts().to_dict() if violations else {},
-            "n_stars_excluded": int(star_mask.sum()),
-        }
-        return {"summary": summary, "violations": violations}
-
+    # ---------------------------
+    # Build edges (EXCLUDE stars as A and as B)
+    # ---------------------------
+    base = df[["CRD_ID", "compared_to"]].copy()
     cmp_df = (
         base.assign(_cmp_list=base["compared_to"].map(_parse_cmp_list_fast))
             [["CRD_ID", "_cmp_list"]]
             .explode("_cmp_list", ignore_index=True)
             .rename(columns={"CRD_ID": "A", "_cmp_list": "B"})
     )
-    # Drop empty neighbors
+    cmp_df["A"] = cmp_df["A"].astype(str)
+    cmp_df["B"] = cmp_df["B"].astype("string")
     cmp_df = cmp_df[cmp_df["B"].notna() & (cmp_df["B"] != "")]
-    # Discard neighbors that are stars; keep unknown/non-star neighbors even if absent in DF
-    cmp_df = cmp_df[~cmp_df["B"].isin(star_ids)]
 
-    # If no edges remain, there are no seen nodes -> 0 components
+    # EXCLUDE any edge that touches a star
+    if star_ids:
+        cmp_df = cmp_df[~cmp_df["A"].isin(star_ids) & ~cmp_df["B"].isin(star_ids)]
+
     if cmp_df.empty:
         summary = {
-            "n_components": 0,  # do NOT count singleton nodes without edges
-            "n_pairs": 0, "n_groups": 0,
+            "n_components": 0,
+            "n_pairs": 0,
+            "n_groups": 0,
             "n_violations": len(violations),
             "by_rule": pd.Series([v["rule"] for v in violations]).value_counts().to_dict() if violations else {},
-            "n_stars_excluded": int(star_mask.sum()),
+            "n_stars_excluded": int(len(star_ids)),
         }
         return {"summary": summary, "violations": violations}
 
-    # Graph nodes are the union of endpoints in edges (seen_nodes baseline)
+    # ---------------------------
+    # Nodes, undirected unique edges, connected components (non-stars only)
+    # ---------------------------
     nodes = pd.Index(pd.unique(pd.concat([cmp_df["A"], cmp_df["B"]], ignore_index=True)))
     id2ix = {cid: i for i, cid in enumerate(nodes)}
-    n = nodes.size
+    ai = cmp_df["A"].map(id2ix).to_numpy()
+    bi = cmp_df["B"].map(id2ix).to_numpy()
 
-    # Build undirected deduplicated edges
-    a_ix = cmp_df["A"].map(id2ix).to_numpy()
-    b_ix = cmp_df["B"].map(id2ix).to_numpy()
-    lo = np.minimum(a_ix, b_ix)
-    hi = np.maximum(a_ix, b_ix)
+    lo = np.minimum(ai, bi)
+    hi = np.maximum(ai, bi)
     und = np.stack([lo, hi], axis=1)
     und = und[und[:, 0] != und[:, 1]]
-    und_view = und.view([('x', und.dtype), ('y', und.dtype)])
-    und = np.unique(und_view).view(und.dtype).reshape(-1, 2)
+    undv = und.view([("x", und.dtype), ("y", und.dtype)])
+    und = np.unique(undv).view(und.dtype).reshape(-1, 2)
 
-    # Sparse graph + components (count ALL graph components)
-    data = np.ones(und.shape[0], dtype=np.int8)
-    A = coo_matrix((data, (und[:, 0], und[:, 1])), shape=(n, n))
+    n_nodes = nodes.size
+    data = np.ones(len(und), dtype=np.int8)
+    A = coo_matrix((data, (und[:, 0], und[:, 1])), shape=(n_nodes, n_nodes))
     A = A + A.T
-    n_comp, labels = connected_components(A, directed=False, return_labels=True)
+    n_comp_all, labels = connected_components(A, directed=False, return_labels=True)
 
-    # Indices of nodes that are PRESENT in df (after removing stars), to use in validation
-    present = df.set_index("CRD_ID").reindex(nodes, copy=False)
-    idx_vals = np.asarray(present.index)
-    present_mask = (~pd.isna(idx_vals)) & (pd.Index(idx_vals).isin(df["CRD_ID"].astype(str).values))
-    present_idx = np.flatnonzero(present_mask)
+    # ---------------------------
+    # Precompute arrays aligned to `nodes` (non-stars only)
+    # ---------------------------
+    node_df = df.set_index(df["CRD_ID"].astype(str), drop=False).reindex(nodes, copy=False)
 
-    # Arrays for PRESENT rows only
-    sub = present.iloc[present_idx][["z_flag_homogenized", "tie_result", "instrument_type_homogenized", "z"]]
+    zf = pd.to_numeric(node_df["z_flag_homogenized"], errors="coerce").to_numpy()
+    tr = pd.to_numeric(node_df["tie_result"], errors="coerce").to_numpy()
 
-    # ---- Ranking for z_flag: NaN -> -2 (lowest), 6 -> -1 (below any non-star), others -> numeric value
-    zf_raw = pd.to_numeric(sub["z_flag_homogenized"], errors="coerce").to_numpy()
-    zf_rank = np.where(np.isnan(zf_raw), -2, zf_raw)
-    zf_rank = np.where(zf_raw == 6, -1, zf_rank)
+    # rank: star(6)=-2, NaN=-1, others=numeric (stars não deveriam aparecer aqui, mas mantemos a codificação)
+    zf_rank_nodes = np.where(np.isnan(zf), -1.0, zf)
+    zf_rank_nodes[zf == 6] = -2.0
 
-    # tie_result array
-    tr_arr = pd.to_numeric(sub["tie_result"], errors="coerce").fillna(-1).astype(int).to_numpy()
-
-    # instrument_type mapping; unknown/NA -> 0 (so known types dominate NA)
+    # type priority
     type_map = {"s": 3, "g": 2, "p": 1}
-    it_arr = sub["instrument_type_homogenized"].map(lambda t: type_map.get(_norm_str(t), 0)).astype(int).to_numpy()
+    it_nodes = node_df["instrument_type_homogenized"].map(
+        lambda t: type_map.get(_norm_str(t), 0)
+    ).astype(np.int16).to_numpy()
 
-    # redshift array
-    z_arr = pd.to_numeric(sub["z"], errors="coerce").to_numpy()
+    # redshift
+    z_nodes = pd.to_numeric(node_df["z"], errors="coerce").to_numpy()
 
-    # Map global index -> local index (only for present nodes)
-    gix_to_lix = {gix: lix for lix, gix in enumerate(present_idx)}
+    # (Todos os nós aqui são não-estrelas, pois removemos os que tocavam estrela ao montar as arestas)
+    # Ainda assim, guardamos a máscara por segurança:
+    nonstar_mask_nodes = (zf != 6) & (tr != 3)
 
-    def zdiff(a, b):
-        mask = np.isnan(a) | np.isnan(b)
-        out = np.abs(a - b)
-        out[mask] = np.inf
-        return out
+    # ---------------------------
+    # Iterate components efficiently
+    # ---------------------------
+    order = np.argsort(labels, kind="mergesort")
+    labels_sorted = labels[order]
+    boundaries = np.flatnonzero(np.r_[True, labels_sorted[1:] != labels_sorted[:-1], True])
 
     n_pairs = 0
     n_groups = 0
+    comps_scanned = 0
 
-    # Optionally limit number of components to scan
-    comp_order = np.arange(n_comp)
-    if max_groups is not None and max_groups < n_comp:
-        comp_order = comp_order[:max_groups]
+    for b in range(len(boundaries) - 1):
+        if (max_groups is not None) and (comps_scanned >= max_groups):
+            break
 
-    for cid in comp_order:
-        # Global node indices of the component
-        gidx = np.where(labels == cid)[0]
-        # Keep only PRESENT nodes (rows we have)
-        lix = [gix_to_lix[g] for g in gidx if g in gix_to_lix]
-        m = len(lix)
-        if m <= 1:
-            continue  # nothing to validate
+        start, end = boundaries[b], boundaries[b + 1]
+        comp_idx = order[start:end]                     # node indices (non-star nodes)
+        comp_ids_str = tuple(nodes[comp_idx].tolist())
 
-        comp_ids_str = tuple(nodes[gidx].tolist())  # for reporting / identification
-        # Slice local arrays for this component
-        tr_c = tr_arr[lix]
-        it_c = it_arr[lix]
-        z_c  = z_arr[lix]
-        zf_c_rank = zf_rank[lix]
+        # Payload once per component (non-stars only — matches group_ids)
+        rows_payload_all = node_df.iloc[comp_idx].copy() if include_rows else None
 
+        # Non-star nodes inside the component (redundant but safe)
+        ns_mask_local = nonstar_mask_nodes[comp_idx]
+        ns_idx = comp_idx[ns_mask_local]
+
+        if ns_idx.size < 2:
+            comps_scanned += 1
+            continue
+
+        # Slice arrays for the component
+        tr_c = np.nan_to_num(tr[ns_idx], nan=-1.0).astype(np.int16)
+        it_c = it_nodes[ns_idx]
+        zf_c = zf_rank_nodes[ns_idx]
+        z_c  = z_nodes[ns_idx]
+
+        m = ns_idx.size
         if m == 2:
             n_pairs += 1
-            a, b = 0, 1
-            tr_a, tr_b = tr_c[a], tr_c[b]
-            zf_a_eff = zf_c_rank[a]
-            zf_b_eff = zf_c_rank[b]
-            ts_a, ts_b = it_c[a], it_c[b]
-            dz = zdiff(np.array([z_c[a]]), np.array([z_c[b]]))[0]
+            a, b_ = 0, 1
+            tr_a, tr_b = tr_c[a], tr_c[b_]
+            zf_a, zf_b = zf_c[a], zf_c[b_]
+            ts_a, ts_b = it_c[a], it_c[b_]
+
+            za, zb = z_c[a], z_c[b_]
+            dz = np.inf if (np.isnan(za) or np.isnan(zb)) else abs(za - zb)
 
             vios_local = []
-            # 1 vs 0: winner must strictly dominate by flag, or by type if flags equal, or Δz<threshold if still tied
-            if {tr_a, tr_b} == {0, 1}:
+            if (tr_a in (0, 1)) and (tr_b in (0, 1)) and (tr_a != tr_b):
                 win_is_a = (tr_a == 1)
-                win_zf = zf_a_eff if win_is_a else zf_b_eff
-                los_zf = zf_b_eff if win_is_a else zf_a_eff
-                win_ts = ts_a if win_is_a else ts_b
-                los_ts = ts_b if win_is_a else ts_a
+                win_zf, los_zf = (zf_a, zf_b) if win_is_a else (zf_b, zf_a)
+                win_ts, los_ts = (ts_a, ts_b) if win_is_a else (ts_b, ts_a)
                 cond = (
                     (win_zf > los_zf) or
                     (win_zf == los_zf and win_ts > los_ts) or
@@ -934,116 +571,111 @@ def validate_tie_results_fast(
                 if not cond:
                     vios_local.append(("PAIR_1v0_PRIORITY",
                                        "Winner lacks higher flag/type or Δz<threshold when tie persists."))
-            # 2 vs 2: tie must have equal flag and type, and Δz>threshold (or undefined)
-            elif tr_a == 2 and tr_b == 2:
-                cond = (zf_a_eff == zf_b_eff) and (ts_a == ts_b) and (dz > threshold or math.isinf(dz))
+            elif (tr_a == 2) and (tr_b == 2):
+                cond = (zf_a == zf_b) and (ts_a == ts_b) and (dz > threshold or math.isinf(dz))
                 if not cond:
                     vios_local.append(("PAIR_2v2_TIE_CONSISTENCY",
                                        "Tie (2,2) requires equal flag/type and Δz>threshold (or undefined)."))
-            # 0 vs 0: both eliminated but not due solely to flag 6 (defensive check)
-            elif tr_a == 0 and tr_b == 0:
-                vios_local.append(("PAIR_0v0_BOTH_FLAG6",
-                                   "Both eliminated (0,0) but not both flag 6."))
+            elif (tr_a == 0) and (tr_b == 0):
+                vios_local.append(("PAIR_0v0_SUSPECT",
+                                   "Both eliminated (0,0); check upstream logic."))
             else:
                 vios_local.append(("PAIR_INVALID_TIE_PATTERN",
                                    f"Unexpected tie_result pattern: ({tr_a},{tr_b})."))
 
             if vios_local:
-                rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
                 for rule, msg in vios_local:
                     violations.append({
                         "rule": rule, "message": msg,
                         "group_ids": comp_ids_str,
-                        "rows": rows_payload,
+                        "rows": rows_payload_all,
                     })
+
         else:
             n_groups += 1
             surv = np.isin(tr_c, (1, 2))
 
-            # Max flag rank in the group (no NaNs in rank); if empty, set to -inf
-            max_flag = np.max(zf_c_rank) if zf_c_rank.size else -np.inf
-
-            # 1) Flag dominance: any survivor with flag rank < max_flag?
-            if np.any(surv & (zf_c_rank < max_flag)):
-                rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
+            # Flag dominance (NaN=-1 in zf_c; stars never appear here)
+            max_flag = np.max(zf_c) if zf_c.size else -np.inf
+            if np.any(surv & (zf_c < max_flag)):
                 violations.append({
                     "rule": "GROUP_FLAG_DOMINANCE",
-                    "message": "Survivors include members with lower z_flag than group max (with rank: NaN<star<others).",
+                    "message": "Survivors include members with lower z_flag than group max (rank: star=-2 < NaN=-1 < others).",
                     "group_ids": comp_ids_str,
-                    "rows": rows_payload,
+                    "rows": rows_payload_all,
                 })
 
-            # 2) Type dominance among top-flag candidates
-            cand_flag = (zf_c_rank == max_flag)
-            if np.any(cand_flag):
-                max_type = np.max(it_c[cand_flag]) if np.any(cand_flag) else -1
-                if np.any(surv & (it_c < max_type)):
-                    rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
-                    violations.append({
-                        "rule": "GROUP_TYPE_DOMINANCE",
-                        "message": "Survivors include members with lower instrument_type than group max among top-flag.",
-                        "group_ids": comp_ids_str,
-                        "rows": rows_payload,
-                    })
-            else:
-                max_type = -1  # defensive fallback
+            # Type dominance among top-flag
+            cand_flag = (zf_c == max_flag)
+            max_type = np.max(it_c[cand_flag]) if np.any(cand_flag) else -1
+            if np.any(surv & (it_c < max_type)):
+                violations.append({
+                    "rule": "GROUP_TYPE_DOMINANCE",
+                    "message": "Survivors include members with lower instrument_type than group max among top-flag.",
+                    "group_ids": comp_ids_str,
+                    "rows": rows_payload_all,
+                })
 
-            # 3) Δz independence among survivors at top-flag & top-type
+            # Δz independence among top-flag & top-type survivors
             cand = cand_flag & (it_c == max_type)
-            cand_surv_idx = np.where(cand & surv)[0]
-            if cand_surv_idx.size >= 2:
-                zS = z_c[cand_surv_idx]
-                D = np.abs(zS[:, None] - zS[None, :])
-                iu = np.triu_indices_from(D, k=1)
-                if (D[iu] < threshold).any():
-                    rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
+            idx = np.where(cand & surv)[0]
+            if idx.size >= 2:
+                zS = z_c[idx]
+                too_close = False
+                for i in range(idx.size - 1):
+                    zi = zS[i]
+                    if np.isnan(zi):
+                        continue
+                    d = np.abs(zS[i+1:] - zi)
+                    if np.any(~np.isnan(d) & (d < threshold)):
+                        too_close = True
+                        break
+                if too_close:
                     violations.append({
                         "rule": "GROUP_DELTZ_INDEPENDENCE",
                         "message": "Two survivors are closer than threshold among max-flag & max-type.",
                         "group_ids": comp_ids_str,
-                        "rows": rows_payload,
+                        "rows": rows_payload_all,
                     })
 
-            # 4) Survivor count rules
+            # Survivor count (among non-stars)
             n_surv = int(np.sum(surv))
             if n_surv == 0:
-                rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
                 violations.append({
                     "rule": "GROUP_NO_SURVIVOR_SUSPECT",
-                    "message": "No survivors but group not all flag 6 (stars already excluded).",
+                    "message": "No survivors among non-stars inside a star-excluded component.",
                     "group_ids": comp_ids_str,
-                    "rows": rows_payload,
+                    "rows": rows_payload_all,
                 })
             elif n_surv == 1:
-                only_idx = np.where(surv)[0][0]
+                only_idx = int(np.where(surv)[0][0])
                 if int(tr_c[only_idx]) != 1:
-                    rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
                     violations.append({
                         "rule": "GROUP_SINGLE_SURVIVOR_MUST_BE_1",
-                        "message": "Exactly one survivor but not labeled tie_result == 1.",
+                        "message": "Exactly one survivor among non-stars but not labeled tie_result == 1.",
                         "group_ids": comp_ids_str,
-                        "rows": rows_payload,
+                        "rows": rows_payload_all,
                     })
             else:
                 if not np.all(tr_c[surv] == 2):
-                    rows_payload = df[df["CRD_ID"].isin(sub.index[lix])].copy() if include_rows else None
                     violations.append({
                         "rule": "GROUP_MULTI_SURVIVOR_MUST_BE_2",
-                        "message": "Multiple survivors but not all labeled tie_result == 2.",
+                        "message": "Multiple survivors among non-stars but not all labeled tie_result == 2.",
                         "group_ids": comp_ids_str,
-                        "rows": rows_payload,
+                        "rows": rows_payload_all,
                     })
 
+        comps_scanned += 1
+
     summary = {
-        "n_components": int(n_comp),     # count ALL graph components
-        "n_pairs": n_pairs,
-        "n_groups": n_groups,
+        "n_components": int(n_comp_all),  # components among non-stars only
+        "n_pairs": int(n_pairs),
+        "n_groups": int(n_groups),
         "n_violations": len(violations),
         "by_rule": pd.Series([v["rule"] for v in violations]).value_counts().to_dict() if violations else {},
-        "n_stars_excluded": int(star_mask.sum()),
+        "n_stars_excluded": int(len(star_ids)),
     }
     return {"summary": summary, "violations": violations}
-
 
 
 def explain_tie_validation_output(
@@ -1051,25 +683,7 @@ def explain_tie_validation_output(
     show_per_rule: int = 3,
     prefer_cols: list[str] | None = None,
 ):
-    """
-    Explain and display the results of `validate_tie_results`.
-
-    Parameters
-    ----------
-    report : dict
-        Output from validate_tie_results(df_final, ...).
-        Expected keys: "summary" and "violations".
-        Each item in "violations" is a dict with:
-            - "rule": str
-            - "message": str
-            - "group_ids": tuple[str, ...]
-            - "rows": pd.DataFrame (the group involved)
-    show_per_rule : int
-        Maximum number of examples to show per rule.
-    prefer_cols : list[str] | None
-        Preferred columns to display in each violation example.
-        If None, a default set is used.
-    """
+    """Explain and display results from validate_tie_results()."""
     if prefer_cols is None:
         prefer_cols = [
             "CRD_ID", "ra", "dec", "z",
@@ -1094,7 +708,7 @@ f"""
 - **Pairs (size=2)**: `{summary.get("n_pairs", 0)}`
 - **Groups (size≥3)**: `{summary.get("n_groups", 0)}`
 - **Total violations**: `{summary.get("n_violations", 0)}`
-- **Stars excluded from graph** (`z_flag_homogenized==6` or `tie_result==3`): `{summary.get("n_stars_excluded", 0)}`
+- **Stars present** (`z_flag_homogenized==6` or `tie_result==3`): `{summary.get("n_stars_excluded", 0)}`
 """
     ))
 
@@ -1120,12 +734,12 @@ f"""
     # Samples per Rule
     # ---------------------------
     display(Markdown("### Samples per rule"))
-    # group violations by "rule"
+    # group by rule
     vio_by_rule = {}
     for v in violations:
         vio_by_rule.setdefault(v.get("rule", "UNKNOWN_RULE"), []).append(v)
 
-    # order rules by count (same order as by_rule_df, if it exists)
+    # order by count
     ordered_rules = list(vio_by_rule.keys())
     if by_rule:
         ordered_rules = [r for r, _ in sorted(by_rule.items(), key=lambda x: x[1], reverse=True)]
@@ -1133,12 +747,12 @@ f"""
     for rule in ordered_rules:
         V = vio_by_rule[rule]
         display(Markdown(f"### Rule: `{rule}`  —  {len(V)} occurrence(s)"))
-        # “typical” message of the rule (take the first one)
+        # typical message (first one)
         msg = V[0].get("message", "")
         if msg:
             display(Markdown(f"> _{msg}_"))
 
-        # show up to `show_per_rule` examples
+        # show up to show_per_rule examples
         for i, viol in enumerate(V[:show_per_rule], start=1):
             group_ids = viol.get("group_ids", ())
             rows_obj = viol.get("rows", None)
@@ -1146,15 +760,14 @@ f"""
 
             display(Markdown(f"**Example {i}** — `group_ids`: `{group_ids}`"))
 
-            # select columns present in `rows`, preserving preferred order
+            # select columns present in rows, preserving preferred order
             cols_present = [c for c in prefer_cols if c in rows.columns]
             if cols_present:
                 to_show = rows[cols_present].reset_index(drop=True)
             else:
-                # fallback: show all if none of the preferred exist
                 to_show = rows.reset_index(drop=True)
 
-            # light sorting for readability (if columns exist)
+            # light sorting for readability
             sort_cols = []
             if "z_flag_homogenized" in to_show.columns:
                 sort_cols.append(("z_flag_homogenized", False))
@@ -1177,28 +790,27 @@ f"""
 """
 > **Useful Notes**
 >
-> - **PAIR_STAR_SHOULD_NOT_BE_COMPARED** / **GROUP_STAR_SHOULD_NOT_BE_COMPARED**  
->   indicate that a member was a star (`z_flag_homogenized==6` or `tie_result==3`) and therefore  
->   should not appear in the graph components.
+> - **Star handling (graph construction)**  
+>   Stars **do not** connect objects: any edge touching a star is removed from the graph.  
+>   They **must** have `tie_result == 3` and **do not** influence decisions among non-stars.
 >
-> - **STAR_MUST_BE_3**  
->   enforces that rows with `z_flag_homogenized==6` must have `tie_result==3`.
+> - **`z_flag_homogenized` ranking (applies only to non-stars)**  
+>   `star (6) → -2`  <  `NaN → -1`  <  `other flags → numeric`.  
+>   Thus, `NaN` participates in tiebreaks (loses to any valid flag), while
+>   star is always the lowest rank.
 >
 > - **PAIR_1v0_PRIORITY**  
->   when there is (1,0), the winner must have higher `z_flag` (excluding 6) **or** better type  
->   (`instrument_type_homogenized`) **or** `Δz < threshold` in case of a tie.
+>   For (1,0), the winner must have a higher flag; if equal, a better `instrument_type`;  
+>   if still tied, require `Δz < threshold`.
 >
 > - **PAIR_2v2_TIE_CONSISTENCY**  
->   ties (2,2) require equal quality (excluding 6), equal type, and `Δz > threshold` (or undefined).
+>   For (2,2), require **same flag** and **same `instrument_type`**, and `Δz > threshold`  
+>   (or undefined).
 >
-> - **GROUP_* rules**  
->   check flag/type dominance among survivors and `Δz` independence  
->   when multiple survive at the top.
+> - **GROUP_* rules (applied only to non-stars inside the component)**  
+>   Check flag/type dominance and Δz independence when multiple top survivors exist.
 """
     ))
-
-# --- Validation: when compared_to is <NA>, tie_result must be 1
-# --- EXCEPTION: tie_result may be 3 ONLY if z_flag_homogenized == 6
 
 
 def render_na_compared_to_validation(
@@ -1207,24 +819,15 @@ def render_na_compared_to_validation(
     cols_to_show: list[str] | None = None,
     assert_if_invalid: bool = False,
 ):
+    """Render a Markdown report for three rules on `compared_to`-NA rows.
+
+    Rules:
+      A) If `compared_to` is <NA>, then `tie_result` must be 1.
+         Exception: `tie_result` may be 3 only if `z_flag_homogenized == 6`.
+      B) (commented out here; kept for reference)
+      C) Global: `tie_result == 3` => `z_flag_homogenized == 6`, and optionally the converse.
     """
-    Render a Markdown report para três regras:
-
-    Regra A (isolados):
-      - Se `compared_to` é <NA>, então `tie_result` deve ser 1.
-      - Exceção: `tie_result` pode ser 3 somente se `z_flag_homogenized == 6`.
-
-    Regra B (membros de componente):
-      - Se `compared_to` NÃO é <NA>, então `z_flag_homogenized` NÃO pode ser 6
-        (estrelas não entram no tiebreaking).
-
-    Regra C (global, independente de compared_to):
-      - `tie_result == 3` → `z_flag_homogenized` deve ser 6 (sempre).
-      - (opcional complementar) `z_flag_homogenized == 6` → `tie_result` deve ser 3.
-
-    Retorna um dicionário com sumários e amostras de violações por regra.
-    """
-    # --- Imports para exibição bonita (ok fora de notebook) ---
+    # Pretty display imports (OK outside notebook)
     try:
         from IPython.display import display, Markdown
     except Exception:
@@ -1233,7 +836,7 @@ def render_na_compared_to_validation(
         def Markdown(x):  # type: ignore
             return x
 
-    # --- Checagem de colunas requeridas ---
+    # Required columns
     required = {"compared_to", "tie_result", "z_flag_homogenized"}
     missing = sorted(required - set(df_final.columns))
     if missing:
@@ -1246,7 +849,7 @@ def render_na_compared_to_validation(
             "tie_result", "survey", "source", "compared_to",
         ]
 
-    # Normaliza compared_to para NA "de verdade"
+    # Normalize compared_to to true NA
     df = df_final.copy()
     df["compared_to"] = (
         df["compared_to"]
@@ -1257,12 +860,12 @@ def render_na_compared_to_validation(
           })
     )
 
-    # Helpers numéricos
+    # Numeric helper
     def _num(s):
         return pd.to_numeric(s, errors="coerce")
 
     # =============================================================================
-    # Regra A: compared_to é NA -> tie_result deve ser 1 (exceto flag==6 -> 3)
+    # Rule A: compared_to is NA -> tie_result must be 1 (except flag==6 -> 3)
     # =============================================================================
     na_cmp = df[df["compared_to"].isna()].copy()
 
@@ -1278,11 +881,11 @@ def render_na_compared_to_validation(
 
     display(Markdown(
 f"""
-### Validation A: `compared_to` `<NA>` ➜ `tie_result` (com exceção flag==6)
+### Validation A: `compared_to` `<NA>` ➜ `tie_result` (with exception flag==6)
 
-- Linhas com `compared_to` `<NA>`: **{total_A}**  
-- Válidas: **{ok_A}**  
-- **INVÁLIDAS:** **{bad_A}**
+- Rows with `compared_to` `<NA>`: **{total_A}**  
+- Valid: **{ok_A}**  
+- **INVALID:** **{bad_A}**
 """
     ))
 
@@ -1290,125 +893,84 @@ f"""
     zflag_disp_A = _num(na_cmp["z_flag_homogenized"]).astype("Int64").astype("string").fillna("<NA>")
     ctab_A = pd.crosstab(tie_disp_A, zflag_disp_A, dropna=False)
 
-    display(Markdown("#### Crosstab A: `tie_result` × `z_flag_homogenized` (isolados; `<NA>` mostrado)"))
+    display(Markdown("#### Crosstab A: `tie_result` × `z_flag_homogenized` (isolated; showing `<NA>`)"))
     display(ctab_A)
 
     if bad_A > 0:
         cols_present_A = [c for c in cols_to_show if c in viol_A.columns]
-        display(Markdown(f"#### ⚠️ Exemplos (até {show_max}) — Regra A"))
+        display(Markdown(f"#### ⚠️ Examples (up to {show_max}) — Rule A"))
         display(viol_A[cols_present_A].head(show_max).reset_index(drop=True))
     else:
-        display(Markdown("✅ Regra A ok: todos isolados seguem a regra."))
+        display(Markdown("✅ Rule A OK: all isolated rows follow the rule."))
 
     # =============================================================================
-    # Regra B: compared_to NÃO é NA -> z_flag_homogenized NÃO pode ser 6
-    # =============================================================================
-    #    not_na_cmp = df[df["compared_to"].notna()].copy()
-    #    zf_B = _num(not_na_cmp["z_flag_homogenized"])
-    #
-    #    viol_mask_B = zf_B.eq(6)
-    #    viol_B = not_na_cmp.loc[viol_mask_B].copy()
-    #
-    #    total_B = int(len(not_na_cmp))
-    #    bad_B   = int(viol_mask_B.sum())
-    #    ok_B    = int(total_B - bad_B)
-    #
-    #    display(Markdown(
-    #f"""
-    #### Validation B: `compared_to` **não** `<NA>` ➜ **proibir** `z_flag_homogenized == 6`
-    #
-    #- Linhas com `compared_to` não `<NA>`: **{total_B}**  
-    #- Válidas (flag ≠ 6 ou `<NA>`): **{ok_B}**  
-    #- **INVÁLIDAS (flag == 6):** **{bad_B}**
-    #"""
-    #    ))
-    #
-    #    if total_B > 0:
-    #        tie_disp_B   = _num(not_na_cmp["tie_result"]).astype("Int64").astype("string").fillna("<NA>")
-    #        zflag_disp_B = _num(not_na_cmp["z_flag_homogenized"]).astype("Int64").astype("string").fillna("<NA>")
-    #        ctab_B = pd.crosstab(tie_disp_B, zflag_disp_B, dropna=False)
-    #    else:
-    #        ctab_B = pd.DataFrame()
-    #
-    #    display(Markdown("#### Crosstab B: `tie_result` × `z_flag_homogenized` (em componentes; `<NA>` mostrado)"))
-    #    display(ctab_B)
-    #
-    #    if bad_B > 0:
-    #        cols_present_B = [c for c in cols_to_show if c in viol_B.columns]
-    #        display(Markdown(f"#### ⚠️ Exemplos (até {show_max}) — Regra B"))
-    #        display(viol_B[cols_present_B].head(show_max).reset_index(drop=True))
-    #    else:
-    #        display(Markdown("✅ Regra B ok: nenhum membro de componente tem `flag == 6`."))
-
-    # =============================================================================
-    # Regra C (GLOBAL): coerência de "estrela"
-    #   C1) Se tie_result == 3 → z_flag_homogenized deve ser 6
-    #   C2) Se z_flag_homogenized == 6 → tie_result deve ser 3
+    # Rule B (GLOBAL): star consistency
+    #   B1) If tie_result == 3 → z_flag_homogenized must be 6
+    #   B2) If z_flag_homogenized == 6 → tie_result must be 3
     # =============================================================================
     tie_all = _num(df["tie_result"])
     zf_all  = _num(df["z_flag_homogenized"])
 
-    # C1: flag qualquer `3` sem flag==6 (pega exatamente seu caso)
-    mask_C1 = tie_all.eq(3) & ~zf_all.eq(6)
-    viol_C1 = df.loc[mask_C1].copy()
+    # B1: tie_result==3 without flag==6
+    mask_B1 = tie_all.eq(3) & ~zf_all.eq(6)
+    viol_B1 = df.loc[mask_B1].copy()
 
-    total_C1 = int(tie_all.eq(3).sum())
-    bad_C1   = int(mask_C1.sum())
-    ok_C1    = int(total_C1 - bad_C1)
-
-    display(Markdown(
-f"""
-### Validation C1 (Global): **`tie_result == 3` exige `z_flag_homogenized == 6`**
-
-- Linhas com `tie_result == 3`: **{total_C1}**  
-- Válidas (`flag == 6`): **{ok_C1}**  
-- **INVÁLIDAS (`flag != 6` ou `<NA>`):** **{bad_C1}**
-"""
-    ))
-
-    if bad_C1 > 0:
-        cols_present_C1 = [c for c in cols_to_show if c in viol_C1.columns]
-        display(Markdown(f"#### ⚠️ Exemplos (até {show_max}) — Regra C1"))
-        display(viol_C1[cols_present_C1].head(show_max).reset_index(drop=True))
-    else:
-        display(Markdown("✅ Regra C1 ok: todo `tie_result == 3` tem `flag == 6`."))
-
-    # C2: se flag==6 → tie_result deve ser 3 (opcional, mas útil)
-    mask_C2 = zf_all.eq(6) & ~tie_all.eq(3)
-    viol_C2 = df.loc[mask_C2].copy()
-
-    total_C2 = int(zf_all.eq(6).sum())
-    bad_C2   = int(mask_C2.sum())
-    ok_C2    = int(total_C2 - bad_C2)
+    total_B1 = int(tie_all.eq(3).sum())
+    bad_B1   = int(mask_B1.sum())
+    ok_B1    = int(total_B1 - bad_B1)
 
     display(Markdown(
 f"""
-### Validation C2 (Global): **`z_flag_homogenized == 6` exige `tie_result == 3`**
+### Validation B1 (Global): **`tie_result == 3` requires `z_flag_homogenized == 6`**
 
-- Linhas com `flag == 6`: **{total_C2}**  
-- Válidas (`tie_result == 3`): **{ok_C2}**  
-- **INVÁLIDAS (`tie_result != 3`):** **{bad_C2}**
+- Rows with `tie_result == 3`: **{total_B1}**  
+- Valid (`flag == 6`): **{ok_B1}**  
+- **INVALID (`flag != 6` or `<NA>`):** **{bad_B1}**
 """
     ))
 
-    if bad_C2 > 0:
-        cols_present_C2 = [c for c in cols_to_show if c in viol_C2.columns]
-        display(Markdown(f"#### ⚠️ Exemplos (até {show_max}) — Regra C2"))
-        display(viol_C2[cols_present_C2].head(show_max).reset_index(drop=True))
+    if bad_B1 > 0:
+        cols_present_B1 = [c for c in cols_to_show if c in viol_B1.columns]
+        display(Markdown(f"#### ⚠️ Examples (up to {show_max}) — Rule B1"))
+        display(viol_B1[cols_present_B1].head(show_max).reset_index(drop=True))
     else:
-        display(Markdown("✅ Regra C2 ok: todo `flag == 6` tem `tie_result == 3`."))
+        display(Markdown("✅ Rule B1 OK: every `tie_result == 3` has `flag == 6`."))
+
+    # B2: flag==6 → tie_result must be 3
+    mask_B2 = zf_all.eq(6) & ~tie_all.eq(3)
+    viol_B2 = df.loc[mask_B2].copy()
+
+    total_B2 = int(zf_all.eq(6).sum())
+    bad_B2   = int(mask_B2.sum())
+    ok_B2    = int(total_B2 - bad_B2)
+
+    display(Markdown(
+f"""
+### Validation B2 (Global): **`z_flag_homogenized == 6` requires `tie_result == 3`**
+
+- Rows with `flag == 6`: **{total_B2}**  
+- Valid (`tie_result == 3`): **{ok_B2}**  
+- **INVALID (`tie_result != 3`):** **{bad_B2}**
+"""
+    ))
+
+    if bad_B2 > 0:
+        cols_present_B2 = [c for c in cols_to_show if c in viol_B2.columns]
+        display(Markdown(f"#### ⚠️ Examples (up to {show_max}) — Rule B2"))
+        display(viol_B2[cols_present_B2].head(show_max).reset_index(drop=True))
+    else:
+        display(Markdown("✅ Rule B2 OK: every `flag == 6` has `tie_result == 3`."))
 
     # =============================================================================
-    # Assertion (se solicitado) — falha se QUALQUER regra for violada
+    # Assertion (optional) — fail if ANY rule is violated
     # =============================================================================
-    if assert_if_invalid and (bad_A > 0 or bad_B > 0 or bad_C1 > 0 or bad_C2 > 0):
+    if assert_if_invalid and (bad_A > 0 or bad_B1 > 0 or bad_B2 > 0):
         raise AssertionError(
             "Validation failed:\n"
             f"- Rule A violations: {bad_A}\n"
-            f"- Rule B violations: {bad_B}\n"
-            f"- Rule C1 (tie==3 -> flag==6) violations: {bad_C1}\n"
-            f"- Rule C2 (flag==6 -> tie==3) violations: {bad_C2}\n"
-            "Veja as tabelas exibidas para exemplos."
+            f"- Rule B1 (tie==3 -> flag==6) violations: {bad_B1}\n"
+            f"- Rule B2 (flag==6 -> tie==3) violations: {bad_B2}\n"
+            "See displayed tables for examples."
         )
 
     return {
@@ -1419,24 +981,17 @@ f"""
         "rule_na_cmp_crosstab": ctab_A,
         "rule_na_cmp_violations": viol_A,
 
-        # Rule B
-        #"rule_non_na_star_total": total_B,
-        #"rule_non_na_star_valid": ok_B,
-        #"rule_non_na_star_invalid": bad_B,
-        #"rule_non_na_star_crosstab": ctab_B,
-        #"rule_non_na_star_violations": viol_B,
+        # Rule B1 (global: tie==3 -> flag==6)
+        "rule_global_tie3_total": total_B1,
+        "rule_global_tie3_valid": ok_B1,
+        "rule_global_tie3_invalid": bad_B1,
+        "rule_global_tie3_violations": viol_B1,
 
-        # Rule C1 (global: tie==3 -> flag==6)
-        "rule_global_tie3_total": total_C1,
-        "rule_global_tie3_valid": ok_C1,
-        "rule_global_tie3_invalid": bad_C1,
-        "rule_global_tie3_violations": viol_C1,
-
-        # Rule C2 (global: flag==6 -> tie==3)
-        "rule_global_flag6_total": total_C2,
-        "rule_global_flag6_valid": ok_C2,
-        "rule_global_flag6_invalid": bad_C2,
-        "rule_global_flag6_violations": viol_C2,
+        # Rule B2 (global: flag==6 -> tie==3)
+        "rule_global_flag6_total": total_B2,
+        "rule_global_flag6_valid": ok_B2,
+        "rule_global_flag6_invalid": bad_B2,
+        "rule_global_flag6_violations": viol_B2,
     }
 
 
@@ -1446,7 +1001,7 @@ f"""
 # Manual Validation
 # =======================
 # =======================
-def analyze_groups_by_compared_to(
+def analyze_groups_by_compared_to_fast(
     df_final: pd.DataFrame,
     threshold: float = 0.0005,
     max_groups: int | None = 10000,
@@ -1455,56 +1010,36 @@ def analyze_groups_by_compared_to(
     final_columns: list[str] | None = None,
     render: bool = True,
 ) -> dict:
+    """Fast group analyzer using sparse graph + connected_components.
+
+    Preserves buckets:
+      - CASE1_* (pairs) and CASE2_* (groups ≥3), with *_small/_large and *_same/_diff
+      - TIE_FLAG_TYPE_BREAK_PAIR / _GROUP
+      - SAME_FLAG_DIFF_TYPE
+      - SAME_SOURCE_PAIR
+
+    Args:
+      df_final: Input dataframe.
+      threshold: Δz threshold for small/large classification.
+      max_groups: Max number of components to scan.
+      max_examples_per_case: Max examples to render per bucket.
+      desired_order: Preferred column order in rendering.
+      final_columns: Final subset of columns for tables.
+      render: Whether to display Markdown/tables.
+
+    Returns:
+      Dict with processed_groups, groups_by_case, case_descriptions, summary_counts.
     """
-    Analyze connected groups induced by 'compared_to' (undirected), classify them into cases,
-    and optionally render an explanatory Markdown report with sampled examples.
+    import numpy as np
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
 
-    Buckets created:
-      - CASE1_* : pairs (size == 2)
-      - CASE2_* : groups (size >= 3)
-          *_small_* -> all pairwise Δz <= threshold
-          *_large_* -> some pairwise Δz > threshold
-          *_same    -> all rows share the same 'survey'
-          *_diff    -> at least two distinct 'survey' values
-
-      - TIE_FLAG_TYPE_BREAK_PAIR   : pair with equal z_flag_homogenized, different instrument_type_homogenized, different surveys
-      - TIE_FLAG_TYPE_BREAK_GROUP  : group (>=3) with equal z_flag_homogenized, different instrument_type_homogenized, different surveys
-      - SAME_FLAG_DIFF_TYPE        : group (>=3) with same z_flag_homogenized but at least one differing instrument_type_homogenized
-      - SAME_SOURCE_PAIR           : pair with identical normalized 'source'
-
-    Parameters
-    ----------
-    df_final : pd.DataFrame
-        Input table with (at least) columns:
-        CRD_ID, compared_to, z, survey, source, z_flag_homogenized, instrument_type_homogenized, tie_result, ra, dec...
-    threshold : float
-        Δz threshold used for “small/large” classification.
-    max_groups : int | None
-        Max number of connected components to process (None = no cap).
-    max_examples_per_case : int
-        How many example groups to display per bucket.
-    desired_order : list[str] | None
-        Column order to use for readability when showing each group.
-    final_columns : list[str] | None
-        Final subset of columns to display in the examples (fallback to all if None or missing).
-    render : bool
-        If True, display a Markdown report with summary + examples. If False, only return artifacts.
-
-    Returns
-    -------
-    dict with:
-      - processed_groups: int
-      - groups_by_case: dict[str, list[pd.DataFrame]]
-      - case_descriptions: dict[str, str]
-      - summary_counts: dict[str, int]
-    """
-    from collections import defaultdict, deque
-
-    # Defaults for column ordering/visibility
+    # --------- display defaults
     if desired_order is None:
         desired_order = [
-            "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err", "instrument_type", "survey", "source",
-            "z_flag_homogenized", "instrument_type_homogenized", "tie_result", "compared_to", "role",
+            "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err", "instrument_type",
+            "survey", "source", "z_flag_homogenized", "instrument_type_homogenized",
+            "tie_result", "compared_to", "role",
         ]
     if final_columns is None:
         final_columns = [
@@ -1513,34 +1048,144 @@ def analyze_groups_by_compared_to(
             "tie_result", "survey", "source", "compared_to",
         ]
 
-    # Keep only rows with non-empty compared_to (string-aware)
-    df_cmp = df_final[(df_final["compared_to"].notnull()) & (df_final["compared_to"].astype(str).str.strip() != "")]
+    # --------- filter rows with non-empty compared_to (string-aware)
+    df = df_final.copy()
+    cmp = (
+        df[["CRD_ID", "compared_to"]]
+        .assign(compared_to=lambda x: x["compared_to"].astype("string"))
+    )
+    nonempty_mask = cmp["compared_to"].notna() & (cmp["compared_to"].str.strip() != "")
+    df_cmp = df.loc[nonempty_mask].copy()
     n_rows_with_cmp = int(len(df_cmp))
+    if n_rows_with_cmp == 0:
+        # Nothing to process
+        out = {
+            "processed_groups": 0,
+            "groups_by_case": {k: [] for k in [
+                "CASE1_small_same", "CASE1_small_diff", "CASE1_large_same", "CASE1_large_diff",
+                "CASE2_small_same", "CASE2_small_diff", "CASE2_large_same", "CASE2_large_diff",
+                "TIE_FLAG_TYPE_BREAK_PAIR", "TIE_FLAG_TYPE_BREAK_GROUP",
+                "SAME_FLAG_DIFF_TYPE", "SAME_SOURCE_PAIR",
+            ]},
+            "case_descriptions": {},
+            "summary_counts": {},
+        }
+        if render:
+            try:
+                from IPython.display import display, Markdown
+            except Exception:
+                def display(x): pass  # type: ignore
+                def Markdown(x): return x  # type: ignore
+            display(Markdown("### Manual group analysis via `compared_to`"))
+            display(Markdown("- No rows with non-empty `compared_to`."))
+        return out
 
-    # ---- Build undirected adjacency from 'compared_to'
-    adjacency: dict[str, set[str]] = defaultdict(set)
-    for _, row in df_cmp.iterrows():
-        crd_id = str(row["CRD_ID"])
-        for neighbor in str(row["compared_to"]).split(","):
-            nb = neighbor.strip()
-            if not nb:
-                continue
-            adjacency[crd_id].add(nb)
-            adjacency[nb].add(crd_id)
+    # --------- vectorized edges from compared_to
+    tmp = df_cmp[["CRD_ID", "compared_to"]].copy()
+    tmp["_nb_list"] = tmp["compared_to"].map(_parse_cmp_list_fast)
+    edges = (
+        tmp[["CRD_ID", "_nb_list"]]
+        .explode("_nb_list", ignore_index=True)
+        .rename(columns={"CRD_ID": "A", "_nb_list": "B"})
+    )
+    edges["A"] = edges["A"].astype(str)
+    edges["B"] = edges["B"].astype("string").fillna("")
+    edges = edges[edges["B"].str.strip() != ""]
 
-    def get_connected_group(start_id: str) -> tuple[str, ...]:
-        """BFS component from start_id over adjacency."""
-        visited = set()
-        queue = deque([start_id])
-        while queue:
-            cur = queue.popleft()
-            if cur in visited:
-                continue
-            visited.add(cur)
-            queue.extend(adjacency[cur] - visited)
-        return tuple(sorted(visited))
+    if edges.empty:
+        # No real edges -> no groups
+        out = {
+            "processed_groups": 0,
+            "groups_by_case": {k: [] for k in [
+                "CASE1_small_same", "CASE1_small_diff", "CASE1_large_same", "CASE1_large_diff",
+                "CASE2_small_same", "CASE2_small_diff", "CASE2_large_same", "CASE2_large_diff",
+                "TIE_FLAG_TYPE_BREAK_PAIR", "TIE_FLAG_TYPE_BREAK_GROUP",
+                "SAME_FLAG_DIFF_TYPE", "SAME_SOURCE_PAIR",
+            ]},
+            "case_descriptions": {},
+            "summary_counts": {},
+        }
+        if render:
+            try:
+                from IPython.display import display, Markdown
+            except Exception:
+                def display(x): pass  # type: ignore
+                def Markdown(x): return x  # type: ignore
+            display(Markdown("### Manual group analysis via `compared_to`"))
+            display(Markdown("- No edges after cleaning `compared_to`."))
+        return out
 
-    # Buckets
+    # --------- normalize nodes and deduplicate undirected edges
+    nodes = pd.Index(pd.unique(pd.concat([edges["A"], edges["B"]], ignore_index=True)))
+    id2ix = pd.Series(np.arange(nodes.size), index=nodes)  # Series for fast map
+    ai = id2ix.loc[edges["A"]].to_numpy()
+    bi = id2ix.loc[edges["B"]].to_numpy()
+    lo = np.minimum(ai, bi)
+    hi = np.maximum(ai, bi)
+    und = np.stack([lo, hi], axis=1)
+    und = und[und[:, 0] != und[:, 1]]
+    if und.size == 0:
+        # only self-loops (discarded)
+        out = {
+            "processed_groups": 0,
+            "groups_by_case": {k: [] for k in [
+                "CASE1_small_same", "CASE1_small_diff", "CASE1_large_same", "CASE1_large_diff",
+                "CASE2_small_same", "CASE2_small_diff", "CASE2_large_same", "CASE2_large_diff",
+                "TIE_FLAG_TYPE_BREAK_PAIR", "TIE_FLAG_TYPE_BREAK_GROUP",
+                "SAME_FLAG_DIFF_TYPE", "SAME_SOURCE_PAIR",
+            ]},
+            "case_descriptions": {},
+            "summary_counts": {},
+        }
+        if render:
+            try:
+                from IPython.display import display, Markdown
+            except Exception:
+                def display(x): pass  # type: ignore
+                def Markdown(x): return x  # type: ignore
+            display(Markdown("### Manual group analysis via `compared_to`"))
+            display(Markdown("- Only self-loops; no useful groups."))
+        return out
+
+    # deduplicate edges
+    und_view = und.view([('x', und.dtype), ('y', und.dtype)])
+    und = np.unique(und_view).view(und.dtype).reshape(-1, 2)
+
+    # --------- sparse graph and components
+    n = nodes.size
+    data = np.ones(len(und), dtype=np.int8)
+    A = coo_matrix((data, (und[:, 0], und[:, 1])), shape=(n, n))
+    A = A + A.T
+    n_comp, labels = connected_components(A, directed=False, return_labels=True)
+
+    # --------- fast indexing by CRD_ID
+    base = df_cmp.set_index(df_cmp["CRD_ID"].astype(str), drop=False)
+    present_mask = nodes.isin(base.index)
+    comp_ids = [np.where(labels == k)[0] for k in range(n_comp)]
+
+    # --------- quick helpers
+    def _pairwise_max_and_all_leq(arr: np.ndarray, thr: float) -> tuple[float, bool]:
+        """Return (max_pairwise_abs_diff, all_pairs_leq_thr) with early-stop."""
+        m = arr.size
+        if m <= 1:
+            return 0.0, True
+        max_d = 0.0
+        all_leq = True
+        for i in range(m - 1):
+            d = np.abs(arr[i+1:] - arr[i])
+            md = float(d.max(initial=0.0))
+            if md > max_d:
+                max_d = md
+            if all_leq and np.any(d > thr):
+                all_leq = False
+        return max_d, all_leq
+
+    def _same_survey_nonempty(vals: pd.Series) -> bool:
+        vs = vals.astype(str).str.strip()
+        vs = vs[vs != ""]
+        return vs.nunique(dropna=True) == 1
+
+    # --------- output buckets
     groups_by_case: dict[str, list[pd.DataFrame]] = {
         "CASE1_small_same": [],
         "CASE1_small_diff": [],
@@ -1564,103 +1209,99 @@ def analyze_groups_by_compared_to(
         "CASE2_small_diff": f"group (≥3) with all Δz ≤ {threshold} from different surveys",
         "CASE2_large_same": f"group (≥3) with some Δz > {threshold} from the same survey",
         "CASE2_large_diff": f"group (≥3) with some Δz > {threshold} from different surveys",
-        "TIE_FLAG_TYPE_BREAK_PAIR": "pair with equal z_flag_homogenized, different instrument_type_homogenized, and different surveys",
-        "TIE_FLAG_TYPE_BREAK_GROUP": "group (≥3) with equal z_flag_homogenized, different instrument_type_homogenized, and different surveys",
+        "TIE_FLAG_TYPE_BREAK_PAIR": "pair with equal z_flag_homogenized, different instrument_type_homogenized, different surveys",
+        "TIE_FLAG_TYPE_BREAK_GROUP": "group (≥3) with equal z_flag_homogenized, different instrument_type_homogenized, different surveys",
         "SAME_FLAG_DIFF_TYPE": "group (≥3) with same z_flag_homogenized but at least one differing instrument_type_homogenized",
         "SAME_SOURCE_PAIR": "pair with identical source (normalized, non-null)",
     }
 
     processed_groups = 0
-    seen_components: set[tuple[str, ...]] = set()
 
-    for _, row in df_cmp.iterrows():
+    # --------- linear iteration by component (with early cap)
+    for k in range(n_comp):
         if max_groups is not None and processed_groups >= max_groups:
             break
-        start_id = str(row["CRD_ID"])
-        comp_ids = get_connected_group(start_id)
-        if comp_ids in seen_components:
-            continue
-        seen_components.add(comp_ids)
 
-        group_df = df_cmp[df_cmp["CRD_ID"].astype(str).isin(comp_ids)].copy()
-        if len(group_df) < 2:
-            continue
+        gidx = comp_ids[k]                   # global node indices
+        present = present_mask[gidx]         # nodes that exist in df_cmp
+        # materialize the group with present rows
+        group_ids = nodes[gidx[present]].tolist()
+        if len(group_ids) < 2:
+            continue  # ignore singletons
 
-        # Mark the row used to discover the group (display-only)
-        group_df["role"] = np.where(group_df["CRD_ID"].astype(str) == start_id, "principal", "compared")
+        group = base.loc[group_ids].copy()
 
-        # Pairwise Δz and survey checks
-        z_vals = pd.to_numeric(group_df["z"], errors="coerce").to_numpy()
-        surveys = group_df["survey"].astype(str).replace({"nan": ""}).values
+        # "role" only to mark the seed row (display)
+        start_id = group_ids[0]
+        group["role"] = np.where(group["CRD_ID"].astype(str).eq(start_id), "principal", "compared")
 
-        delta_z_matrix = np.abs(z_vals[:, None] - z_vals[None, :])
-        pairwise_dz = delta_z_matrix[np.triu_indices(len(z_vals), k=1)]
-        max_delta_z = float(np.max(pairwise_dz)) if len(pairwise_dz) else 0.0
-        all_pairs_below_thresh = bool(np.all(pairwise_dz <= threshold)) if len(pairwise_dz) else True
-        same_survey = (len(set([s for s in surveys if s.strip() != ""])) == 1)
+        # quick metrics
+        z_vals = pd.to_numeric(group["z"], errors="coerce").to_numpy()
+        max_dz, all_leq = _pairwise_max_and_all_leq(z_vals[np.isfinite(z_vals)], threshold)
+        same_survey = _same_survey_nonempty(group["survey"])
 
-        # Classify
-        if len(group_df) == 2:
+        # classification
+        if len(group) == 2:
             key = (
-                "CASE1_small_same" if (max_delta_z <= threshold and same_survey) else
-                "CASE1_small_diff" if (max_delta_z <= threshold) else
+                "CASE1_small_same" if (max_dz <= threshold and same_survey) else
+                "CASE1_small_diff" if (max_dz <= threshold) else
                 "CASE1_large_same" if (same_survey) else
                 "CASE1_large_diff"
             )
         else:
             key = (
-                "CASE2_small_same" if (all_pairs_below_thresh and same_survey) else
-                "CASE2_small_diff" if (all_pairs_below_thresh) else
+                "CASE2_small_same" if (all_leq and same_survey) else
+                "CASE2_small_diff" if (all_leq) else
                 "CASE2_large_same" if (same_survey) else
                 "CASE2_large_diff"
             )
 
-        # Reorder columns for readability
-        all_columns = list(group_df.columns)
+        # reorder columns for readability
+        all_columns = list(group.columns)
         ordered_columns = (desired_order or []) + [c for c in all_columns if c not in (desired_order or [])]
-        group_df = group_df.reindex(columns=ordered_columns)
+        group = group.reindex(columns=ordered_columns)
+        groups_by_case[key].append(group)
 
-        groups_by_case[key].append(group_df)
-
-        # Extra buckets
-        flags = set(group_df["z_flag_homogenized"].dropna())
-        types = set(group_df["instrument_type_homogenized"].dropna())
-        surveys_in_group = set(group_df["survey"].dropna())
-
+        # extra buckets
+        flags = set(group["z_flag_homogenized"].dropna())
+        types = set(group["instrument_type_homogenized"].dropna())
+        surveys_in_group = set(group["survey"].dropna())
         if len(surveys_in_group) > 1 and len(flags) == 1 and len(types) > 1:
-            if len(group_df) == 2:
-                groups_by_case["TIE_FLAG_TYPE_BREAK_PAIR"].append(group_df)
-            elif len(group_df) > 2:
-                groups_by_case["TIE_FLAG_TYPE_BREAK_GROUP"].append(group_df)
-
-        if len(flags) == 1 and len(types) > 1 and len(group_df) > 2:
-            groups_by_case["SAME_FLAG_DIFF_TYPE"].append(group_df)
-
-        if len(group_df) == 2:
-            src_valid = group_df["source"].dropna().astype(str).str.strip().str.lower()
-            if len(src_valid) == 2 and len(set(src_valid)) == 1:
-                groups_by_case["SAME_SOURCE_PAIR"].append(group_df)
+            if len(group) == 2:
+                groups_by_case["TIE_FLAG_TYPE_BREAK_PAIR"].append(group)
+            else:
+                groups_by_case["TIE_FLAG_TYPE_BREAK_GROUP"].append(group)
+        if len(flags) == 1 and len(types) > 1 and len(group) > 2:
+            groups_by_case["SAME_FLAG_DIFF_TYPE"].append(group)
+        if len(group) == 2:
+            src = group["source"].dropna().astype(str).str.strip().str.lower()
+            if src.size == 2 and src.nunique() == 1:
+                groups_by_case["SAME_SOURCE_PAIR"].append(group)
 
         processed_groups += 1
 
-    # Summary counts
+    # --------- summary
     summary_counts = {k: len(v) for k, v in groups_by_case.items()}
 
-    # Helper for diversity sampling by survey signature
-    def survey_signature(df: pd.DataFrame) -> tuple[str, ...]:
-        vals = df["survey"].dropna().astype(str).unique().tolist()
-        return tuple(sorted(vals)) if len(vals) else ("<MISSING>",)
-
-    # Optional rendering
+    # --------- rendering (with diversity sampling by survey signature)
     if render:
-        display(Markdown(f"### Manual group analysis via `compared_to`"))
+        try:
+            from IPython.display import display, Markdown
+        except Exception:
+            def display(x): pass  # type: ignore
+            def Markdown(x): return x  # type: ignore
+
+        def survey_signature(df: pd.DataFrame) -> tuple[str, ...]:
+            vals = df["survey"].dropna().astype(str).unique().tolist()
+            return tuple(sorted(vals)) if len(vals) else ("<MISSING>",)
+
+        display(Markdown(f"### Manual group analysis via `compared_to` (fast)"))
         display(Markdown(
             f"- Rows with **non-empty** `compared_to`: **{n_rows_with_cmp}**  \n"
             f"- Unique connected groups processed: **{processed_groups}**  \n"
             f"- Δz threshold: **{threshold}**"
         ))
 
-        # Summary table (counts per case)
         if any(summary_counts.values()):
             summary_df = pd.DataFrame(
                 sorted(summary_counts.items(), key=lambda x: (-x[1], x[0])),
@@ -1671,38 +1312,26 @@ def analyze_groups_by_compared_to(
         else:
             display(Markdown("_No groups found under the current filters._"))
 
-        # Show examples per case
         for case_name, groups in groups_by_case.items():
             if not groups:
                 continue
-            desc = case_descriptions.get(case_name, case_name)
-            display(Markdown(f"#### {case_name} — {desc}  \nFound: **{len(groups)}** group(s)"))
-
-            # Diversity-first selection by survey signature
+            # diversity by survey signature
             seen_sigs = set()
-            selection = []
-            leftovers = []
-
+            selection, leftovers = [], []
             for g in groups:
                 sig = survey_signature(g)
-                if sig not in seen_sigs:
-                    seen_sigs.add(sig)
-                    selection.append(g)
-                else:
-                    leftovers.append(g)
+                (selection if sig not in seen_sigs else leftovers).append(g)
+                seen_sigs.add(sig)
                 if len(selection) >= max_examples_per_case:
                     break
-
-            # Fill remaining slots if needed
             i = 0
             while len(selection) < max_examples_per_case and i < len(leftovers):
-                selection.append(leftovers[i])
-                i += 1
+                selection.append(leftovers[i]); i += 1
 
-            # Display chosen examples
+            desc = case_descriptions.get(case_name, case_name)
+            display(Markdown(f"#### {case_name} — {desc}  \nFound: **{len(groups)}** group(s)"))
             for g in selection:
                 to_show = g.copy()
-                # Final visible columns
                 cols_present = [c for c in (final_columns or []) if c in to_show.columns]
                 if cols_present:
                     to_show = to_show.reindex(columns=cols_present)
@@ -1716,51 +1345,76 @@ def analyze_groups_by_compared_to(
         "summary_counts": summary_counts,
     }
 
-def validate_tie_preservation(
+def _parse_tokens(s: pd.Series) -> pd.Series:
+    """Split CSV-like strings into lists of stripped tokens (''/NA -> [])."""
+    s = s.astype("string")
+    lst = s.str.split(",")
+    out = []
+    for tokens in lst:
+        if not tokens:
+            out.append([])
+            continue
+        toks = [t.strip() for t in tokens if t and t.strip()]
+        out.append(toks)
+    return pd.Series(out, index=s.index, dtype="object")
+
+def _cmp_na_like_mask(df: pd.DataFrame, cmp_col: str) -> pd.Series:
+    """True when compared_to is NA-like (NA or only whitespace)."""
+    s = df[cmp_col].astype("string")
+    return s.isna() | (s.str.strip() == "")
+
+def _only_star_neighbors_mask(
+    df_proc: pd.DataFrame,
+    df_orig: pd.DataFrame,
+    *,
+    key: str,
+    cmp_col: str,
+    zflag_col: str = "z_flag_homogenized",
+) -> pd.Series:
+    """True when compared_to is non-empty and all neighbors are star IDs
+    (as defined by df_original[z_flag_homogenized] == 6)."""
+    if zflag_col not in df_orig.columns:
+        # If we cannot tell who is a star, be conservative: no rows qualify
+        return pd.Series(False, index=df_proc.index)
+
+    # Build set of star IDs from original
+    star_ids = set(
+        df_orig.loc[
+            pd.to_numeric(df_orig[zflag_col], errors="coerce").eq(6.0), key
+        ].astype("string")
+    )
+
+    s = df_proc[cmp_col].astype("string")
+    non_empty = ~(s.isna() | (s.str.strip() == ""))
+    tokens = _parse_tokens(s.fillna(""))
+
+    def _all_star(tok_list):
+        if not tok_list:
+            return False
+        return all((t in star_ids) for t in tok_list)
+
+    only_star = tokens.map(_all_star)
+    return (non_empty & only_star).astype(bool)
+
+def _check_preserve_block(
     df_original: pd.DataFrame,
     df_processed: pd.DataFrame,
+    mask_proc: pd.Series,
     *,
-    key: str = "CRD_ID",
-    tr_col: str = "tie_result",
-    cmp_col: str = "compared_to",
-    max_examples: int = 20,
-) -> dict:
-    """
-    Validate that for rows in df_processed with compared_to <NA/empty>,
-    the tie_result matches exactly the original tie_result in df_original.
+    key: str,
+    tr_col: str,
+    max_examples: int,
+) -> Dict:
+    """Compare tie_result for the subset indicated by mask_proc."""
+    proc_sub = df_processed.loc[mask_proc, [key, tr_col]].copy()
+    proc_sub = proc_sub.rename(columns={tr_col: f"{tr_col}_proc"})
 
-    Parameters
-    ----------
-    key : unique ID column to join on (must exist in both dataframes)
-    tr_col : tie_result column name
-    cmp_col : compared_to column name
-    max_examples : cap the number of mismatches returned for quick inspection
-
-    Returns
-    -------
-    result : dict with:
-      - ok (bool)
-      - n_checked (int)
-      - n_missing_in_original (int)
-      - n_mismatches (int)
-      - mismatches (DataFrame): up to `max_examples` rows with details
-    """
-    # --- Normalize NA-like compared_to: treat NA or empty/whitespace as NA-like
-    cmp_str = df_processed[cmp_col].astype("string")
-    na_like_mask = cmp_str.isna() | (cmp_str.str.strip() == "")
-
-    proc_na = df_processed.loc[na_like_mask, [key, tr_col]].copy()
-    proc_na = proc_na.rename(columns={tr_col: f"{tr_col}_proc"})
-
-    # Join with original to fetch baseline tie_result
     orig_min = df_original[[key, tr_col]].rename(columns={tr_col: f"{tr_col}_orig"})
-    merged = proc_na.merge(orig_min, on=key, how="left", validate="m:1")
+    merged = proc_sub.merge(orig_min, on=key, how="left", validate="m:1")
 
-    # Track rows that don't exist in original (cannot validate)
     missing_in_orig_mask = merged[f"{tr_col}_orig"].isna() & ~merged[f"{tr_col}_proc"].isna()
     n_missing_in_original = int(missing_in_orig_mask.sum())
 
-    # Compare (treat NaN == NaN as equal)
     tr_proc = pd.to_numeric(merged[f"{tr_col}_proc"], errors="coerce")
     tr_orig = pd.to_numeric(merged[f"{tr_col}_orig"], errors="coerce")
     equal_mask = (tr_proc == tr_orig) | (tr_proc.isna() & tr_orig.isna())
@@ -1770,37 +1424,197 @@ def validate_tie_preservation(
     if len(mismatches_df) > max_examples:
         mismatches_df = mismatches_df.head(max_examples)
 
-    n_checked = int(len(merged))
-    n_mismatches = int(mismatch_mask.sum())
+    return {
+        "n_checked": int(len(merged)),
+        "n_missing_in_original": n_missing_in_original,
+        "n_mismatches": int(mismatch_mask.sum()),
+        "mismatches": mismatches_df,
+    }
 
-    ok = (n_mismatches == 0) and (n_missing_in_original == 0)
+def _check_star_must_be_3(
+    df_processed: pd.DataFrame,
+    mask_proc: pd.Series,
+    *,
+    key: str,
+    tr_col: str,
+    max_examples: int,
+) -> dict:
+    """Check that stars under mask have tie_result == 3.
+
+    Args:
+        df_processed: Processed DataFrame.
+        mask_proc: Boolean mask selecting candidate rows.
+        key: ID column name.
+        tr_col: Tie result column name.
+        max_examples: Maximum number of example rows to return.
+
+    Returns:
+        Dict with counts and example rows where tie_result != 3.
+    """
+    sub = df_processed.loc[mask_proc, [key, tr_col]].copy()
+    tr_proc = pd.to_numeric(sub[tr_col], errors="coerce")
+    bad = ~(tr_proc == 3)
+
+    examples = sub.loc[bad, [key, tr_col]].copy()
+    examples = examples.rename(columns={tr_col: f"{tr_col}_proc"})
+    if len(examples) > max_examples:
+        examples = examples.head(max_examples)
+
+    return {
+        "n_checked": int(len(sub)),
+        "n_bad": int(bad.sum()),
+        "examples": examples,
+    }
+
+
+def validate_tie_preservation(
+    df_original: pd.DataFrame,
+    df_processed: pd.DataFrame,
+    *,
+    key: str = "CRD_ID",
+    tr_col: str = "tie_result",
+    cmp_col: str = "compared_to",
+    max_examples: int = 20,
+) -> dict:
+    """Validate tie_result preservation in NA-like and star-neighbor cases.
+
+    Rules:
+        A) If compared_to is NA-like -> must preserve tie_result.
+        B) If compared_to has only star neighbors:
+           - Non-star row -> must preserve tie_result.
+           - Star row     -> must have tie_result == 3.
+
+    Args:
+        df_original: Original DataFrame.
+        df_processed: Processed DataFrame.
+        key: ID column name.
+        tr_col: Tie result column name.
+        cmp_col: Compared-to column name.
+        max_examples: Maximum number of mismatches to show.
+
+    Returns:
+        Dict with per-case results, totals, and examples.
+    """
+    # A) NA-like case
+    mask_na = _cmp_na_like_mask(df_processed, cmp_col)
+
+    # B) Only-star neighbors
+    mask_only_star = _only_star_neighbors_mask(
+        df_processed, df_original, key=key, cmp_col=cmp_col, zflag_col="z_flag_homogenized"
+    )
+
+    # Identify stars in processed
+    zflag_proc = pd.to_numeric(df_processed.get("z_flag_homogenized"), errors="coerce")
+    mask_is_star_proc = zflag_proc.eq(6.0)
+
+    # Split into star / non-star cases
+    mask_only_star_star = (mask_only_star & mask_is_star_proc).fillna(False)
+    mask_only_star_nonstar = (mask_only_star & ~mask_is_star_proc).fillna(False)
+
+    # Run validations
+    res_na = _check_preserve_block(
+        df_original, df_processed, mask_na, key=key, tr_col=tr_col, max_examples=max_examples
+    )
+    res_star_preserve = _check_preserve_block(
+        df_original, df_processed, mask_only_star_nonstar, key=key, tr_col=tr_col, max_examples=max_examples
+    )
+    res_star_must3 = _check_star_must_be_3(
+        df_processed, mask_only_star_star, key=key, tr_col=tr_col, max_examples=max_examples
+    )
+
+    # Combine examples
+    mismatches_all = pd.concat(
+        [res_na["mismatches"], res_star_preserve["mismatches"]], ignore_index=True
+    )
+    if len(mismatches_all) > max_examples:
+        mismatches_all = mismatches_all.head(max_examples)
+
+    ok = (
+        (res_na["n_mismatches"] == 0 and res_na["n_missing_in_original"] == 0)
+        and (res_star_preserve["n_mismatches"] == 0 and res_star_preserve["n_missing_in_original"] == 0)
+        and (res_star_must3["n_bad"] == 0)
+    )
 
     return {
         "ok": ok,
-        "n_checked": n_checked,
-        "n_missing_in_original": n_missing_in_original,
-        "n_mismatches": n_mismatches,
-        "mismatches": mismatches_df,
+        "na_like": {
+            "n_checked": res_na["n_checked"],
+            "n_missing_in_original": res_na["n_missing_in_original"],
+            "n_mismatches": res_na["n_mismatches"],
+        },
+        "only_star_neighbors_preserve": {
+            "n_checked": res_star_preserve["n_checked"],
+            "n_missing_in_original": res_star_preserve["n_missing_in_original"],
+            "n_mismatches": res_star_preserve["n_mismatches"],
+        },
+        "only_star_neighbors_star3": {
+            "n_checked": res_star_must3["n_checked"],
+            "n_bad": res_star_must3["n_bad"],
+        },
+        "n_checked_total": int(
+            res_na["n_checked"] + res_star_preserve["n_checked"] + res_star_must3["n_checked"]
+        ),
+        "n_missing_in_original_total": int(
+            res_na["n_missing_in_original"] + res_star_preserve["n_missing_in_original"]
+        ),
+        "n_mismatches_total": int(
+            res_na["n_mismatches"] + res_star_preserve["n_mismatches"]
+        ),
+        "n_star_must3_bad_total": int(res_star_must3["n_bad"]),
+        "mismatches": mismatches_all,
+        "star_must3_examples": res_star_must3["examples"],
     }
 
 
 def explain_tie_preservation(result: dict, *, title: str = "Tie-result preservation check") -> str:
-    """
-    Produce a short human-readable explanation from validate_tie_preservation() result.
+    """Render human-readable summary of preservation validation results.
+
+    Args:
+        result: Dict returned by validate_tie_preservation.
+        title: Report title.
+
+    Returns:
+        Text summary.
     """
     lines = []
     lines.append(f"{title}")
     lines.append("-" * len(title))
-    lines.append(f"Checked rows (compared_to NA-like): {result['n_checked']}")
-    lines.append(f"Missing in original: {result['n_missing_in_original']}")
-    lines.append(f"Mismatches: {result['n_mismatches']}")
+
+    # Case A
+    lines.append("Case A — compared_to NA-like (preserve tie_result)")
+    lines.append(f"  Checked: {result['na_like']['n_checked']}")
+    lines.append(f"  Missing in original: {result['na_like']['n_missing_in_original']}")
+    lines.append(f"  Mismatches: {result['na_like']['n_mismatches']}")
+
+    # Case B.1
+    lines.append("Case B1 — only star neighbors & row is NON-STAR (preserve)")
+    lines.append(f"  Checked: {result['only_star_neighbors_preserve']['n_checked']}")
+    lines.append(f"  Missing in original: {result['only_star_neighbors_preserve']['n_missing_in_original']}")
+    lines.append(f"  Mismatches: {result['only_star_neighbors_preserve']['n_mismatches']}")
+
+    # Case B.2
+    lines.append("Case B2 — only star neighbors & row IS STAR (require tie_result==3)")
+    lines.append(f"  Checked: {result['only_star_neighbors_star3']['n_checked']}")
+    lines.append(f"  Not equal to 3: {result['only_star_neighbors_star3']['n_bad']}")
+
+    lines.append("")
+    lines.append(f"Total checked: {result['n_checked_total']}")
+    lines.append(f"Total missing in original (preserve-cases): {result['n_missing_in_original_total']}")
+    lines.append(f"Total mismatches (preserve-cases): {result['n_mismatches_total']}")
+    lines.append(f"Total star-not-3 (must-be-3 case): {result['n_star_must3_bad_total']}")
     lines.append(f"Status: {'OK ✅' if result['ok'] else 'FAIL ❌'}")
 
+    # Examples
     mism = result.get("mismatches", None)
     if mism is not None and len(mism) > 0:
-        lines.append("\nExamples (up to N shown):")
-        # Render a few examples as 'ID: proc -> orig'
+        lines.append("\nExamples (preserve mismatches: proc -> orig):")
         for _, row in mism.iterrows():
             lines.append(f"  {row.iloc[0]}: {row.iloc[1]} -> {row.iloc[2]}")
+
+    star_bad = result.get("star_must3_examples", None)
+    if star_bad is not None and len(star_bad) > 0:
+        lines.append("\nExamples (star must be 3 — proc values):")
+        for _, row in star_bad.iterrows():
+            lines.append(f"  {row.iloc[0]}: proc={row.iloc[1]} (expected 3)")
 
     return "\n".join(lines)

@@ -397,71 +397,124 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         log_prep.info("END preparation: finished prepared collections")
 
         # ---------------------------------------------------------------
+        # Detect pipeline state for resume (is crossmatch already done?)
+        # ---------------------------------------------------------------
+        final_step = len(prepared_info) - 1
+        resume_log = os.path.join(temp_dir, "process_resume.log")
+
+        def _recover_final_collection_path() -> str | None:
+            #1) Try to take from the resume of the last step
+            resumed = _resume_get(resume_log, f"crossmatch_step{final_step}.collection_path")
+            resumed = _normalize_collection_root(resumed)
+            if resumed and _is_collection_root(resumed):
+                return resumed
+            #2) Try to guess on the disk
+            guessed = _guess_collection_for_step(temp_dir, final_step)
+            if guessed and _is_collection_root(guessed):
+                return guessed
+            return None
+
+        merged_final_path = os.path.join(temp_dir, f"merged_step{final_step}")
+        crossmatch_already_done = (
+            (f"crossmatch_step{final_step}" in completed) or
+            os.path.isdir(merged_final_path)
+        )
+
+        # If you have already finished crossmatching, retrieve the collection root (if it exists) for distributed dedup.
+        final_collection_path = _recover_final_collection_path() if crossmatch_already_done else None
+
+
+        # ---------------------------------------------------------------
         # 2) AUTO MATCH (self crossmatch over each prepared)
         # ---------------------------------------------------------------
         log_auto = _phase_logger(base_logger, "automatch")
         if combine_mode in ("concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"):
-            log_auto.info("START automatch: generating *_hats_auto from prepared collections")
 
-            queue_auto: list[dict] = []
-            for info in prepared_info:
-                tag = f"autocross_{info['internal_name']}"
-                if tag in completed:
-                    log_auto.info("Skip auto for %s (already done)", info["internal_name"])
-                else:
-                    queue_auto.append(info)
-
-            max_inflight_auto = int(param_config.get("auto_cross_max_inflight", 5))
-            log_auto.info(
-                "Concurrency for auto-cross: max_inflight=%d, to_run=%d, already_done=%d",
-                max_inflight_auto, len(queue_auto), len(prepared_info) - len(queue_auto),
-            )
-
-            ac2 = as_completed()
-            inflight2 = []
-            fut2info: dict[Any, dict] = {}
-
-            for _ in range(min(max_inflight_auto, len(queue_auto))):
-                info = queue_auto.pop(0)
-                fut = client.submit(_auto_cross_worker, info, logs_dir, translation_config, pure=False)
-                ac2.add(fut)
-                inflight2.append(fut)
-                fut2info[fut] = info
-
-            auto_done = 0
-            while inflight2:
-                fut = next(ac2)
-                inflight2.remove(fut)
-                try:
-                    ret = fut.result()
-                except Exception as e:
-                    info_err = fut2info.pop(fut)
-                    log_auto.error("Auto crossmatch failed for %s: %s", info_err["internal_name"], e)
-                    raise
-                info_ok = fut2info.pop(fut)
-                info_ok["collection_path"] = ret  # prepared_*_hats_auto
-                log_step(resume_log, f"autocross_{info_ok['internal_name']}")
-                auto_done += 1
-                if queue_auto:
-                    info = queue_auto.pop(0)
-                    fut2 = client.submit(_auto_cross_worker, info, logs_dir, translation_config, pure=False)
-                    ac2.add(fut2)
-                    inflight2.append(fut2)
-                    fut2info[fut2] = info
-
-            log_auto.info("Auto crossmatch completed for %d catalogs", auto_done)
-            log_auto.info("END automatch: all *_hats_auto generated")
-
-        # Enforce *_hats_auto for all
-        for info in prepared_info:
-            hats_auto = info["prepared_path"] + "_hats_auto"
-            if os.path.isdir(hats_auto):
-                info["collection_path"] = hats_auto
-            else:
-                raise FileNotFoundError(
-                    f"Auto-cross output not found for {info['internal_name']}: {hats_auto}. "
-                    "Auto-cross must succeed before crossmatch."
+            if crossmatch_already_done:
+                # No auto needed: merges already completed and merged_step{final} present
+                log_auto.info(
+                    "Skip automatch: crossmatch already finalized (merged_step%d exists or logged).",
+                    final_step,
                 )
+            else:
+                log_auto.info("START automatch: generating *_hats_auto from prepared collections")
+
+                queue_auto: list[dict] = []
+                already_done = 0
+                for info in prepared_info:
+                    tag = f"autocross_{info['internal_name']}"
+                    hats_auto = info["prepared_path"] + "_hats_auto"
+                    if tag in completed and os.path.isdir(hats_auto):
+                        already_done += 1
+                    else:
+                        queue_auto.append(info)
+
+                max_inflight_auto = int(param_config.get("auto_cross_max_inflight", 5))
+                log_auto.info(
+                    "Concurrency for auto-cross: max_inflight=%d, to_run=%d, already_done=%d",
+                    max_inflight_auto, len(queue_auto), already_done,
+                )
+
+                if queue_auto:
+                    ac2 = as_completed()
+                    inflight2 = []
+                    fut2info: dict[Any, dict] = {}
+
+                    def _submit_auto(i: dict):
+                        return client.submit(_auto_cross_worker, i, logs_dir, translation_config, pure=False)
+
+                    for _ in range(min(max_inflight_auto, len(queue_auto))):
+                        info = queue_auto.pop(0)
+                        fut = _submit_auto(info)
+                        ac2.add(fut)
+                        inflight2.append(fut)
+                        fut2info[fut] = info
+
+                    auto_done_now = 0
+                    while inflight2:
+                        fut = next(ac2)
+                        inflight2.remove(fut)
+                        try:
+                            out_path = fut.result()
+                        except Exception as e:
+                            info_err = fut2info.pop(fut)
+                            log_auto.error("Auto crossmatch failed for %s: %s", info_err["internal_name"], e)
+                            raise
+                        info_ok = fut2info.pop(fut)
+                        info_ok["collection_path"] = out_path
+                        log_step(resume_log, f"autocross_{info_ok['internal_name']}")
+                        auto_done_now += 1
+                        if queue_auto:
+                            nxt = queue_auto.pop(0)
+                            fut2 = _submit_auto(nxt)
+                            ac2.add(fut2)
+                            inflight2.append(fut2)
+                            fut2info[fut2] = nxt
+
+                    log_auto.info("Auto crossmatch completed for %d catalogs (re/computed)", auto_done_now)
+                else:
+                    log_auto.info("No auto-crossmatch needed (all *_hats_auto present).")
+
+                log_auto.info("END automatch: all *_hats_auto guaranteed on disk")
+
+            # -----------------------------------------------------------
+            # Enforcement of *_hats_auto ONLY if we are still going to run crossmatch
+            # -----------------------------------------------------------
+            if not crossmatch_already_done:
+                missing_auto: list[str] = []
+                for info in prepared_info:
+                    hats_auto = info["prepared_path"] + "_hats_auto"
+                    if os.path.isdir(hats_auto):
+                        info["collection_path"] = hats_auto
+                    else:
+                        missing_auto.append(info["internal_name"])
+                if missing_auto:
+                    raise FileNotFoundError(
+                        "Auto-cross outputs still missing after recovery: "
+                        + ", ".join(missing_auto)
+                        + ". Check disk/permissions/logs."
+                    )
+
 
         # ---------------------------------------------------------------
         # 3) CROSSMATCH (no tie-breaking)
@@ -479,68 +532,81 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             start_consolidate = True
 
         elif combine_mode in ("concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"):
-            init = prepared_info[0]
-            cat_prev = lsdb.open_catalog(init["collection_path"])  # *_hats_auto
-            start_i = 1
-            final_collection_path = None
-            final_step = len(prepared_info) - 1
 
-            for i in range(start_i, len(prepared_info)):
-                tag = f"crossmatch_step{i}"
-                info_i = prepared_info[i]
-
-                if tag in completed:
-                    log_cross.info("Skip completed step: %s", tag)
-                    resume_key = f"{tag}.collection_path"
-                    resumed_col = _resume_get(resume_log, resume_key)
-                    resumed_col = _normalize_collection_root(resumed_col)
-                    if resumed_col and _is_collection_root(resumed_col):
-                        log_cross.info("Resume collection root for %s: %s", tag, resumed_col)
-                        cat_prev = lsdb.open_catalog(resumed_col)
-                        if i == final_step:
-                            final_collection_path = resumed_col
-                    elif i == final_step and final_collection_path is None:
-                        guessed = _guess_collection_for_step(temp_dir, i)
-                        if guessed:
-                            log_cross.info("Guessed collection root for %s: %s", tag, guessed)
-                            final_collection_path = guessed
-                    continue
-
-                cat_curr = lsdb.open_catalog(info_i["collection_path"])  # *_hats_auto
-                target_name = info_i["internal_name"]
-                log_cross.info("Crossmatching previous result with: %s", target_name)
-
-                is_last = (i == final_step)
-                crossmatch_result = crossmatch_tiebreak_safe(
-                    left_cat=cat_prev,
-                    right_cat=cat_curr,
-                    logs_dir=logs_dir,
-                    temp_dir=temp_dir,
-                    step=i,
-                    client=client,
-                    translation_config=translation_config,
-                    do_import=True,  # returns collection path (root or subcat)
+            if crossmatch_already_done:
+                # Crossmatch chain already finished previously (by resume log or presence of merged_step{final})
+                log_cross.info(
+                    "Skip crossmatch loop: already finalized at step %d (resume/merged present).",
+                    final_step,
                 )
+                # No df_final here; dedup will read merged_step{final} directly.
+                start_consolidate = False  # dedup still runs before consolidation
 
-                log_cross.info("Raw crossmatch path returned: %s", crossmatch_result)
-                norm = _normalize_collection_root(crossmatch_result)
-                if norm != crossmatch_result:
-                    log_cross.info("Normalized to collection root: %s", norm)
+            else:
+                # === Normal iterative crossmatch flow ===
+                init = prepared_info[0]
+                cat_prev = lsdb.open_catalog(init["collection_path"])  # *_hats_auto
+                start_i = 1
+                final_collection_path = None  # set when last step finishes
 
-                if not _is_hats_collection(norm):
-                    log_cross.warning("Returned path does not look like a HATS collection: %s", crossmatch_result)
+                for i in range(start_i, len(prepared_info)):
+                    tag = f"crossmatch_step{i}"
+                    info_i = prepared_info[i]
 
-                cat_prev = lsdb.open_catalog(norm)
-                _resume_set(resume_log, f"{tag}.collection_path", norm, log_cross)
-                if is_last:
-                    final_collection_path = norm
+                    if tag in completed:
+                        log_cross.info("Skip completed step: %s", tag)
+                        resume_key = f"{tag}.collection_path"
+                        resumed_col = _resume_get(resume_log, resume_key)
+                        resumed_col = _normalize_collection_root(resumed_col)
+                        if resumed_col and _is_collection_root(resumed_col):
+                            log_cross.info("Resume collection root for %s: %s", tag, resumed_col)
+                            cat_prev = lsdb.open_catalog(resumed_col)
+                            if i == final_step:
+                                final_collection_path = resumed_col
+                        elif i == final_step and final_collection_path is None:
+                            guessed = _guess_collection_for_step(temp_dir, i)
+                            if guessed:
+                                log_cross.info("Guessed collection root for %s: %s", tag, guessed)
+                                final_collection_path = guessed
+                        continue
 
-                log_step(resume_log, tag)
-                if delete_temp_files:
-                    _cleanup_previous_step(i, prepared_info, temp_dir, log_cross)
+                    # Open next *_hats_auto catalog and crossmatch
+                    cat_curr = lsdb.open_catalog(info_i["collection_path"])
+                    target_name = info_i["internal_name"]
+                    log_cross.info("Crossmatching previous result with: %s", target_name)
 
-            log_cross.info("END crossmatch: graph merge completed")
-            start_consolidate = False  # consolidation runs after dedup
+                    is_last = (i == final_step)
+                    crossmatch_result = crossmatch_tiebreak_safe(
+                        left_cat=cat_prev,
+                        right_cat=cat_curr,
+                        logs_dir=logs_dir,
+                        temp_dir=temp_dir,
+                        step=i,
+                        client=client,
+                        translation_config=translation_config,
+                        do_import=True,  # returns collection path (root or subcat)
+                    )
+
+                    log_cross.info("Raw crossmatch path returned: %s", crossmatch_result)
+                    norm = _normalize_collection_root(crossmatch_result)
+                    if norm != crossmatch_result:
+                        log_cross.info("Normalized to collection root: %s", norm)
+
+                    if not _is_hats_collection(norm):
+                        log_cross.warning("Returned path does not look like a HATS collection: %s", crossmatch_result)
+
+                    cat_prev = lsdb.open_catalog(norm)
+                    _resume_set(resume_log, f"{tag}.collection_path", norm, log_cross)
+                    if is_last:
+                        final_collection_path = norm
+
+                    log_step(resume_log, tag)
+                    if delete_temp_files:
+                        _cleanup_previous_step(i, prepared_info, temp_dir, log_cross)
+
+                log_cross.info("END crossmatch: graph merge completed")
+                start_consolidate = False
+                
 
             # -----------------------------------------------------------
             # 4) DEDUPLICATION
@@ -636,6 +702,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     tie_col="tie_result",
                 )
 
+                # Read the final merged parquet once; keep original tie_result for later restore
                 df_all = dd.read_parquet(final_merged_path)
                 try:
                     df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
@@ -644,13 +711,14 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
                     labels = labels.assign(CRD_ID=labels["CRD_ID"].astype("string"))
 
+                orig_tr_dd = df_all.loc[:, ["CRD_ID", "tie_result"]].rename(columns={"tie_result": "tie_result_orig"})
+
                 rhs_dd = labels.rename(columns={"tie_result": "tie_result_new"})
 
+                # Keep clear_divisions only right before merges
                 for obj in (df_all, rhs_dd):
-                    try:
-                        obj = obj.clear_divisions()
-                    except Exception:
-                        pass
+                    try: obj = obj.clear_divisions()
+                    except Exception: pass
 
                 with dask.config.set({"dataframe.shuffle.method": "tasks"}):
                     merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
@@ -684,38 +752,33 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     delta_z_threshold=delta_z_threshold_cfg,
                 )
 
+                # Read once and cache the original tie_result.
                 df_all = dd.read_parquet(final_merged_path)
+                orig_tr_dd = df_all.loc[:, ["CRD_ID", "tie_result"]].rename(columns={"tie_result": "tie_result_orig"})
+
                 rhs_pdf = pdf_out.loc[:, ["CRD_ID", "tie_result"]].rename(columns={"tie_result": "tie_result_new"})
                 rhs_dd = dd.from_pandas(rhs_pdf, npartitions=max(1, df_all.npartitions))
 
                 for obj in (df_all, rhs_dd):
-                    try:
-                        obj = obj.clear_divisions()
-                    except Exception:
-                        pass
+                    try: obj = obj.clear_divisions()
+                    except Exception: pass
 
                 with dask.config.set({"dataframe.shuffle.method": "tasks"}):
                     merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
 
-            # Coalesce tie_result
+            # Coalesce tie_result with the newly computed labels
             if "tie_result" in merged.columns:
                 merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
             else:
                 merged = merged.assign(tie_result=merged["tie_result_new"])
             merged = merged.drop(columns=["tie_result_new"])
 
-            try:
-                merged = merged.clear_divisions()
-            except Exception:
-                pass
+            try: merged = merged.clear_divisions()
+            except Exception: pass
 
+            # Numeric views for rules below
             tie_f = dd.to_numeric(merged["tie_result"], errors="coerce").astype("float64")
-            zf_f = dd.to_numeric(merged["z_flag_homogenized"], errors="coerce").astype("float64")
-
-            try:
-                merged = merged.clear_divisions()
-            except Exception:
-                pass
+            zf_f  = dd.to_numeric(merged["z_flag_homogenized"], errors="coerce").astype("float64")
 
             # Stars: flag==6 => tie=3
             is_star = zf_f.eq(6.0)
@@ -725,46 +788,87 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             wrong_3 = tie_f.eq(3.0) & ~is_star
             merged["tie_result"] = merged["tie_result"].mask(wrong_3, 0)
 
-            # Guard: isolated & flag NaN => restore original tie_result
-            cmp_str = merged["compared_to"].astype("string")
-            cmp_empty = cmp_str.isna() | (cmp_str.str.strip().str.len().fillna(0) == 0)
-            guard_mask = cmp_empty & zf_f.isna()
+            # --------- GUARD RESTORE (optimized, incl. "only-star neighbors") ----------
+            # Build NA-like mask once
+            cmp_str   = merged["compared_to"].astype("string")
+            cmp_empty = cmp_str.isna() | cmp_str.str.strip().eq("")
+            # Base guard: empty compared_to & NaN z_flag_homogenized -> restore original tie_result
+            guard_empty = cmp_empty & zf_f.isna()
 
-            n_restore = (
-                guard_mask.map_partitions(lambda s: s.astype("int8").sum(), meta=("sum", "int64"))
-                .sum()
+            # Build fast lookup set of star IDs once (from df_all already in memory)
+            star_ids = set(
+                df_all.loc[
+                    dd.to_numeric(df_all["z_flag_homogenized"], errors="coerce").eq(6.0),
+                    "CRD_ID",
+                ]
+                .astype("string")
                 .compute()
             )
-            log_dedup.info("Guard restore count (isolated & flag NaN): %d", int(n_restore))
-            if int(n_restore) > 0:
-                orig_tr = (
-                    dd.read_parquet(final_merged_path, columns=["CRD_ID", "tie_result"])
-                    .rename(columns={"tie_result": "tie_result_orig"})
-                )
-                try:
-                    merged = merged.clear_divisions()
-                except Exception:
-                    pass
-                try:
-                    orig_tr = orig_tr.clear_divisions()
-                except Exception:
-                    pass
+
+            def _only_star_neighbors_partition(col: pd.Series, star_set: set[str]) -> pd.Series:
+                """Return True if compared_to is non-empty and all neighbors are star IDs."""
+                s = col.astype("string").fillna("")
+                lst = s.str.split(",")
+                out = []
+                for tokens in lst:
+                    if not tokens:
+                        out.append(False)
+                        continue
+                    toks = [t.strip() for t in tokens if t and t.strip()]
+                    out.append(bool(toks) and all((tok in star_set) for tok in toks))
+                return pd.Series(out, index=col.index, dtype="boolean")
+
+            # Compute only-star-neighbors only if there are non-empty compared_to rows
+            needs_only_star = bool((~cmp_empty).any().compute())
+            if needs_only_star:
+                only_star_neighbors = (~cmp_empty) & merged["compared_to"].map_partitions(
+                    _only_star_neighbors_partition, star_ids, meta=("only_star_neighbors", "boolean")
+                ).fillna(False)
+            else:
+                # Fast false column with the same index/partitions
+                only_star_neighbors = tie_f.eq(-9999)  # always False, preserves graph
+
+            # IMPORTANT: do NOT restore stars (they must remain tie_result == 3)
+            restore_mask = (~is_star) & (guard_empty | only_star_neighbors)
+
+            # Materialize once; no extra parquet reads
+            merged = merged.assign(_guard_mask=restore_mask)
+
+            n_restore = int(merged["_guard_mask"].astype("int8").sum().compute())
+            log_dedup.info(
+                "Guard restore count (non-stars with empty compared_to OR only-star neighbors): %d",
+                n_restore,
+            )
+
+            if n_restore > 0:
+                try: merged   = merged.clear_divisions()
+                except Exception: pass
+                try: orig_tr_dd = orig_tr_dd.clear_divisions()
+                except Exception: pass
                 with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-                    merged = dd.merge(merged, orig_tr, on="CRD_ID", how="left")
-                merged["tie_result"] = merged["tie_result"].mask(guard_mask, merged["tie_result_orig"])
+                    merged = dd.merge(merged, orig_tr_dd, on="CRD_ID", how="left")
+                merged["tie_result"] = merged["tie_result"].mask(merged["_guard_mask"], merged["tie_result_orig"])
                 merged = merged.drop(columns=["tie_result_orig"])
 
-            _ = (tie_f.eq(3.0) & ~zf_f.eq(6.0)).map_partitions(lambda s: s.astype("int64").sum(), meta=("sum", "int64")).sum().compute()
-            _ = (zf_f.eq(6.0) & ~tie_f.eq(3.0)).map_partitions(lambda s: s.astype("int64").sum(), meta=("sum", "int64")).sum().compute()
+            # Drop temp column
+            merged = merged.drop(columns=["_guard_mask"])
+            # --------------------------------------------------------------------------
 
+            # (Optional) recompute metrics AFTER restore (or remove if not needed)
+            # tie_f_fin = dd.to_numeric(merged["tie_result"], errors="coerce").astype("float64")
+            # zf_f_fin  = dd.to_numeric(merged["z_flag_homogenized"], errors="coerce").astype("float64")
+            # _ = (tie_f_fin.eq(3.0) & ~zf_f_fin.eq(6.0)).map_partitions(lambda s: s.astype("int64").sum(), meta=("sum","int64")).sum().compute()
+            # _ = (zf_f_fin.eq(6.0) & ~tie_f_fin.eq(3.0)).map_partitions(lambda s: s.astype("int64").sum(), meta=("sum","int64")).sum().compute()
+
+            # Final dtype
             merged["tie_result"] = merged["tie_result"].astype("Int8")
 
             try:
                 df_final_dd = merged.clear_divisions()
             except Exception:
                 df_final_dd = merged
-            df_final = df_final_dd.compute()
 
+            df_final = df_final_dd.compute()
             log_dedup.info("END deduplication: labels merged back into final dataframe")
 
             # Next phase runs below:
@@ -791,6 +895,18 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     if combine_mode == "concatenate" and "tie_result" in df_final.columns:
         log_cons.info("Dropping 'tie_result' (concatenate mode)")
         df_final = df_final.drop(columns=["tie_result"])
+
+    if combine_mode == "concatenate_and_remove_duplicates":
+        if "tie_result" not in df_final.columns:
+            log_cons.warning("Expected 'tie_result' column for removal mode, but it is missing; skipping row filter.")
+        else:
+            # Keep only rows marked as winners (tie_result == 1)
+            tie_num = pd.to_numeric(df_final["tie_result"], errors="coerce").fillna(0).astype("int8")
+            keep_mask = tie_num.eq(1)
+            kept = int(keep_mask.sum())
+            dropped = int(len(df_final) - kept)
+            df_final = df_final.loc[keep_mask].copy()
+            log_cons.info("Removed duplicates by tie_result==1: kept=%d rows, dropped=%d rows.", kept, dropped)
 
     if USE_ARROW_TYPES:
         df_final = df_final.convert_dtypes(dtype_backend="pyarrow")
@@ -861,13 +977,18 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     start_ts = time.time()
+    ok = False
     try:
         main(args.config_path, args.cwd, args.base_dir)
+        ok = True
     finally:
         dur = time.time() - start_ts
         lg = logging.getLogger("crc")
+        msg = f"Pipeline {'completed successfully' if ok else 'terminated with errors'} in {dur:.2f} seconds."
         if lg.handlers:
-            # keep phase to help time-profiler catch the trailer as 'consolidation'
-            logging.LoggerAdapter(lg, {"phase": "consolidation"}).info("Pipeline completed in %.2f seconds.", dur)
+            logging.LoggerAdapter(lg, {"phase": "consolidation"}).info(msg)
         else:
-            print(f"✅ Pipeline completed in {dur:.2f} seconds.")
+            print(("✅ " if ok else "❌ ") + msg)
+        # propagate non-zero exit if failed
+        if not ok:
+            sys.exit(1)

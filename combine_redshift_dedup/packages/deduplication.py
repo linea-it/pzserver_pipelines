@@ -860,6 +860,23 @@ def _dedup_local_no_margin(
     out[tie_col] = _nullable_int8(out[tie_col])
     return out
 
+def _columns_set(ddf) -> set:
+    """Return the set of column names from a Dask DataFrame's _meta (cheap)."""
+    return set(map(str, getattr(getattr(ddf, "_meta", None), "columns", [])))
+
+def _assert_required(ddf, required: set[str], where: str):
+    """Raise KeyError if required columns are missing from ddf."""
+    have = _columns_set(ddf)
+    missing = sorted([c for c in required if c not in have])
+    if missing:
+        raise KeyError(f"Missing required columns in {where}: {missing}")
+
+def _assert_priorities(ddf, priorities: list[str], where: str):
+    """Raise KeyError if any tiebreaking_priority column is missing from ddf."""
+    have = _columns_set(ddf)
+    missing = sorted([c for c in priorities if c not in have])
+    if missing:
+        raise KeyError(f"Missing priority columns in {where}: {missing}")
 
 def run_dedup_with_lsdb_map_partitions(
     cat,
@@ -886,6 +903,23 @@ def run_dedup_with_lsdb_map_partitions(
         main_ddf = cat._ddf
         has_margin = bool(getattr(cat, "margin", None) and hasattr(cat.margin, "_ddf"))
         log.info("Inputs: has_margin=%s, npartitions(main)=%s", has_margin, main_ddf.npartitions)
+
+        # Strict schema checks: required base + all tiebreaking priority columns
+        required_base = {crd_col, compared_col, z_col}
+        _assert_required(main_ddf, required_base, "main")
+        _assert_priorities(main_ddf, list(tiebreaking_priority), "main")
+        
+        if has_margin:
+            margin_ddf = cat.margin._ddf
+            _assert_required(margin_ddf, required_base, "margin")
+            _assert_priorities(margin_ddf, list(tiebreaking_priority), "margin")
+        
+        # Enforce instrument_type mapping only if requested in priorities
+        if ("instrument_type_homogenized" in set(tiebreaking_priority)) and (instrument_type_priority is None):
+            raise ValueError(
+                "instrument_type_priority is required when "
+                "'instrument_type_homogenized' is used in tiebreaking_priority."
+            )
 
         # Output meta for map_partitions
         meta = pd.DataFrame(

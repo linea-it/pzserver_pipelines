@@ -371,8 +371,10 @@ def crossmatch_tiebreak(
             logger.warning("Failed to cast column '%s' to %s: %s", col, dtype, e)
 
     # 5b) Coerce prev/expr columns to stable Arrow dtypes across partitions
-    schema_hints_local = (translation_config or {}).get("expr_column_schema", {}) or {}
-    merged = _coerce_optional_columns_for_import(merged, schema_hints_local)
+    cfg = translation_config or {}
+    schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
+    if schema_hints_local:
+        merged = _coerce_optional_columns_for_import(merged, schema_hints_local)
 
     logger.info("Type normalization complete (%.2fs)", time.time() - t0)
 
@@ -386,7 +388,7 @@ def crossmatch_tiebreak(
     if do_import:
         t0 = time.time()
         logger.info("START import_collection: step=%s parquet=%s", step, merged_path)
-        schema_hints = (translation_config or {}).get("expr_column_schema")
+        schema_hints = schema_hints_local if schema_hints_local else None
 
         collection_path = _build_collection_with_retry(
             parquet_path=merged_path,
@@ -475,7 +477,9 @@ def crossmatch_tiebreak_safe(
             if do_import:
                 t0 = time.time()
                 logger.info("START import_collection_safe: step=%s parquet=%s", step, merged_path)
-                schema_hints = (translation_config or {}).get("expr_column_schema")
+                cfg = translation_config or {}
+                schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
+                schema_hints = schema_hints_local if schema_hints_local else None
 
                 collection_path = _build_collection_with_retry(
                     parquet_path=merged_path,
