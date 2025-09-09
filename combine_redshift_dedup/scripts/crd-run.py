@@ -706,6 +706,14 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     "'instrument_type_homogenized' is present in tiebreaking_priority."
                 )
             delta_z_threshold_cfg = float(translation_config.get("delta_z_threshold", 0.0))
+
+            #######################################################################
+            # Diagnostics / outputs
+            # - edge_log: enable edge diagnostics (warn on star-neighbor exclusions)
+            # - group_col: set to None to disable exporting group labels
+            edge_log = True
+            group_col = "group_id"  # None to deactivate
+            #######################################################################
             
             if use_distributed:
                 log_dedup.info("Running graph-based dedup on final merged collection (map_partitions)")
@@ -744,109 +752,214 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 if not hasattr(final_cat, "_ddf"):
                     raise RuntimeError("Main subcatalog does not expose _ddf.")
             
-                # Labels are computed per partition; guard-restore now happens inside deduplicate_pandas
-                labels = run_dedup_with_lsdb_map_partitions(
-                    final_cat,
-                    tiebreaking_priority=tiebreaking_priority_cfg,
-                    instrument_type_priority=(instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None),
-                    delta_z_threshold=delta_z_threshold_cfg,
-                    crd_col="CRD_ID",
-                    compared_col="compared_to",
-                    z_col="z",
-                    tie_col="tie_result",
-                )
-            
-                # Read once for the final merge
-                df_all = dd.read_parquet(final_merged_path)
+                # Compute labels per partition. Guard-restore is inside deduplicate_pandas.
                 try:
-                    df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
-                    labels = labels.assign(CRD_ID=labels["CRD_ID"].astype("string[pyarrow]"))
-                except Exception:
-                    df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
-                    labels = labels.assign(CRD_ID=labels["CRD_ID"].astype("string"))
+                    labels = run_dedup_with_lsdb_map_partitions(
+                        final_cat,
+                        tiebreaking_priority=tiebreaking_priority_cfg,
+                        instrument_type_priority=(instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None),
+                        delta_z_threshold=delta_z_threshold_cfg,
+                        crd_col="CRD_ID",
+                        compared_col="compared_to",
+                        z_col="z",
+                        tie_col="tie_result",
+                        edge_log=edge_log,
+                        group_col=group_col,
+                    )
+                    log_dedup.info("Labels Dask graph built (lazy). Preparing merge...")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while building labels Dask graph: %s\n%s", repr(e), _tb.format_exc())
+                    raise
             
-                rhs_dd = labels.rename(columns={"tie_result": "tie_result_new"})
-            
-                # Keep clear_divisions only right before merges
-                for obj in (df_all, rhs_dd):
+                # Read once for the final merge; align CRD_ID dtypes with labels.
+                try:
+                    df_all = dd.read_parquet(final_merged_path)
                     try:
-                        obj = obj.clear_divisions()
+                        df_all  = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
+                        labels  = labels.assign(CRD_ID=labels["CRD_ID"].astype("string[pyarrow]"))
+                    except Exception:
+                        df_all  = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
+                        labels  = labels.assign(CRD_ID=labels["CRD_ID"].astype("string"))
+                    log_dedup.info("Aligned CRD_ID dtypes between base and labels.")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while reading base parquet or aligning dtypes: %s\n%s", repr(e), _tb.format_exc())
+                    raise
+            
+                # Keep only the columns needed for the merge; rename tie_result.
+                try:
+                    rhs_dd = labels.rename(columns={"tie_result": "tie_result_new"})
+                    keep_cols = ["CRD_ID", "tie_result_new"]
+                    if group_col and (group_col in rhs_dd.columns):
+                        keep_cols.append(group_col)
+                    rhs_dd = rhs_dd[keep_cols]
+                    log_dedup.info("Prepared labels rhs_dd with columns: %s", keep_cols)
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while preparing rhs_dd: %s\n%s", repr(e), _tb.format_exc())
+                    raise
+            
+                # Clear divisions before shuffle-based merge (assign back!).
+                try:
+                    try:
+                        df_all = df_all.clear_divisions()
                     except Exception:
                         pass
+                    try:
+                        rhs_dd = rhs_dd.clear_divisions()
+                    except Exception:
+                        pass
+                    log_dedup.info("Cleared divisions for shuffle merge.")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while clearing divisions: %s\n%s", repr(e), _tb.format_exc())
+                    raise
             
-                with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-                    merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
+                # Merge and compute labels to catch issues early
+                try:
+                    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
+                        merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
+                    log_dedup.info("Dask merge graph built (lazy). Computing a small sample for sanity...")
+                    # Compute a small sample to validate schema early
+                    _ = merged.head(1)
+                    log_dedup.info("Merge sample computed successfully.")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED during merge (distributed branch): %s\n%s", repr(e), _tb.format_exc())
+                    raise
             
             else:
                 log_dedup.warning(
                     "final_collection_path missing or not a collection root; falling back to driver-side pandas dedup."
                 )
-                base_dd = dd.read_parquet(final_merged_path, engine="pyarrow", split_row_groups=True)
-                available = set(map(str, base_dd.columns))
-                required_base = {"CRD_ID", "compared_to", "z"}
-                missing_base = sorted(required_base - available)
-                if missing_base:
-                    raise KeyError(f"Missing required columns: {missing_base}")
+                try:
+                    base_dd = dd.read_parquet(final_merged_path, engine="pyarrow", split_row_groups=True)
+                    available = set(map(str, base_dd.columns))
+                    required_base = {"CRD_ID", "compared_to", "z"}
+                    missing_base = sorted(required_base - available)
+                    if missing_base:
+                        raise KeyError(f"Missing required columns: {missing_base}")
+                
+                    priority_set = set(tiebreaking_priority_cfg or [])
+                    missing_priority = sorted([c for c in priority_set if c not in available])
+                    if missing_priority:
+                        raise KeyError(f"Missing priority columns: {missing_priority}")
+                
+                    optional_candidates = {"z_flag_homogenized", "instrument_type_homogenized"}
+                    optional_present = (optional_candidates - priority_set) & available
+                    maybe_tie_result = {"tie_result"} & available  # bring original tie_result if present
+                    needed = sorted(required_base | priority_set | optional_present | maybe_tie_result)
+                    pdf = base_dd[needed].compute()
+                    log_dedup.info("Driver-side dataframe computed for dedup: shape=%s", tuple(pdf.shape))
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while loading base data for driver-side dedup: %s\n%s", repr(e), _tb.format_exc())
+                    raise
             
-                priority_set = set(tiebreaking_priority_cfg or [])
-                missing_priority = sorted([c for c in priority_set if c not in available])
-                if missing_priority:
-                    raise KeyError(f"Missing priority columns: {missing_priority}")
+                # Run solver on driver (guard-restore happens inside).
+                try:
+                    pdf_out = deduplicate_pandas(
+                        pdf,
+                        tiebreaking_priority=tiebreaking_priority_cfg,
+                        instrument_type_priority=instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None,
+                        delta_z_threshold=delta_z_threshold_cfg,
+                        crd_col="CRD_ID",
+                        compared_col="compared_to",
+                        z_col="z",
+                        tie_col="tie_result",
+                        edge_log=edge_log,
+                        partition_tag="[driver]",
+                        logger=_phase_logger(),
+                        group_col=group_col,
+                    )
+                    log_dedup.info("Driver-side labels computed: shape=%s", tuple(pdf_out.shape))
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED inside deduplicate_pandas (driver branch): %s\n%s", repr(e), _tb.format_exc())
+                    raise
             
-                optional_candidates = {"z_flag_homogenized", "instrument_type_homogenized"}
-                optional_present = (optional_candidates - priority_set) & available
-                maybe_tie_result = {"tie_result"} & available  # bring original tie_result if present
-                needed = sorted(required_base | priority_set | optional_present | maybe_tie_result)
-                pdf = base_dd[needed].compute()
-            
-                # Guard-restore is inside deduplicate_pandas
-                pdf_out = deduplicate_pandas(
-                    pdf,
-                    tiebreaking_priority=tiebreaking_priority_cfg,
-                    instrument_type_priority=instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None,
-                    delta_z_threshold=delta_z_threshold_cfg,
-                )
-            
-                # Merge new labels back
-                df_all = dd.read_parquet(final_merged_path)
-                rhs_pdf = pdf_out.loc[:, ["CRD_ID", "tie_result"]].rename(columns={"tie_result": "tie_result_new"})
-                rhs_dd = dd.from_pandas(rhs_pdf, npartitions=max(1, df_all.npartitions))
-            
-                for obj in (df_all, rhs_dd):
+                # Merge new labels back (driver branch)
+                try:
+                    df_all = dd.read_parquet(final_merged_path)
+                    cols = ["CRD_ID", "tie_result"]
+                    if group_col and (group_col in pdf_out.columns):
+                        cols.append(group_col)
+                
+                    rhs_pdf = pdf_out.loc[:, cols].rename(columns={"tie_result": "tie_result_new"})
+                    rhs_dd = dd.from_pandas(rhs_pdf, npartitions=max(1, df_all.npartitions))
+                
                     try:
-                        obj = obj.clear_divisions()
+                        df_all = df_all.clear_divisions()
                     except Exception:
                         pass
+                    try:
+                        rhs_dd = rhs_dd.clear_divisions()
+                    except Exception:
+                        pass
+                
+                    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
+                        merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
+                    log_dedup.info("Driver-side merge graph built.")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED during merge (driver branch): %s\n%s", repr(e), _tb.format_exc())
+                    raise
             
-                with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-                    merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
-            
-            # Coalesce tie_result with the newly computed labels
-            if "tie_result" in merged.columns:
-                merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
-            else:
-                merged = merged.assign(tie_result=merged["tie_result_new"])
-            merged = merged.drop(columns=["tie_result_new"])
-            
+            # Coalesce tie_result with the newly computed labels.
             try:
-                merged = merged.clear_divisions()
-            except Exception:
-                pass
+                if "tie_result" in merged.columns:
+                    merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
+                else:
+                    merged = merged.assign(tie_result=merged["tie_result_new"])
+                merged = merged.drop(columns=["tie_result_new"])
+                log_dedup.info("Coalesced tie_result with new labels.")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while coalescing tie_result: %s\n%s", repr(e), _tb.format_exc())
+                raise
             
-            # Final dtype
-            merged["tie_result"] = merged["tie_result"].astype("Int8")
-            
+            # Stable dtypes for final output.
             try:
-                df_final_dd = merged.clear_divisions()
-            except Exception:
-                df_final_dd = merged
+                try:
+                    merged = merged.clear_divisions()
+                except Exception:
+                    pass
+                
+                merged["tie_result"] = merged["tie_result"].astype("Int8")
+                if "group_id" in merged.columns:
+                    merged["group_id"] = merged["group_id"].astype("Int64")
+                log_dedup.info("Final dtypes stabilized for tie_result/group_id.")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while stabilizing final dtypes: %s\n%s", repr(e), _tb.format_exc())
+                raise
             
-            df_final = df_final_dd.compute()
-            log_dedup.info("END deduplication: labels merged back into final dataframe")
+            # Materialize result.
+            try:
+                try:
+                    df_final_dd = merged.clear_divisions()
+                except Exception:
+                    df_final_dd = merged
+                
+                # Extra sanity before compute
+                head_sample = df_final_dd.head(1, compute=True)
+                log_dedup.info("Pre-compute sample OK: columns=%s", list(head_sample.columns))
+                
+                df_final = df_final_dd.compute()
+
+                dup = df_final["group_id"].value_counts(dropna=True)
+                n_big = int((dup > 1).sum())
+                log_dedup.info("Sanity group_id: uniques=%d, ids_com_>1_ocorr=%d", int(dup.size), n_big)
+                
+                log_dedup.info("END deduplication: labels merged back into final dataframe")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while computing final dataframe: %s\n%s", repr(e), _tb.format_exc())
+                raise
             
             # Next phase runs below:
             start_consolidate = True
-
 
         else:
             base_logger.error("Unknown combine_mode: %s", combine_mode, extra={"phase": "crossmatch"})

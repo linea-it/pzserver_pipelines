@@ -301,7 +301,7 @@ def _next_available_prev_name(existing: list[str], base: str) -> str:
 
 
 def _stash_previous_results(df: dd.DataFrame, entry: dict, logger: logging.Logger) -> dd.DataFrame:
-    """Stash previous-run results into CRD_ID_prev*/compared_to_prev*.
+    """Stash previous-run results into CRD_ID_prev*/compared_to_prev*/group_id_prev*.
 
     Args:
         df: Frame after rename.
@@ -318,12 +318,14 @@ def _stash_previous_results(df: dd.DataFrame, entry: dict, logger: logging.Logge
 
     mapped_id_from_crd = str(non_null_map.get("id", "")).strip().lower() == "crd_id"
 
+    # Handle YAML-mapped id → CRD_ID
     if mapped_id_from_crd and "id" in cols:
         new_name = _next_available_prev_name(cols, "CRD_ID_prev")
         logger.info(f"Stash CRD_ID from YAML-mapped 'id' → {new_name} (keep 'id')")
         df[new_name] = df["id"]
         cols.append(new_name)
 
+    # Handle CRD_ID
     if "CRD_ID" in cols:
         new_name = _next_available_prev_name(cols, "CRD_ID_prev")
         if new_name != "CRD_ID":
@@ -331,11 +333,20 @@ def _stash_previous_results(df: dd.DataFrame, entry: dict, logger: logging.Logge
             df = df.rename(columns={"CRD_ID": new_name})
             cols.append(new_name)
 
+    # Handle compared_to
     if "compared_to" in cols:
         new_name = _next_available_prev_name(cols, "compared_to_prev")
         if new_name != "compared_to":
             logger.info(f"Stash previous compared_to → {new_name}")
             df = df.rename(columns={"compared_to": new_name})
+            cols.append(new_name)
+
+    # Handle group_id
+    if "group_id" in cols:
+        new_name = _next_available_prev_name(cols, "group_id_prev")
+        if new_name != "group_id":
+            logger.info(f"Stash previous group_id → {new_name}")
+            df = df.rename(columns={"group_id": new_name})
             cols.append(new_name)
 
     return df
@@ -1046,38 +1057,47 @@ def _select_output_columns(
     """Assemble final output schema and coerce optional expression columns.
 
     Args:
-        df: Frame after tie-breaking and DP1 flagging.
-        translation_rules_uc: Upper-cased translation rules.
-        tiebreaking_priority: Priority columns to append if present.
-        used_type_fastpath: Whether `type` was reused for instrument_type.
-        save_expr_columns: Keep variables used in YAML expressions.
-        schema_hints: Normalized hints {'int','float','str','bool'}.
+      df: Frame after tie-breaking and DP1 flagging.
+      translation_rules_uc: Upper-cased translation rules.
+      tiebreaking_priority: Priority columns to append if present.
+      used_type_fastpath: Whether `type` was reused for instrument_type.
+      save_expr_columns: Keep variables used in YAML expressions.
+      schema_hints: Normalized hints {'int','float','str','bool'}.
 
     Returns:
-        dd.DataFrame: Subset with deterministic column order.
+      dd.DataFrame: Subset with deterministic column order.
     """
+    # Base schema (only columns that exist will be kept at the end).
     final_cols = [
         "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err",
         "instrument_type", "survey", "source", "tie_result",
-        "is_in_DP1_fields", "compared_to"
+        "is_in_DP1_fields", "compared_to",
+        # New optional current component label (will only be kept if present)
+        "group_id",
     ]
+
+    # Optional homogenized fields.
     if "z_flag_homogenized" in df.columns:
         final_cols.append("z_flag_homogenized")
     if "instrument_type_homogenized" in df.columns:
         final_cols.append("instrument_type_homogenized")
 
+    # Normalize compared_to to nullable string if present.
     if "compared_to" in df.columns:
         df["compared_to"] = df["compared_to"].map_partitions(
             _normalize_string_series_to_na,
             meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
         )
 
+    # Fast path: instrument_type <- type
     if used_type_fastpath and "type" in df.columns:
         df["instrument_type"] = df["type"].astype(DTYPE_STR)
 
+    # Add tiebreaking columns if present and not already included.
     extra = [c for c in tiebreaking_priority if c not in final_cols and c in df.columns]
     final_cols += extra
 
+    # Collect variables referenced in YAML expressions (if requested).
     extra_expr_cols = set()
     if save_expr_columns:
         for ruleset in translation_rules_uc.values():
@@ -1088,18 +1108,22 @@ def _select_output_columns(
                     vars_in_expr = _extract_variables_from_expr(expr)
                     extra_expr_cols.update({v for v in vars_in_expr if v in df.columns})
 
+    # Keep expression vars that are not already standard/final.
     standard = {"id", "ra", "dec", "z", "z_flag", "z_err", "instrument_type", "survey"}
     already = set(final_cols)
     needed = [c for c in extra_expr_cols if c not in standard and c not in already]
     if save_expr_columns:
         final_cols += needed
 
+    # --- Include *_prev columns if present (now also for group_id). ---
     prev_like = [c for c in df.columns if str(c).startswith("CRD_ID_prev")]
     prev_like += [c for c in df.columns if str(c).startswith("compared_to_prev")]
+    prev_like += [c for c in df.columns if str(c).startswith("group_id_prev")]  # NEW
     for c in prev_like:
         if c not in final_cols:
             final_cols.append(c)
 
+    # Optional dtype coercions for expression vars (guided by schema_hints).
     schema_hints = schema_hints or {}
     if save_expr_columns and schema_hints:
         target_cols = [c for c in needed if c in schema_hints]
@@ -1129,6 +1153,7 @@ def _select_output_columns(
                         meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
                     )
             else:
+                # Create missing columns with requested dtype.
                 if kind == "str":
                     df = _add_missing_with_dtype(df, col, DTYPE_STR)
                 elif kind == "float":
@@ -1138,6 +1163,7 @@ def _select_output_columns(
                 elif kind == "bool":
                     df = _add_missing_with_dtype(df, col, DTYPE_BOOL)
 
+    # De-duplicate while preserving order, then filter to existing columns.
     final_cols = list(dict.fromkeys(final_cols))
     df = df[[c for c in final_cols if c in df.columns]]
     return df

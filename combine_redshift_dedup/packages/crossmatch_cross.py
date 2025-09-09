@@ -69,13 +69,23 @@ def _coerce_optional_columns_for_import(
     Returns:
         dd.DataFrame with coerced/added columns.
     """
-    # 1) Prev columns → string
-    prev_like = [c for c in df.columns if str(c).startswith("CRD_ID_prev")]
-    prev_like += [c for c in df.columns if str(c).startswith("compared_to_prev")]
-    for c in prev_like:
+    # 1) Prev columns
+    # CRD_ID_prev*, compared_to_prev* → string
+    prev_like_str = [c for c in df.columns if str(c).startswith("CRD_ID_prev")]
+    prev_like_str += [c for c in df.columns if str(c).startswith("compared_to_prev")]
+    for c in prev_like_str:
         df[c] = df[c].map_partitions(
             _normalize_string_series_to_na,
             meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
+        )
+
+    # group_id_prev* → int
+    prev_like_int = [c for c in df.columns if str(c).startswith("group_id_prev")]
+    for c in prev_like_int:
+        coerced = dd.to_numeric(df[c], errors="coerce")
+        df[c] = coerced.map_partitions(
+            lambda s: s.astype(DTYPE_INT),
+            meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
         )
 
     # 2) Expr columns guided by hints
@@ -86,7 +96,7 @@ def _coerce_optional_columns_for_import(
     for col, kind in hints.items():
         k = str(kind).lower()
         if col not in df.columns:
-            # create missing with target dtype (so partições vazias não viram null[pyarrow])
+            # Create missing with target dtype (so empty partitions don’t default to null[pyarrow])
             if k == "str":
                 df = _add_missing_with_dtype(df, col, DTYPE_STR)
             elif k == "float":
@@ -97,7 +107,7 @@ def _coerce_optional_columns_for_import(
                 df = _add_missing_with_dtype(df, col, DTYPE_BOOL)
             continue
 
-        # cast existing
+        # Cast existing
         if k == "str":
             df[col] = df[col].map_partitions(
                 _normalize_string_series_to_na,
@@ -116,7 +126,7 @@ def _coerce_optional_columns_for_import(
                 meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
             )
         elif k == "bool":
-            # conservador: apenas dtype target; upstream já deve ter saneado valores
+            # Conservative: enforce target dtype only; upstream should already sanitize values
             df[col] = df[col].map_partitions(
                 lambda s: s.astype(DTYPE_BOOL),
                 meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
