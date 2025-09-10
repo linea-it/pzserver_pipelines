@@ -268,6 +268,36 @@ def _auto_cross_worker(info: dict, logs_dir: str, translation_config: dict):
     )
     return out_auto
 
+# ---------------------------------------------------------------------------
+# Publish / copy helpers
+# ---------------------------------------------------------------------------
+def _copy_file(src: str, dst: str, lg: logging.LoggerAdapter) -> None:
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    abs_src, abs_dst = os.path.abspath(src), os.path.abspath(dst)
+    if abs_src == abs_dst:
+        lg.info("Skip copy: source equals destination (%s).", abs_dst)
+        return
+    try:
+        if os.path.exists(abs_dst):
+            os.remove(abs_dst)
+        os.link(abs_src, abs_dst)  # hardlink se for mesmo FS
+        lg.info("Hardlinked: %s -> %s", abs_src, abs_dst)
+    except Exception:
+        shutil.copy2(abs_src, abs_dst)
+        lg.info("Copied: %s -> %s", abs_src, abs_dst)
+
+def _copy_tree(src_dir: str, dst_dir: str, lg: logging.LoggerAdapter) -> None:
+    """Copia recursivamente src_dir → dst_dir, sobrescrevendo se existir."""
+    if not os.path.isdir(src_dir):
+        lg.warning("Source dir not found for copy: %s", src_dir)
+        return
+    os.makedirs(dst_dir, exist_ok=True)
+    for root, dirs, files in os.walk(src_dir):
+        rel = os.path.relpath(root, src_dir)
+        tgt_root = os.path.join(dst_dir, rel) if rel != "." else dst_dir
+        os.makedirs(tgt_root, exist_ok=True)
+        for f in files:
+            _copy_file(os.path.join(root, f), os.path.join(tgt_root, f), lg)
 
 # ---------------------------------------------------------------------------
 # Core pipeline
@@ -292,9 +322,13 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
     logs_dir = os.path.join(base_dir, "process_info")
     temp_dir = os.path.join(base_dir, "temp")
-    os.makedirs(out_root_and_dir, exist_ok=True)
     os.makedirs(logs_dir, exist_ok=True)
     os.makedirs(temp_dir, exist_ok=True)
+
+    try:
+        _copy_file(config_path, os.path.join(base_dir, "config.yaml"), logging.LoggerAdapter(logging.getLogger("crc"), {"phase": "init"}))
+    except Exception:
+        pass
 
     # --- process.yml bookkeeping ---
     process_info_path = os.path.join(base_dir, "process.yml")
@@ -971,7 +1005,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     # 5) CONSOLIDATION / EXPORT
     # ---------------------------------------------------------------
     log_cons = _phase_logger(base_logger, "consolidation")
-    log_cons.info("START consolidation: post-processing and export (out=%s)", out_root_and_dir)
+    log_cons.info("START consolidation: staging artifacts into process dir (base_dir=%s)", base_dir)
 
     try:
         n_after_dedup = int(len(df_final))
@@ -1015,9 +1049,9 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         log_cons.info("Dropping all-missing columns: %s", ", ".join(sorted(map(str, to_drop))))
         df_final = df_final.drop(columns=to_drop)
 
-    final_base_path = os.path.join(out_root_and_dir, output_name)
-    save_dataframe(df_final, final_base_path, output_format)
-    log_cons.info("Final combined catalog saved at %s.%s", final_base_path, output_format)
+    staged_output_base = os.path.join(base_dir, output_name)
+    save_dataframe(df_final, staged_output_base, output_format)
+    log_cons.info("Staged final output at %s.%s", staged_output_base, output_format)
 
     relative_path = os.path.join(output_dir, f"{output_name}.{output_format}")
     
@@ -1058,6 +1092,32 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     update_process_info(process_info, process_info_path, "end_time", str(pd.Timestamp.now()))
     update_process_info(process_info, process_info_path, "status", "Successful")
 
+    # ----------------- PUBLISH STEP (finalzinho) -----------------
+    publish_logger = _phase_logger(base_logger, "register")
+    publish_logger.info("START publish: copying staged artifacts from process dir to out_root_and_dir (%s)", out_root_and_dir)
+
+    # Cria pasta de publicação só agora
+    os.makedirs(out_root_and_dir, exist_ok=True)
+
+    # 1) process_info/
+    _copy_tree(os.path.join(base_dir, "process_info"), os.path.join(out_root_and_dir, "process_info"), publish_logger)
+
+    # 2) process.yml e alias process.yaml
+    _copy_file(os.path.join(base_dir, "process.yml"),  os.path.join(out_root_and_dir, "process.yml"),  publish_logger)
+    if os.path.exists(os.path.join(base_dir, "process.yaml")):
+        _copy_file(os.path.join(base_dir, "process.yaml"), os.path.join(out_root_and_dir, "process.yaml"), publish_logger)
+
+    # 3) config.yaml
+    if os.path.exists(os.path.join(base_dir, "config.yaml")):
+        _copy_file(os.path.join(base_dir, "config.yaml"), os.path.join(out_root_and_dir, "config.yaml"), publish_logger)
+
+    # 4) output final
+    _copy_file(f"{staged_output_base}.{output_format}",
+               os.path.join(out_root_and_dir, f"{output_name}.{output_format}"),
+               publish_logger)
+
+    publish_logger.info("END publish: artifacts copied to %s", out_root_and_dir)
+
     if delete_temp_files:
         try:
             shutil.rmtree(temp_dir)
@@ -1071,6 +1131,19 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _pick_next_process_dir(root: str) -> str:
+    """Return first non-existing 'processNNN' path under root."""
+    i = 1
+    while True:
+        name = f"process{i:03d}"
+        path = os.path.join(root, name)
+        if not os.path.exists(path):
+            return path
+        i += 1
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -1079,22 +1152,40 @@ if __name__ == "__main__":
     )
     parser.add_argument("config_path", help="Path to YAML config file.")
     parser.add_argument("--cwd", default=os.getcwd(), help="Working directory (default: current dir).")
-    parser.add_argument("--base_dir", required=True, help="Base directory for outputs and logs.")
+    parser.add_argument(
+        "--base_dir",
+        default=None,
+        help="Base directory for outputs and logs. If omitted, picks processNNN under --cwd."
+    )
     args = parser.parse_args()
+
+    # Resolve working dir and base_dir
+    workdir = os.path.abspath(args.cwd)
+    os.makedirs(workdir, exist_ok=True)
+
+    base_dir = args.base_dir
+    if not base_dir:
+        base_dir = _pick_next_process_dir(workdir)
+
+    base_dir = os.path.abspath(base_dir)
+    os.makedirs(base_dir, exist_ok=True)
+
+    # Optional: echo the chosen run dir early for visibility when logs aren't wired yet
+    print(f"▶ Using run directory: {base_dir}")
 
     start_ts = time.time()
     ok = False
     try:
-        main(args.config_path, args.cwd, args.base_dir)
+        # Pass resolved paths
+        main(args.config_path, workdir, base_dir)
         ok = True
     finally:
         dur = time.time() - start_ts
         lg = logging.getLogger("crc")
-        msg = f"Pipeline {'completed successfully' if ok else 'terminated with errors'} in {dur:.2f} seconds."
+        msg = f"Pipeline {'completed successfully' if ok else 'terminated with errors'} in {dur:.2f} seconds. (run dir: {base_dir})"
         if lg.handlers:
             logging.LoggerAdapter(lg, {"phase": "consolidation"}).info(msg)
         else:
             print(("✅ " if ok else "❌ ") + msg)
-        # propagate non-zero exit if failed
         if not ok:
             sys.exit(1)

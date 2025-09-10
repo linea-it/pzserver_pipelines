@@ -242,7 +242,7 @@ inputs:
         z_err: "z_err"
         survey: "survey"
 
-output_root_dir: "process001"
+output_root_dir: "storage"
 output_dir: "outputs" # Relative directory for final outputs
 output_name: "crd" # Name prefix for the final output files
 output_format: "parquet" # Output format: csv, parquet, hdf5, or fits
