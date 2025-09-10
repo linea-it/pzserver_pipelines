@@ -4,6 +4,7 @@ from typing import Any
 from pydantic import BaseModel, model_validator
 
 DATASETS_DIR = os.getenv("DATASETS_DIR", "/datasets")
+DASK_EXECUTOR = os.getenv("DASK_EXECUTOR", "local")
 
 
 class Slurm(BaseModel):
@@ -17,7 +18,8 @@ class Slurm(BaseModel):
         job_extra_directives: list[str] = ["--propagate", "--time=2:00:00"]
 
     class Scale(BaseModel):
-        jobs: int = 10
+        minimum_jobs: int = 10
+        maximum_jobs: int = 20
 
     instance: Instance = Instance()
     scale: Scale = Scale()
@@ -39,7 +41,7 @@ class Executor(BaseModel):
     def sync_args(cls, data: Any) -> Any:
 
         assert isinstance(data, dict), "data is not dict"
-        name = data.get("name", "local")
+        name = data.get("name", DASK_EXECUTOR)
 
         match name:
             case "local":
