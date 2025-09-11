@@ -1,8 +1,10 @@
 import os
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, model_validator
 
+MAINDIR = Path(__file__).parent
 DATASETS_DIR = os.getenv("DATASETS_DIR", "/datasets")
 DASK_EXECUTOR = os.getenv("DASK_EXECUTOR", "local")
 
@@ -78,7 +80,7 @@ class Inputs(BaseModel):
 
 class Param(BaseModel):
     combine_type: str = "concatenate"
-    flags_translation_file: str = "/data/apps/app.orch/datasets/flags_translation.yaml"
+    flags_translation_file: str = str(Path(MAINDIR, "flags_translation.yaml"))
 
 
 class Config(BaseModel):

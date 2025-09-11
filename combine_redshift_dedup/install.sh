@@ -7,12 +7,15 @@ if [ ! -d "$PIPELINES_DIR" ]; then
     exit 1
 fi
 
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
 PIPE_BASE="$PIPELINES_DIR/combine_redshift_dedup"
 HASENV=`conda env list | grep pipe_crd`
 
 if [ -z "$HASENV" ]; then
     echo "Create virtual environment..."
-    conda env create -f ${PIPE_BASE}/environment.yaml -y
+    conda env create -f ${PIPE_BASE}/environment.yaml
     echo "Virtual environment created and packages installed."
 # else
 #     if [ "$CONDA_FORCE_UPDATE" == "yes" ]; then

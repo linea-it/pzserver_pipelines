@@ -7,6 +7,9 @@ if [ ! -d "$PIPELINES_DIR" ]; then
     exit 1
 fi
 
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
 PIPE_BASE="$PIPELINES_DIR/training_set_maker"
 HASENV=`conda env list | grep pipe_tsm`
 
@@ -24,11 +27,10 @@ fi
 conda activate pipe_tsm
 
 export PATH=$PATH:"$PIPE_BASE/scripts/"
-
-if [ -z "$PYTHONPATH" ]; then
-    export PYTHONPATH="$PIPE_BASE/packages/"
-else
+if [ -n "${PYTHONPATH:-}" ]; then
     export PYTHONPATH=$PYTHONPATH:"$PIPE_BASE/packages/"
+else
+    export PYTHONPATH="$PIPE_BASE/packages/"
 fi
 
 echo "Conda Environment: $CONDA_DEFAULT_ENV"
