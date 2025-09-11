@@ -200,7 +200,11 @@ class Runner:
                 self.output_format,
             )
 
-            columns_suffix = {k: f"{v}{self.specz_suffix}" for k, v in columns.items()}
+            columns_suffix = {}
+            for k, v in columns.items():
+                if v:
+                    columns_suffix[k] = f"{v}{self.specz_suffix}"
+
             columns_assoc = self.__get_columns_associations(
                 columns_suffix, specz_columns
             )
