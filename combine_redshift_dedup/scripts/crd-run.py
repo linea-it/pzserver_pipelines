@@ -331,6 +331,17 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         pass
 
     # --- process.yml bookkeeping ---
+    try:
+        main_process_info = os.path.join(cwd, "process.yml")
+        if os.path.exists(main_process_info):
+            _copy_file(
+                main_process_info,
+                os.path.join(base_dir, "process.yml"),
+                logging.LoggerAdapter(logging.getLogger("crc"), {"phase": "init"}),
+            )
+    except Exception:
+        pass
+
     process_info_path = os.path.join(base_dir, "process.yml")
     if not os.path.exists(process_info_path):
         dump_yml(process_info_path, {})
@@ -693,14 +704,14 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
                 log_cross.info("END crossmatch: graph merge completed")
                 start_consolidate = False
-                
+
 
             # -----------------------------------------------------------
             # 4) DEDUPLICATION
             # -----------------------------------------------------------
             log_dedup = _phase_logger(base_logger, "deduplication")
             log_dedup.info("START deduplication: LSDB graph labeling and tie consolidation")
-            
+
             # Ensure final collection root for dedup
             if not final_collection_path:
                 resumed = _resume_get(resume_log, f"crossmatch_step{final_step}.collection_path")
@@ -713,26 +724,26 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     if guessed:
                         final_collection_path = guessed
                         log_dedup.info("Guessed final collection root from disk: %s", final_collection_path)
-            
+
             final_merged_path = os.path.join(temp_dir, f"merged_step{final_step}")
             if not os.path.exists(final_merged_path):
                 log_dedup.error("Final merged Parquet folder not found: %s", final_merged_path)
                 client.close()
                 cluster.close()
                 return
-            
+
             n_before = int(dd.read_parquet(final_merged_path).shape[0].compute())
             log_dedup.info("Rows before dedup (final_merged): %d", n_before)
-            
+
             use_distributed = final_collection_path is not None and _is_collection_root(final_collection_path)
-            
+
             # --- Safe config parsing ---
             tiebreaking_priority_cfg = translation_config.get("tiebreaking_priority")
             if isinstance(tiebreaking_priority_cfg, (str, bytes)):
                 tiebreaking_priority_cfg = [str(tiebreaking_priority_cfg)]
             if not isinstance(tiebreaking_priority_cfg, (list, tuple)) or not tiebreaking_priority_cfg:
                 raise TypeError("tiebreaking_priority must be a non-empty list of column names.")
-            
+
             instrument_type_priority_cfg = translation_config.get("instrument_type_priority")
             if "instrument_type_homogenized" in set(tiebreaking_priority_cfg) and not isinstance(instrument_type_priority_cfg, dict):
                 raise TypeError(
@@ -748,25 +759,25 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             edge_log = True
             group_col = "group_id"  # None to deactivate
             #######################################################################
-            
+
             if use_distributed:
                 log_dedup.info("Running graph-based dedup on final merged collection (map_partitions)")
                 final_collection_path = _normalize_collection_root(final_collection_path)
                 log_dedup.info("final_collection_root: %s", final_collection_path)
-            
+
                 if not _is_collection_root(final_collection_path):
                     raise RuntimeError(f"Expected collection root at: {final_collection_path}")
-            
+
                 # Discover subcatalogs
                 base = os.path.basename(final_collection_path.rstrip("/"))
                 main_subcat_path = os.path.join(final_collection_path, base)
                 log_dedup.info("Expected main subcatalog path: %s", main_subcat_path)
                 if not _is_hats_subcatalog(main_subcat_path):
                     raise RuntimeError(f"Main subcatalog not found: {main_subcat_path}")
-            
+
                 final_cat = lsdb.open_catalog(main_subcat_path)
                 log_dedup.info("Opened main subcatalog.")
-            
+
                 # Optional margin (*arcs), prefer 5arcs if present
                 arcs_candidates = [p for p in glob.glob(os.path.join(final_collection_path, "*arcs")) if _is_hats_subcatalog(p)]
                 if arcs_candidates:
@@ -782,10 +793,10 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 else:
                     log_dedup.info("No *arcs margin found; proceeding without margin.")
                     final_cat.margin = None
-            
+
                 if not hasattr(final_cat, "_ddf"):
                     raise RuntimeError("Main subcatalog does not expose _ddf.")
-            
+
                 # Compute labels per partition. Guard-restore is inside deduplicate_pandas.
                 try:
                     labels = run_dedup_with_lsdb_map_partitions(
@@ -805,7 +816,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     import traceback as _tb
                     log_dedup.error("FAILED while building labels Dask graph: %s\n%s", repr(e), _tb.format_exc())
                     raise
-            
+
                 # Read once for the final merge; align CRD_ID dtypes with labels.
                 try:
                     df_all = dd.read_parquet(final_merged_path)
@@ -820,7 +831,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     import traceback as _tb
                     log_dedup.error("FAILED while reading base parquet or aligning dtypes: %s\n%s", repr(e), _tb.format_exc())
                     raise
-            
+
                 # Keep only the columns needed for the merge; rename tie_result.
                 try:
                     rhs_dd = labels.rename(columns={"tie_result": "tie_result_new"})
@@ -833,7 +844,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     import traceback as _tb
                     log_dedup.error("FAILED while preparing rhs_dd: %s\n%s", repr(e), _tb.format_exc())
                     raise
-            
+
                 # Clear divisions before shuffle-based merge (assign back!).
                 try:
                     try:
@@ -849,7 +860,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     import traceback as _tb
                     log_dedup.error("FAILED while clearing divisions: %s\n%s", repr(e), _tb.format_exc())
                     raise
-            
+
                 # Merge and compute labels to catch issues early
                 try:
                     with dask.config.set({"dataframe.shuffle.method": "tasks"}):
@@ -862,7 +873,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     import traceback as _tb
                     log_dedup.error("FAILED during merge (distributed branch): %s\n%s", repr(e), _tb.format_exc())
                     raise
-            
+
             else:
                 log_dedup.warning(
                     "final_collection_path missing or not a collection root; falling back to driver-side pandas dedup."
@@ -874,12 +885,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     missing_base = sorted(required_base - available)
                     if missing_base:
                         raise KeyError(f"Missing required columns: {missing_base}")
-                
+
                     priority_set = set(tiebreaking_priority_cfg or [])
                     missing_priority = sorted([c for c in priority_set if c not in available])
                     if missing_priority:
                         raise KeyError(f"Missing priority columns: {missing_priority}")
-                
+
                     optional_candidates = {"z_flag_homogenized", "instrument_type_homogenized"}
                     optional_present = (optional_candidates - priority_set) & available
                     maybe_tie_result = {"tie_result"} & available  # bring original tie_result if present
@@ -890,7 +901,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     import traceback as _tb
                     log_dedup.error("FAILED while loading base data for driver-side dedup: %s\n%s", repr(e), _tb.format_exc())
                     raise
-            
+
                 # Run solver on driver (guard-restore happens inside).
                 try:
                     pdf_out = deduplicate_pandas(
@@ -912,17 +923,17 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     import traceback as _tb
                     log_dedup.error("FAILED inside deduplicate_pandas (driver branch): %s\n%s", repr(e), _tb.format_exc())
                     raise
-            
+
                 # Merge new labels back (driver branch)
                 try:
                     df_all = dd.read_parquet(final_merged_path)
                     cols = ["CRD_ID", "tie_result"]
                     if group_col and (group_col in pdf_out.columns):
                         cols.append(group_col)
-                
+
                     rhs_pdf = pdf_out.loc[:, cols].rename(columns={"tie_result": "tie_result_new"})
                     rhs_dd = dd.from_pandas(rhs_pdf, npartitions=max(1, df_all.npartitions))
-                
+
                     try:
                         df_all = df_all.clear_divisions()
                     except Exception:
@@ -931,7 +942,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                         rhs_dd = rhs_dd.clear_divisions()
                     except Exception:
                         pass
-                
+
                     with dask.config.set({"dataframe.shuffle.method": "tasks"}):
                         merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
                     log_dedup.info("Driver-side merge graph built.")
@@ -939,7 +950,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     import traceback as _tb
                     log_dedup.error("FAILED during merge (driver branch): %s\n%s", repr(e), _tb.format_exc())
                     raise
-            
+
             # Coalesce tie_result with the newly computed labels.
             try:
                 if "tie_result" in merged.columns:
@@ -952,14 +963,14 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 import traceback as _tb
                 log_dedup.error("FAILED while coalescing tie_result: %s\n%s", repr(e), _tb.format_exc())
                 raise
-            
+
             # Stable dtypes for final output.
             try:
                 try:
                     merged = merged.clear_divisions()
                 except Exception:
                     pass
-                
+
                 merged["tie_result"] = merged["tie_result"].astype("Int8")
                 if "group_id" in merged.columns:
                     merged["group_id"] = merged["group_id"].astype("Int64")
@@ -968,30 +979,30 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 import traceback as _tb
                 log_dedup.error("FAILED while stabilizing final dtypes: %s\n%s", repr(e), _tb.format_exc())
                 raise
-            
+
             # Materialize result.
             try:
                 try:
                     df_final_dd = merged.clear_divisions()
                 except Exception:
                     df_final_dd = merged
-                
+
                 # Extra sanity before compute
                 head_sample = df_final_dd.head(1, compute=True)
                 log_dedup.info("Pre-compute sample OK: columns=%s", list(head_sample.columns))
-                
+
                 df_final = df_final_dd.compute()
 
                 dup = df_final["group_id"].value_counts(dropna=True)
                 n_big = int((dup > 1).sum())
                 log_dedup.info("Sanity group_id: uniques=%d, ids_com_>1_ocorr=%d", int(dup.size), n_big)
-                
+
                 log_dedup.info("END deduplication: labels merged back into final dataframe")
             except Exception as e:
                 import traceback as _tb
                 log_dedup.error("FAILED while computing final dataframe: %s\n%s", repr(e), _tb.format_exc())
                 raise
-            
+
             # Next phase runs below:
             start_consolidate = True
 
@@ -1054,22 +1065,22 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     log_cons.info("Staged final output at %s.%s", staged_output_base, output_format)
 
     relative_path = os.path.join(output_dir, f"{output_name}.{output_format}")
-    
+
     expected_columns = ["id", "ra", "dec", "z", "z_flag", "z_err", "survey"]
     columns_assoc = {}
-    
+
     # Special handling for id
     if "CRD_ID" in df_final.columns:
         columns_assoc["id"] = "CRD_ID"
     elif "id" in df_final.columns:
         columns_assoc["id"] = "id"
-    
+
     # Special handling for z_flag
     if "z_flag_homogenized" in df_final.columns:
         columns_assoc["z_flag"] = "z_flag_homogenized"
     elif "z_flag" in df_final.columns:
         columns_assoc["z_flag"] = "z_flag"
-    
+
     # Identity mapping for the others
     for col in expected_columns:
         if col not in ("id", "z_flag") and col in df_final.columns:
