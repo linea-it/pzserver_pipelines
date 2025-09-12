@@ -3,6 +3,7 @@ channels:
   - defaults
 dependencies:
   - python=3.12
+  - pip
   - pytables
   - pip:
       - PyYaml==6.0.2
