@@ -4,6 +4,7 @@ channels:
   - defaults
 dependencies:
   - python
+  - pip
   - dask
   - distributed
   - dask-jobqueue         
