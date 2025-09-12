@@ -18,30 +18,31 @@ normalize_name() {
   tr '[:upper:]' '[:lower:]' | sed 's/_/-/g'
 }
 
-# Extract pinned specs (both conda deps and pip deps) from environment.yaml.
-# Output format per line: "name|op|version"
+# Extract pinned specs (conda or pip-style) from environment.yaml.
+# Emits one line per constrained dep: "name|op|version"
+# Compatible with POSIX awk (no gawk-only features).
 read_pinned_specs() {
   local yaml="$1"
-  grep -E '^[[:space:]]*-[[:space:]]*[^#]+' "$yaml" \
-    | sed -E 's/#.*$//' \
-    | grep -E '==|>=|<=|>|<|=' \
-    | sed -E 's/^[[:space:]]*-[[:space:]]*//' \
-    | awk '
-        {
-          line=$0
-          if (match(line, /^([A-Za-z0-9_.-]+)/, m)) {
-            name=m[1]
-            rest=substr(line, RLENGTH+1)
-            gsub(/^[[:space:]]+/, "", rest)
-            if (match(rest, /^(==|>=|<=|>|<|=)/, o)) {
-              op=o[1]
-              ver=substr(rest, length(op)+1)
-              gsub(/^[[:space:]]+/, "", ver)
-              gsub(/[[:space:]]+$/, "", ver)
-              print name "|" op "|" ver
-            }
-          }
-        }'
+  awk '
+    /^[[:space:]]*-[[:space:]]*/ {
+      line = $0
+      sub(/#.*/, "", line)                        # strip comments
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line) # strip "- "
+
+      idx = match(line, /(==|>=|<=|>|<|=)/)       # first operator
+      if (idx) {
+        op   = substr(line, RSTART, RLENGTH)
+        name = substr(line, 1, RSTART-1)
+        ver  = substr(line, RSTART+RLENGTH)
+
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", ver)
+
+        if (name != "" && ver != "")
+          print name "|" op "|" ver
+      }
+    }
+  ' "$yaml"
 }
 
 # ---------- Version detection (conda + pip) ----------
@@ -54,13 +55,11 @@ conda_installed_version() {
 
   conda list -n "$env" \
   | awk -v want="$want" 'BEGIN{IGNORECASE=1}
-       /^#/ || NF < 2 { next }         # pula comentários/linhas vazias
+       /^#/ || NF < 2 { next }
        {
          name=$1
-         gsub(/_/, "-", name)          # normaliza "_" -> "-"
-         if (name == want) {           # comparação case-insensitive
-           print $2; exit
-         }
+         gsub(/_/, "-", name)
+         if (name == want) { print $2; exit }
        }'
 }
 
@@ -72,9 +71,8 @@ load_pip_versions() {
   local env="$1"
   if [ "$PIP_VERS_LOADED" = "$env" ]; then return; fi
   PIP_VERS_CACHE=()
-  # Use conda run to query inside the env; parse JSON to "name==version"
   while IFS= read -r line; do
-    # line looks like: NAME==VERSION
+    # NAME==VERSION
     local name="${line%%==*}"
     local ver="${line#*==}"
     [ -z "$name" ] && continue
@@ -213,11 +211,21 @@ if ! env_exists "$ENV_NAME"; then
   NEED_CREATE=1
 else
   log "Conda env '$ENV_NAME' exists → checking pinned constraints (conda + pip)…"
-  mapfile -t PINNED < <(read_pinned_specs "$ENV_YAML")
+
+  # Safer capture: temp file so parser errors cannot be masked
+  TMP_PINS="$(mktemp)"
+  if ! read_pinned_specs "$ENV_YAML" > "$TMP_PINS"; then
+    echo "Failed to parse pinned specs from $ENV_YAML"; rm -f "$TMP_PINS"; exit 1
+  fi
+  mapfile -t PINNED < "$TMP_PINS"
+  rm -f "$TMP_PINS"
 
   if [ "${#PINNED[@]}" -eq 0 ]; then
     log "No pinned packages with version constraints found → skipping reinstall."
   else
+    log "Pinned constraints detected:"
+    for l in "${PINNED[@]}"; do log "  - $l"; done
+
     for line in "${PINNED[@]}"; do
       IFS='|' read -r raw_pkg op want <<< "$line"
       have="$(installed_version "$ENV_NAME" "$raw_pkg" || true)"
