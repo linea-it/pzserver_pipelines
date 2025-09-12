@@ -5,13 +5,9 @@
 # ==============================
 set -Eeuo pipefail
 set -o errtrace  # propagate ERR into functions/subshells/sourced files
-
-# Prefix for `set -x`: timestamp, file, and line
 export PS4='+ [$(date "+%Y-%m-%d %H:%M:%S")] (${BASH_SOURCE##*/}:${LINENO}) '
 
 # ---------------- Helpers ----------------
-
-# Print a compact call stack (source:line in order)
 _print_call_stack() {
   local i
   for ((i=0; i<${#BASH_SOURCE[@]}; i++)); do
@@ -22,11 +18,23 @@ _print_call_stack() {
   done
 }
 
-# Logger with timestamp
 log() {
-  local ts
-  ts="$(date "+%Y-%m-%d %H:%M:%S")"
+  local ts; ts="$(date "+%Y-%m-%d %H:%M:%S")"
   echo "[$ts] $*"
+}
+
+pick_next_process_dir() {
+  local root="${1:-.}"
+  local i=1 name path
+  while :; do
+    printf -v name "process%03d" "$i"
+    path="${root}/${name}"
+    if [ ! -e "$path" ]; then
+      echo "$path"
+      return 0
+    fi
+    i=$((i+1))
+  done
 }
 
 # ---------------- Error Trap ----------------
@@ -49,52 +57,64 @@ trap '{
   log "[ERROR] Context:"
   log "        PIPELINES_DIR='${PIPELINES_DIR-}'"
   log "        INSTALL_PIPE='${INSTALL_PIPE-}'"
+  log "        RUN_DIR='${RUN_DIR-}'"
+  log "        LOG_FILE='${LOG_FILE-}'"
   log "❌ Fail"
   exit $code
 }' ERR
 
 # ---------------- Args ----------------
-if [ $# -eq 0 ]; then
-  echo "Error: No arguments provided."
+if [ $# -lt 1 ]; then
+  echo "Usage: ./run.sh <config.yaml> [run_dir]"
   exit 1
 fi
 
-ARGS=$@
+CONFIG_PATH="$1"
+RUN_DIR="${2:-}"
+
+# Auto-pick run directory if not supplied
+if [ -z "$RUN_DIR" ]; then
+  RUN_DIR="$(pick_next_process_dir ".")"
+  log "No run directory provided. Using '${RUN_DIR}'."
+fi
+mkdir -p "$RUN_DIR"
 
 # ---------------- Basic checks ----------------
 if [ -z "${PIPELINES_DIR:-}" ] || [ ! -d "${PIPELINES_DIR}" ]; then
-    echo "Error: PIPELINES_DIR not defined."
-    exit 1
+  echo "Error: PIPELINES_DIR not defined."
+  exit 1
 fi
 
 INSTALL_PIPE="$PIPELINES_DIR/training_set_maker/install.sh"
 if [ ! -f "$INSTALL_PIPE" ]; then
-    echo "Error: Installation script not found."
-    exit 1
+  echo "Error: Installation script not found at: $INSTALL_PIPE"
+  exit 1
 fi
 
 # ---------------- Logs wiring ----------------
-LOGS_DIR="./process_info"
+LOGS_DIR="$RUN_DIR/process_info"
 mkdir -p "$LOGS_DIR"
 LOG_FILE="$LOGS_DIR/process.log"
 
-# Duplicate stdout/stderr to both terminal and process.log
+# Replicate stdout/stderr: both terminal and process.log
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # ---------------- Install pipeline ----------------
 log "Installing pipeline..."
+if [ "${DEBUG:-0}" = "1" ]; then set -x; fi
 # shellcheck disable=SC1090
-set -x
 . "$INSTALL_PIPE"
-{ set +x; } 2>/dev/null
+if [ "${DEBUG:-0}" = "1" ]; then { set +x; } 2>/dev/null; fi
 
 # ---------------- Run TSM ----------------
-set -x
-tsm-run $ARGS
-{ set +x; } 2>/dev/null
+# NOTE: tsm-run expects positional args: config_path [cwd]
+# We pass RUN_DIR as the optional working directory (cwd).
+if [ "${DEBUG:-0}" = "1" ]; then set -x; fi
+tsm-run "$CONFIG_PATH" "$RUN_DIR"
+if [ "${DEBUG:-0}" = "1" ]; then { set +x; } 2>/dev/null; fi
 
 # ---------------- Epilogue ----------------
 log "Pipeline exited with code: 0"
-log "✅ Success (logs: ${LOG_FILE})"
+log "✅ Success (run dir: ${RUN_DIR})"
 exit 0
 
