@@ -1,39 +1,46 @@
 #!/bin/bash --login
 
-source $(conda info --base)/etc/profile.d/conda.sh || { echo "Failed to source conda.sh"; exit 1; }
+# Initialize conda
+source "$(conda info --base)"/etc/profile.d/conda.sh || { echo "Failed to source conda.sh"; exit 1; }
 
+# Check PIPELINES_DIR
 if [ ! -d "$PIPELINES_DIR" ]; then
     echo "Error: PIPELINES_DIR not defined."
     exit 1
 fi
 
+# Accept Anaconda TOS
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 
 PIPE_BASE="$PIPELINES_DIR/combine_redshift_dedup"
-HASENV=`conda env list | grep pipe_crd`
 
-if [ -z "$HASENV" ]; then
+# Robust check: does env 'pipe_crd' exist?
+if conda env list | awk '{print $1}' | grep -qx 'pipe_crd'; then
+    HASENV=1
+else
+    HASENV=0
+fi
+
+if [ "$HASENV" -eq 0 ]; then
     echo "Create virtual environment..."
-    conda env create -f ${PIPE_BASE}/environment.yaml
+    conda env create -f "${PIPE_BASE}/environment.yaml"
     echo "Virtual environment created and packages installed."
 # else
-#     if [ "$CONDA_FORCE_UPDATE" == "yes" ]; then
+#     if [ "$CONDA_FORCE_UPDATE" = "yes" ]; then
 #         echo "Virtual environment already exists. Updating..."
-#         conda env update --file ${PIPE_BASE}/environment.yaml --prune
+#         conda env update --file "${PIPE_BASE}/environment.yaml" --prune
 #     fi
 fi
 
+# Activate env
 conda activate pipe_crd || { echo "Failed to activate pipe_crd"; exit 1; }
-
-# PATH export no longer needed since we're calling python explicitly
-# export PATH=$PATH:"$PIPE_BASE/scripts/"
 
 # Set PYTHONPATH so Python can find combine_redshift_dedup
 if [ -n "${PYTHONPATH:-}" ]; then
-    export PYTHONPATH=$PYTHONPATH:"$PIPE_BASE/packages/"
+    export PYTHONPATH="$PYTHONPATH:${PIPE_BASE}/packages/"
 else
-    export PYTHONPATH="$PIPE_BASE/packages/"
+    export PYTHONPATH="${PIPE_BASE}/packages/"
 fi
 
 echo "Conda Environment: $CONDA_DEFAULT_ENV"

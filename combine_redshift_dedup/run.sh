@@ -3,6 +3,25 @@
 # Exit on errors, unset vars are errors, and fail a pipeline if any command in it fails
 set -Eeuo pipefail
 
+# Make ERR propagate through functions and sourced scripts; improve xtrace prefix
+set -o errtrace  # so ERR trap runs for functions/subshel ls/sourced files
+
+# Pretty PS4 for `set -x` (shows timestamp, file, and line)
+export PS4='+ [$(date "+%Y-%m-%d %H:%M:%S")] (${BASH_SOURCE##*/}:${LINENO}) '
+
+# Utility: print a compact call stack (source:line in order)
+_print_call_stack() {
+  local i
+  # BASH_SOURCE[0] is this file; BASH_LINENO[i-1] is the callsite line
+  for ((i=0; i<${#BASH_SOURCE[@]}; i++)); do
+    # Skip empty frames
+    local src="${BASH_SOURCE[$i]}"
+    local func="${FUNCNAME[$i]:-main}"
+    local line="${BASH_LINENO[$((i-1))]:-?}"
+    printf '   #%d %s:%s in %s()\n' "$i" "${src:-?}" "${line}" "${func}"
+  done
+}
+
 # -------- Helpers --------
 
 # Print an ISO-8601 timestamped line to stdout
@@ -86,12 +105,32 @@ pick_next_process_dir() {
 }
 
 # -------- Error Trap --------
-
-# On any error, print a timestamped message and exit with the original code
 trap '{
   code=$?
-  set +x
-  log "[ERROR] A command failed at line $LINENO (exit $code)"
+  # Turn off xtrace for clean error logs
+  { set +x; } 2>/dev/null
+  # Snapshot failing command and location
+  local_cmd=${BASH_COMMAND}
+  local_src=${BASH_SOURCE[0]}
+  local_line=${LINENO}
+
+  log "[ERROR] Exit code: ${code}"
+  log "[ERROR] While running: ${local_cmd}"
+  log "[ERROR] At: ${local_src}:${local_line}"
+
+  # If the error originated in a sourced file (e.g., install.sh), show the stack
+  if [ ${#BASH_SOURCE[@]} -gt 1 ]; then
+    log "[ERROR] Call stack (most recent first):"
+    _print_call_stack | sed -e "s/^/[$(date "+%Y-%m-%d %H:%M:%S")] /"
+  fi
+
+  # Helpful runtime context
+  log "[ERROR] Context:"
+  log "        CONFIG_PATH='${CONFIG_PATH-}'"
+  log "        BASE_DIR_OVERRIDE='${BASE_DIR_OVERRIDE-}'"
+  log "        PIPELINES_DIR='${PIPELINES_DIR-}'"
+  log "        INSTALL_PIPE='${INSTALL_PIPE-}'"
+  log "        CRC_LOG_COLLECTOR='${CRC_LOG_COLLECTOR-}'"
   log "❌ Fail"
   exit $code
 }' ERR
@@ -143,7 +182,9 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 log "Installing pipeline..."
 # shellcheck disable=SC1090
+set -x
 . "$INSTALL_PIPE"
+{ set +x; } 2>/dev/null
 
 # -------- CRC_LOG_COLLECTOR auto-detection --------
 # If CRC_LOG_COLLECTOR is already set, keep it.
