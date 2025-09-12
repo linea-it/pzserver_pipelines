@@ -299,6 +299,24 @@ def _copy_tree(src_dir: str, dst_dir: str, lg: logging.LoggerAdapter) -> None:
         for f in files:
             _copy_file(os.path.join(root, f), os.path.join(tgt_root, f), lg)
 
+def _snapshot_shell_logs(src_dir: str, dst_dir: str, lg: logging.LoggerAdapter, max_size_mb: int = 100) -> None:
+    """Copy *.log/*.err/*.out (and *.N rotations) from src_dir to dst_dir."""
+    os.makedirs(dst_dir, exist_ok=True)
+    patterns = ["*.log", "*.log.*", "*.err", "*.err.*", "*.out", "*.out.*"]
+    seen = set()
+    for pat in patterns:
+        for path in glob.glob(os.path.join(src_dir, pat)):
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                if os.path.getsize(path) > max_size_mb * 1024 * 1024:
+                    lg.info("Skip (>%d MB): %s", max_size_mb, path)
+                    continue
+            except Exception:
+                pass
+            _copy_file(path, os.path.join(dst_dir, os.path.basename(path)), lg)
+
 # ---------------------------------------------------------------------------
 # Core pipeline
 # ---------------------------------------------------------------------------
@@ -324,6 +342,10 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     temp_dir = os.path.join(base_dir, "temp")
     os.makedirs(logs_dir, exist_ok=True)
     os.makedirs(temp_dir, exist_ok=True)
+
+    launch_dir = os.environ.get("CRC_LAUNCH_DIR", ".")
+    launch_snap_dir = os.path.join(logs_dir, "launch_dir_files")
+    print(f"Pipeline was called from: {launch_dir}")
 
     try:
         _copy_file(config_path, os.path.join(base_dir, "config.yaml"), logging.LoggerAdapter(logging.getLogger("crc"), {"phase": "init"}))
@@ -1106,6 +1128,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     # ----------------- PUBLISH STEP (finalzinho) -----------------
     publish_logger = _phase_logger(base_logger, "register")
     publish_logger.info("START publish: copying staged artifacts from process dir to out_root_and_dir (%s)", out_root_and_dir)
+
+    try:
+        _snapshot_shell_logs(str(launch_dir), launch_snap_dir, publish_logger, max_size_mb=100)
+        publish_logger.info("Snapshotted shell logs from %s into %s", launch_dir, launch_snap_dir)
+    except Exception as e:
+        publish_logger.warning("Snapshot of shell logs failed: %s", e)    
 
     # Cria pasta de publicação só agora
     os.makedirs(out_root_and_dir, exist_ok=True)
