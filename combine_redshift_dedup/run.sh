@@ -7,6 +7,12 @@ set -o errtrace  # ensure ERR trap runs in functions/subshells/sourced files
 # Pretty PS4 for `set -x` (shows timestamp, file, and line)
 export PS4='+ [$(date "+%Y-%m-%d %H:%M:%S")] (${BASH_SOURCE##*/}:${LINENO}) '
 
+# --- XTRACE GATE: silence any inherited xtrace unless we explicitly enable it
+exec 9>/dev/null
+export BASH_XTRACEFD=${BASH_XTRACEFD:-9}
+_enable_xtrace() { export BASH_XTRACEFD=2; set -x; }
+_disable_xtrace() { { set +x; } 2>/dev/null; export BASH_XTRACEFD=9; }
+
 # =========================
 # Helpers
 # =========================
@@ -190,11 +196,11 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 # =========================
 
 log "Installing pipeline..."
-# Enable xtrace only if DEBUG=1
-if [ "${DEBUG:-0}" = "1" ]; then set -x; fi
+# Enable xtrace only if DEBUG=1 (and keep it silenced otherwise)
+if [ "${DEBUG:-0}" = "1" ]; then _enable_xtrace; fi
 # shellcheck disable=SC1090
 . "$INSTALL_PIPE"
-if [ "${DEBUG:-0}" = "1" ]; then { set +x; } 2>/dev/null; fi
+if [ "${DEBUG:-0}" = "1" ]; then _disable_xtrace; fi
 
 # =========================
 # CRC_LOG_COLLECTOR auto-detection
@@ -217,11 +223,11 @@ log "CRC_LOG_COLLECTOR=${CRC_LOG_COLLECTOR}"
 # Run the pipeline
 # =========================
 
-if [ "${DEBUG:-0}" = "1" ]; then set -x; fi
+if [ "${DEBUG:-0}" = "1" ]; then _enable_xtrace; fi
 PYTHONPATH="$PIPELINES_DIR:${PYTHONPATH:-}" \
 CRC_LOG_COLLECTOR="$CRC_LOG_COLLECTOR" \
 python "$PIPE_BASE/scripts/crd-run.py" "$CONFIG_PATH" --base_dir "$BASE_DIR_OVERRIDE"
-if [ "${DEBUG:-0}" = "1" ]; then { set +x; } 2>/dev/null; fi
+if [ "${DEBUG:-0}" = "1" ]; then _disable_xtrace; fi
 
 # =========================
 # Epilogue
