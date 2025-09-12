@@ -1,17 +1,30 @@
 #!/bin/bash
 
-# Exit on errors, unset vars are errors, and fail a pipeline if any command in it fails
+# =========================================
+# Strict flags, errtrace, and quiet-by-default
+# =========================================
 set -Eeuo pipefail
-set -o errtrace  # ensure ERR trap runs in functions/subshells/sourced files
-
-# Pretty PS4 for `set -x` (shows timestamp, file, and line)
+set -o errtrace
 export PS4='+ [$(date "+%Y-%m-%d %H:%M:%S")] (${BASH_SOURCE##*/}:${LINENO}) '
 
-# --- XTRACE GATE: silence any inherited xtrace unless we explicitly enable it
+# ---- HARD KILL any inherited xtrace right away ----
+{ set +x; } 2>/dev/null
 exec 9>/dev/null
-export BASH_XTRACEFD=${BASH_XTRACEFD:-9}
-_enable_xtrace() { export BASH_XTRACEFD=2; set -x; }
-_disable_xtrace() { { set +x; } 2>/dev/null; export BASH_XTRACEFD=9; }
+# Force xtrace output to /dev/null unless we explicitly rewire it
+export BASH_XTRACEFD=9
+
+# Helpers to (re)enable / disable xtrace safely.
+_enable_xtrace() {
+  # Enable xtrace ONLY if explicitly requested, and only on interactive TTYs.
+  if [ "${DEBUG:-0}" = "1" ] && [ "${ALLOW_XTRACE:-0}" = "1" ] && [ -t 2 ]; then
+    export BASH_XTRACEFD=2
+    set -x
+  fi
+}
+_disable_xtrace() {
+  { set +x; } 2>/dev/null
+  export BASH_XTRACEFD=9
+}
 
 # =========================
 # Helpers
@@ -29,66 +42,37 @@ _print_call_stack() {
 }
 
 # Timestamped logging helpers
-# - log  -> stdout (will go ONLY to file; not to terminal)
-# - warn -> stderr (shows in terminal AND file)
-# - err  -> stderr (shows in terminal AND file)
-log() {
-  local ts; ts="$(date "+%Y-%m-%d %H:%M:%S")"
-  echo "[$ts] $*"
-}
-warn() {
-  local ts; ts="$(date "+%Y-%m-%d %H:%M:%S")"
-  echo "[$ts] [WARN] $*" >&2
-}
-err() {
-  local ts; ts="$(date "+%Y-%m-%d %H:%M:%S")"
-  echo "[$ts] [ERROR] $*" >&2
-}
+log()  { echo "[$(date "+%Y-%m-%d %H:%M:%S")] $*"; }
+warn() { echo "[$(date "+%Y-%m-%d %H:%M:%S")] [WARN] $*"  >&2; }
+err()  { echo "[$(date "+%Y-%m-%d %H:%M:%S")] [ERROR] $*" >&2; }
 
 # Best-effort detection of the driver's primary IPv4 address.
-# Priority:
-#   1) hostname -I (first non-loopback IPv4)
-#   2) ip route get (extract 'src' field)
-#   3) ifconfig (BSD/macOS) fallback
 detect_driver_ip() {
   if command -v hostname >/dev/null 2>&1; then
     # shellcheck disable=SC2207
     local addrs=($(hostname -I 2>/dev/null || true))
     for a in "${addrs[@]:-}"; do
       if [[ "$a" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && [[ ! "$a" =~ ^127\. ]]; then
-        echo "$a"
-        return 0
+        echo "$a"; return 0
       fi
     done
   fi
-
   if command -v ip >/dev/null 2>&1; then
-    local r
+    local r src last_ipv4
     r="$(ip route get 1.1.1.1 2>/dev/null || true)"
     if [[ -n "$r" ]]; then
-      local src
       src="$(awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' <<<"$r" || true)"
-      if [[ "$src" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && [[ ! "$src" =~ ^127\. ]]; then
-        echo "$src"; return 0
-      fi
-      local last_ipv4
+      if [[ "$src" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && [[ ! "$src" =~ ^127\. ]]; then echo "$src"; return 0; fi
       last_ipv4="$(grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' <<<"$r" | tail -n1 || true)"
-      if [[ "$last_ipv4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && [[ ! "$last_ipv4" =~ ^127\. ]]; then
-        echo "$last_ipv4"; return 0
-      fi
+      if [[ "$last_ipv4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && [[ ! "$last_ipv4" =~ ^127\. ]]; then echo "$last_ipv4"; return 0; fi
     fi
   fi
-
   if command -v ifconfig >/dev/null 2>&1; then
     local cand
     cand="$(ifconfig 2>/dev/null | grep -Eo 'inet ([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $2}' | grep -v '^127\.' | head -n1 || true)"
-    if [[ "$cand" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-      echo "$cand"; return 0
-    fi
+    if [[ "$cand" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then echo "$cand"; return 0; fi
   fi
-
-  echo ""
-  return 1
+  echo ""; return 1
 }
 
 # Pick next available process directory under a root (defaults to .)
@@ -98,10 +82,7 @@ pick_next_process_dir() {
   while :; do
     printf -v name "process%03d" "$i"
     path="${root}/${name}"
-    if [ ! -e "$path" ]; then
-      echo "$path"
-      return 0
-    fi
+    if [ ! -e "$path" ]; then echo "$path"; return 0; fi
     i=$((i+1))
   done
 }
@@ -109,7 +90,6 @@ pick_next_process_dir() {
 # =========================
 # Error Trap
 # =========================
-# NOTE: LOG_FILE may be defined later; the trap checks for its presence.
 trap '{
   code=$?
   { set +x; } 2>/dev/null
@@ -134,7 +114,6 @@ trap '{
   err "  INSTALL_PIPE='${INSTALL_PIPE-}'"
   err "  CRC_LOG_COLLECTOR='${CRC_LOG_COLLECTOR-}'"
 
-  # Show tail of process.log for immediate context (if available)
   if [ -n "${LOG_FILE-}" ] && [ -f "${LOG_FILE-}" ]; then
     err "---- tail of ${LOG_FILE} ----"
     tail -n 200 "$LOG_FILE" >&2 || true
@@ -148,7 +127,6 @@ trap '{
 # =========================
 # Args & basic checks
 # =========================
-
 if [ $# -lt 1 ]; then
   err "Usage: ./run.sh <config.yaml> [run_dir]"
   err "If [run_dir] is not provided, the script will pick process001, process002, ..."
@@ -176,14 +154,11 @@ if [ -z "$BASE_DIR_OVERRIDE" ]; then
   BASE_DIR_OVERRIDE="$(pick_next_process_dir ".")"
   log "No run directory provided. Using '${BASE_DIR_OVERRIDE}'."
 fi
-
-# Ensure the chosen run directory exists
 mkdir -p "$BASE_DIR_OVERRIDE"
 
 # =========================
 # Logs wiring (shell level)
 # =========================
-
 LOGS_DIR="${BASE_DIR_OVERRIDE}/process_info"
 mkdir -p "$LOGS_DIR"
 LOG_FILE="$LOGS_DIR/process.log"
@@ -194,13 +169,12 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 # =========================
 # Install pipeline deps
 # =========================
-
 log "Installing pipeline..."
-# Enable xtrace only if DEBUG=1 (and keep it silenced otherwise)
-if [ "${DEBUG:-0}" = "1" ]; then _enable_xtrace; fi
+# Don’t trust external DEBUG/BASH_XTRACEFD unless explicitly allowed
+_enable_xtrace
 # shellcheck disable=SC1090
 . "$INSTALL_PIPE"
-if [ "${DEBUG:-0}" = "1" ]; then _disable_xtrace; fi
+_disable_xtrace
 
 # =========================
 # CRC_LOG_COLLECTOR auto-detection
@@ -222,19 +196,16 @@ log "CRC_LOG_COLLECTOR=${CRC_LOG_COLLECTOR}"
 # =========================
 # Run the pipeline
 # =========================
-
-if [ "${DEBUG:-0}" = "1" ]; then _enable_xtrace; fi
+_enable_xtrace
 PYTHONPATH="$PIPELINES_DIR:${PYTHONPATH:-}" \
 CRC_LOG_COLLECTOR="$CRC_LOG_COLLECTOR" \
 python "$PIPE_BASE/scripts/crd-run.py" "$CONFIG_PATH" --base_dir "$BASE_DIR_OVERRIDE"
-if [ "${DEBUG:-0}" = "1" ]; then _disable_xtrace; fi
+_disable_xtrace
 
 # =========================
 # Epilogue
 # =========================
-
 log "Pipeline exited with code: 0"
-# Success message goes only to the log file (not to terminal)
 log "✅ Success (run dir: ${BASE_DIR_OVERRIDE})"
 exit 0
 
