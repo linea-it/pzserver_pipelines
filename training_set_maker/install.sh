@@ -1,6 +1,6 @@
 #!/bin/bash --login
 
-# Initialize conda (robust, like CRC)
+# Initialize conda
 source "$(conda info --base)"/etc/profile.d/conda.sh || { echo "Failed to source conda.sh"; exit 1; }
 
 # Check PIPELINES_DIR
