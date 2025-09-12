@@ -7,11 +7,23 @@ set -Eeuo pipefail
 set -o errtrace  # propagate ERR into functions/subshells/sourced files
 export PS4='+ [$(date "+%Y-%m-%d %H:%M:%S")] (${BASH_SOURCE##*/}:${LINENO}) '
 
-# --- XTRACE GATE: silence any inherited xtrace unless we explicitly enable it
+# ---- HARD KILL any inherited xtrace right away ----
+{ set +x; } 2>/dev/null
 exec 9>/dev/null
-export BASH_XTRACEFD=${BASH_XTRACEFD:-9}
-_enable_xtrace() { export BASH_XTRACEFD=2; set -x; }
-_disable_xtrace() { { set +x; } 2>/dev/null; export BASH_XTRACEFD=9; }
+# Route xtrace to /dev/null unless explicitly enabled
+export BASH_XTRACEFD=9
+
+# Enable xtrace ONLY when explicitly allowed and in interactive TTYs
+_enable_xtrace() {
+  if [ "${DEBUG:-0}" = "1" ] && [ "${ALLOW_XTRACE:-0}" = "1" ] && [ -t 2 ]; then
+    export BASH_XTRACEFD=2
+    set -x
+  fi
+}
+_disable_xtrace() {
+  { set +x; } 2>/dev/null
+  export BASH_XTRACEFD=9
+}
 
 # ---------------- Helpers ----------------
 _print_call_stack() {
@@ -107,17 +119,17 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 # ---------------- Install pipeline ----------------
 log "Installing pipeline..."
-if [ "${DEBUG:-0}" = "1" ]; then _enable_xtrace; fi
+_enable_xtrace
 # shellcheck disable=SC1090
 . "$INSTALL_PIPE"
-if [ "${DEBUG:-0}" = "1" ]; then _disable_xtrace; fi
+_disable_xtrace
 
 # ---------------- Run TSM ----------------
 # NOTE: tsm-run expects positional args: config_path [cwd]
 # We pass RUN_DIR as the optional working directory (cwd).
-if [ "${DEBUG:-0}" = "1" ]; then _enable_xtrace; fi
+_enable_xtrace
 tsm-run "$CONFIG_PATH" "$RUN_DIR"
-if [ "${DEBUG:-0}" = "1" ]; then _disable_xtrace; fi
+_disable_xtrace
 
 # ---------------- Epilogue ----------------
 log "Pipeline exited with code: 0"
