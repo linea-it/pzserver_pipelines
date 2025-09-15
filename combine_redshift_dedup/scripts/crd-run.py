@@ -332,6 +332,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         raise ValueError("You must specify --base_dir via the command line.")
     base_dir = base_dir_override
 
+    # --- Paths ---
     output_root_dir = config["output_root_dir"]
     output_dir = config["output_dir"]
     out_root_and_dir = os.path.join(output_root_dir, output_dir)
@@ -450,6 +451,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 prepare_catalog,
                 entry,
                 translation_config,
+                param_config,
                 logs_dir,
                 temp_dir,
                 combine_mode,

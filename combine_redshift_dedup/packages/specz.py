@@ -1524,6 +1524,7 @@ def _maybe_collection(
 def prepare_catalog(
     entry: dict,
     translation_config: dict,
+    param_config: dict,
     logs_dir: str,
     temp_dir: str,
     combine_mode: str = "concatenate_and_mark_duplicates",
@@ -1584,7 +1585,22 @@ def prepare_catalog(
         translation_rules_uc,
     ) = _homogenize(df, translation_config, product_name, lg, type_cast_ok=type_cast_ok)
 
-    # 7) Persist + repartition
+    # 7) Apply cut based on z_flag_homogenized if requested
+    z_flag_homogenized_value_to_cut = param_config.get("z_flag_homogenized_value_to_cut", None)
+    if z_flag_homogenized_value_to_cut is not None and "z_flag_homogenized" in df.columns:
+        try:
+            cut_val = float(z_flag_homogenized_value_to_cut)
+            if 0.0 < cut_val <= 4.0:
+                initial_count = df.shape[0].compute()
+                df = df[df["z_flag_homogenized"] >= cut_val]
+                final_count = df.shape[0].compute()
+                lg.info(f"Applied z_flag_homogenized cut >= {cut_val}: {initial_count} → {final_count} rows")
+            else:
+                lg.warning(f"Invalid z_flag_homogenized_value_to_cut={z_flag_homogenized_value_to_cut}; skipping cut.")
+        except Exception as e:
+            lg.warning(f"Could not apply z_flag_homogenized cut ({e}); skipping cut.")
+
+    # 8) Persist + repartition
     part_size = "256MB"
     try:
         if client is not None:
@@ -1596,7 +1612,7 @@ def prepare_catalog(
     except Exception as e:
         lg.warning(f"Persist/repartition skipped or failed: {e}")
 
-    # 8) Init compared_to/tie_result
+    # 9) Init compared_to/tie_result
     df = _add_missing_with_dtype(df, "compared_to", DTYPE_STR)
     df = _add_missing_with_dtype(df, "tie_result", DTYPE_INT8)
     df["tie_result"] = df["tie_result"].map_partitions(
@@ -1604,13 +1620,13 @@ def prepare_catalog(
         meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
     )
 
-    # 9) Geometry validation
+    # 10) Geometry validation
     _validate_ra_dec_or_fail(df, product_name)
 
-    # 10) DP1 flag
+    # 11) DP1 flag
     df = _flag_dp1(df)
 
-    # 11) Assemble final columns
+    # 12) Assemble final columns
     df = _select_output_columns(
         df,
         translation_rules_uc,
@@ -1637,10 +1653,10 @@ def prepare_catalog(
         lg.warning(f"Output repartition failed; writing current npartitions. Reason: {e}")
         df_to_write = df
 
-    # 12) Write prepared parquet
+    # 13) Write prepared parquet
     out_path = _save_parquet(df_to_write, temp_dir, product_name)
 
-    # 13) Build collection (always)
+    # 14) Build collection (always)
     schema_hints_raw = translation_config.get("expr_column_schema")
     collection_path = _build_collection_with_retry(
         parquet_path=out_path,

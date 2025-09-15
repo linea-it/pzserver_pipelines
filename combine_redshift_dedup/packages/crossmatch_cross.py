@@ -272,7 +272,10 @@ def crossmatch_tiebreak(
     """
     logger = _get_logger()
     t0_all = time.time()
+
+    # Parameters with defaults
     radius = float((translation_config or {}).get("crossmatch_radius_arcsec", 0.75))
+    k = int((translation_config or {}).get("crossmatch_n_neighbors", 10))
 
     logger.info(
         "START crossmatch_update_compared_to: step=%s radius=%.3f\" import=%s",
@@ -286,7 +289,7 @@ def crossmatch_tiebreak(
     xmatched = left_cat.crossmatch(
         right_cat,
         radius_arcsec=radius,
-        n_neighbors=10,
+        n_neighbors=k,
         suffixes=("left", "right"),
     )
     logger.info("Crossmatch done (%.2fs)", time.time() - t0)
