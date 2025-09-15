@@ -14,9 +14,9 @@ tiebreaking_priority:
 delta_z_threshold: 0.0005    # Maximum allowed redshift difference (|z1 - z2|) to resolve hard ties
                              # Applied only when initial tiebreaking via columns results in a tie (tie_result == 2)
 
-crossmatch_radius_arcsec: 0.75  # Angular radius (in arcseconds) used to perform spatial crossmatching BETWEEN different catalogs
-                               # This is NOT used for resolving internal duplicates (within the same catalog), 
-                               # which are resolved only when RA and DEC are exactly equal (to 6 decimal places)
+crossmatch_radius_arcsec: 0.75  # Angular radius (in arcseconds) used to perform spatial crossmatching.
+
+crossmatch_n_neighbors: 10      # Number of nearest neighbors to consider during crossmatching.
 
 instrument_type_priority:
   s: 3     # Spectroscopic (most reliable type)

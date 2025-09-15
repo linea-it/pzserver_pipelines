@@ -194,6 +194,7 @@ class Runner:
 
             outputfile = create_output(
                 data,
+                self.cwd,
                 self.output_root_dir,
                 self.output_dir,
                 self.output_name,
@@ -217,6 +218,10 @@ class Runner:
         copy_files_by_extensions(".", self.logdir, [".log", ".err", ".out"])
         copy_file(
             self.config, str(Path(self.output_root_dir, self.output_dir, "config.yml"))
+        )
+        # Also copying to the working directory for consistency
+        copy_file(
+            self.config, str(Path(self.cwd, "config.yml"))
         )
         copy_directory(
             self.logdir,

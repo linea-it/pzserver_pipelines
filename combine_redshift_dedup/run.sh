@@ -196,6 +196,8 @@ log "CRC_LOG_COLLECTOR=${CRC_LOG_COLLECTOR}"
 # =========================
 # Run the pipeline
 # =========================
+export CRC_LAUNCH_DIR="$PWD"
+
 _enable_xtrace
 PYTHONPATH="$PIPELINES_DIR:${PYTHONPATH:-}" \
 CRC_LOG_COLLECTOR="$CRC_LOG_COLLECTOR" \

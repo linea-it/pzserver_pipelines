@@ -6,8 +6,70 @@ set -Eeuo pipefail
 # ----------------------------
 log(){ echo "[$(date "+%Y-%m-%d %H:%M:%S")] $*"; }
 
-# Initialize conda (required for conda commands)
-source "$(conda info --base)"/etc/profile.d/conda.sh || { echo "Failed to source conda.sh"; exit 1; }
+# ---------- Conda initialization with fallbacks ----------
+init_conda() {
+  # 1) Fast path: conda on PATH + normal base
+  if command -v conda >/dev/null 2>&1; then
+    if source "$(conda info --base)/etc/profile.d/conda.sh" 2>/dev/null; then
+      log "Conda initialized via conda info --base."
+      return 0
+    else
+      log "Fallback: conda.sh not found under \$(conda info --base)."
+    fi
+  else
+    log "conda not found in PATH."
+  fi
+
+  # 2) System-wide fallback
+  if [ -f /etc/profile.d/conda.sh ]; then
+    # shellcheck disable=SC1091
+    if source /etc/profile.d/conda.sh 2>/dev/null; then
+      log "Conda initialized from /etc/profile.d/conda.sh."
+      return 0
+    fi
+  fi
+
+  # 3) From CONDA_EXE if present
+  if [ -n "${CONDA_EXE:-}" ]; then
+    local _base
+    _base="$(dirname "$(dirname "$CONDA_EXE")")"
+    if [ -f "$_base/etc/profile.d/conda.sh" ]; then
+      # shellcheck disable=SC1091
+      if source "$_base/etc/profile.d/conda.sh" 2>/dev/null; then
+        log "Conda initialized via CONDA_EXE at $_base."
+        return 0
+      fi
+    fi
+  fi
+
+  # 4) Cluster-specific fallbacks: $SCRATCH/miniconda and $SCRATCH/miniconda3
+  local _scratch="${SCRATCH:-}"
+  if [ -n "$_scratch" ]; then
+    local candidates=(
+      "$_scratch/miniconda"
+      "$_scratch/miniconda3"
+    )
+    for cand in "${candidates[@]}"; do
+      if [ -f "$cand/etc/profile.d/conda.sh" ]; then
+        # shellcheck disable=SC1091
+        if source "$cand/etc/profile.d/conda.sh" 2>/dev/null; then
+          log "Conda initialized from $cand."
+          return 0
+        fi
+      fi
+    done
+  else
+    log "SCRATCH is not set; skipping $SCRATCH/miniconda* fallbacks."
+  fi
+
+  # If we reach here, we failed
+  log "Failed to source conda.sh from all known locations."
+  return 1
+}
+
+# Call it and stop on failure
+init_conda || { echo "Failed to source conda.sh"; exit 1; }
+# --------------------------------------------------------
 
 env_exists() {
   conda env list | awk '{print $1}' | grep -qx "$1"

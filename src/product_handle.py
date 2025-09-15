@@ -17,7 +17,7 @@ OpInt = Union[int, None]
 OpStr = Union[str, None]
 
 
-def create_output(data, output_root_dir, output_dir, output_name, extension):
+def create_output(data, cwd_dir, output_root_dir, output_dir, output_name, extension):
     """Create output file
 
     Args:
@@ -33,7 +33,7 @@ def create_output(data, output_root_dir, output_dir, output_name, extension):
 
     outputfile = str(Path(output_dir, f"{output_name}.{extension}"))
     output_full_file = str(Path(output_root_dir, outputfile).resolve())
-    output_temp = f"{output_name}.{extension}"
+    output_temp = str(Path(cwd_dir, f"{output_name}.{extension}"))
 
     match extension:
         case "csv":

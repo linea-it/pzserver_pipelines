@@ -35,7 +35,7 @@ class Local(BaseModel):
 
 class Executor(BaseModel):
 
-    name: str = "local"
+    name: str = DASK_EXECUTOR
     args: Any = {}
 
     @model_validator(mode="before")
