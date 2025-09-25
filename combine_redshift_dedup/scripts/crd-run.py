@@ -414,11 +414,47 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
     combine_mode = param_config.get("combine_type", "concatenate_and_mark_duplicates").lower()
     completed = read_completed_steps(os.path.join(temp_dir, "process_resume.log"))
-    log_init.info("END init: pipeline bootstrap")
-
+ 
     # --- Dask cluster/client ---
     cluster = get_executor(config["executor"], logs_dir=logs_dir)
     client = Client(cluster)
+    
+    # Ensure the minimum number of workers start within 10 seconds
+    exec_args = config.get("executor", {}).get("args", {}) or {}
+    instance_cfg = exec_args.get("instance", {}) or {}
+    scale_cfg = exec_args.get("scale", {}) or {}
+    
+    procs = int(instance_cfg.get("processes", 1) or 1)
+    min_jobs = scale_cfg.get("minimum_jobs")
+    min_workers = 0 if min_jobs is None else int(min_jobs) * procs
+    
+    if min_workers > 0:
+        log_init.info("Waiting up to 10s for minimum_workers=%d to start...", min_workers)
+        try:
+            client.wait_for_workers(min_workers, timeout=10)
+        except Exception:
+            current_workers = len(client.scheduler_info().get("workers", {}))
+            log_init.warning(
+                "Timeout: waited 10 seconds but minimum_workers=%d did not start "
+                "(current=%d). Proceeding anyway.",
+                min_workers,
+                current_workers,
+            )
+        else:
+            current_workers = len(client.scheduler_info().get("workers", {}))
+            log_init.info(
+                "Confirmed: minimum_workers=%d started within 10s (current=%d).",
+                min_workers,
+                current_workers,
+            )
+
+    current_workers = len(client.scheduler_info().get("workers", {}))
+    log_init.info(
+        "WORKERS STILL RUNNING=%d.",
+        current_workers,
+    )
+    
+    log_init.info("END init: pipeline bootstrap")
 
     # Dask perf report (global)
     global_report_path = os.path.join(logs_dir, "main_dask_report.html")
@@ -516,6 +552,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             if tag not in completed:
                 log_step(resume_log, tag)
 
+        current_workers = len(client.scheduler_info().get("workers", {}))
+        log_prep.info(
+            "WORKERS STILL RUNNING=%d.",
+            current_workers,
+        )
+
         log_prep.info("END preparation: finished prepared collections")
 
         # ---------------------------------------------------------------
@@ -544,7 +586,6 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
         # If you have already finished crossmatching, retrieve the collection root (if it exists) for distributed dedup.
         final_collection_path = _recover_final_collection_path() if crossmatch_already_done else None
-
 
         # ---------------------------------------------------------------
         # 2) AUTO MATCH (self crossmatch over each prepared)
@@ -617,6 +658,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 else:
                     log_auto.info("No auto-crossmatch needed (all *_hats_auto present).")
 
+                current_workers = len(client.scheduler_info().get("workers", {}))
+                log_auto.info(
+                    "WORKERS STILL RUNNING=%d.",
+                    current_workers,
+                )
+
                 log_auto.info("END automatch: all *_hats_auto guaranteed on disk")
 
             # -----------------------------------------------------------
@@ -648,6 +695,13 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             # Simple concat mode still passes through consolidation phase later.
             log_cross.info("Concatenate mode selected (no crossmatch).")
             df_final = dd.concat([dd.read_parquet(i["prepared_path"]) for i in prepared_info]).compute()
+
+            current_workers = len(client.scheduler_info().get("workers", {}))
+            log_cross.info(
+                "WORKERS STILL RUNNING=%d.",
+                current_workers,
+            )
+            
             log_cross.info("END crossmatch: concatenate mode (no crossmatch performed)")
 
             # Consolidation will run below
@@ -725,6 +779,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     log_step(resume_log, tag)
                     if delete_temp_files:
                         _cleanup_previous_step(i, prepared_info, temp_dir, log_cross)
+
+                current_workers = len(client.scheduler_info().get("workers", {}))
+                log_cross.info(
+                    "WORKERS STILL RUNNING=%d.",
+                    current_workers,
+                )
 
                 log_cross.info("END crossmatch: graph merge completed")
                 start_consolidate = False
@@ -1021,6 +1081,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 n_big = int((dup > 1).sum())
                 log_dedup.info("Sanity group_id: uniques=%d, ids_com_>1_ocorr=%d", int(dup.size), n_big)
 
+                current_workers = len(client.scheduler_info().get("workers", {}))
+                log_dedup.info(
+                    "WORKERS STILL RUNNING=%d.",
+                    current_workers,
+                )
+
                 log_dedup.info("END deduplication: labels merged back into final dataframe")
             except Exception as e:
                 import traceback as _tb
@@ -1166,6 +1232,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         except Exception as e:
             log_cons.warning("Could not delete temp_dir %s: %s", temp_dir, e)
 
+    current_workers = len(client.scheduler_info().get("workers", {}))
+    log_cons.info(
+        "WORKERS STILL RUNNING=%d.",
+        current_workers,
+    )
+    
     log_cons.info("END consolidation: export complete")
     client.close()
     cluster.close()

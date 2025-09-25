@@ -278,9 +278,10 @@ def crossmatch_tiebreak(
     k = int((translation_config or {}).get("crossmatch_n_neighbors", 10))
 
     logger.info(
-        "START crossmatch_update_compared_to: step=%s radius=%.3f\" import=%s",
+        "START crossmatch_update_compared_to: step=%s radius=%.3f\" n_neighbors=%d import=%s",
         step,
         radius,
+        k,
         bool(do_import),
     )
 
