@@ -2,14 +2,31 @@ from __future__ import annotations
 """
 Crossmatch and `compared_to` updater for CRC.
 
-Performs a spatial crossmatch between two catalogs (no tie-breaking / Δz),
-updates `compared_to` symmetrically on both inputs, writes a merged Parquet,
-and optionally imports it as an LSDB Collection (margin-first retry).
+This module supports two export backends, controlled by the hardcoded flag
+`USE_LSDB_CONCAT`:
+
+- If USE_LSDB_CONCAT = True (default):
+    Performs the crossmatch; updates `compared_to`; normalizes dtypes on each
+    input catalog independently; concatenates at the LSDB catalog level;
+    writes a HATS collection via `to_hats`; returns the collection path.
+    (No intermediate Parquet.)
+
+- If USE_LSDB_CONCAT = False:
+    Performs the crossmatch; updates `compared_to`; extracts the underlying
+    Dask DataFrames (`._ddf`) from the two catalogs; concatenates them with
+    Dask; normalizes dtypes on the merged Dask DataFrame (expected, prev, expr);
+    writes a Parquet dataset; imports it as an LSDB collection (margin-first
+    retry); returns the collection path.
 
 Public API:
     - crossmatch_tiebreak(...)
     - crossmatch_tiebreak_safe(...)
 """
+
+# -----------------------
+# Backend switch
+# -----------------------
+USE_LSDB_CONCAT: bool = False  # Toggle behavior as described above.
 
 # -----------------------
 # Standard library
@@ -22,21 +39,21 @@ from typing import Dict, Iterable, List, Set
 # -----------------------
 # Third-party
 # -----------------------
-import dask.dataframe as dd
 import numpy as np
 import pandas as pd
+import dask.dataframe as dd
 import lsdb
 
 # -----------------------
 # Project
 # -----------------------
+from combine_redshift_dedup.packages.utils import get_phase_logger
 from combine_redshift_dedup.packages.specz import (
     _build_collection_with_retry,
     _normalize_string_series_to_na,
     _add_missing_with_dtype,
     DTYPE_STR, DTYPE_FLOAT, DTYPE_INT, DTYPE_BOOL, DTYPE_INT8,
 )
-from combine_redshift_dedup.packages.utils import get_phase_logger
 
 __all__ = ["crossmatch_tiebreak", "crossmatch_tiebreak_safe"]
 
@@ -54,116 +71,10 @@ def _get_logger() -> logging.LoggerAdapter:
 
 
 # -----------------------
-# Type utilities
-# -----------------------
-def _coerce_optional_columns_for_import(
-    df: dd.DataFrame,
-    schema_hints: dict | None = None,
-) -> dd.DataFrame:
-    """Coerce prev/expr columns to consistent Arrow dtypes across partitions.
-
-    Args:
-        df: Merged Dask dataframe.
-        schema_hints: Mapping {col_name: 'str'|'float'|'int'|'bool'}.
-
-    Returns:
-        dd.DataFrame with coerced/added columns.
-    """
-    # 1) Prev columns
-    # CRD_ID_prev*, compared_to_prev* → string
-    prev_like_str = [c for c in df.columns if str(c).startswith("CRD_ID_prev")]
-    prev_like_str += [c for c in df.columns if str(c).startswith("compared_to_prev")]
-    for c in prev_like_str:
-        df[c] = df[c].map_partitions(
-            _normalize_string_series_to_na,
-            meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
-        )
-
-    # group_id_prev* → int
-    prev_like_int = [c for c in df.columns if str(c).startswith("group_id_prev")]
-    for c in prev_like_int:
-        coerced = dd.to_numeric(df[c], errors="coerce")
-        df[c] = coerced.map_partitions(
-            lambda s: s.astype(DTYPE_INT),
-            meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
-        )
-
-    # 2) Expr columns guided by hints
-    hints = dict(schema_hints or {})
-    if not hints:
-        return df
-
-    for col, kind in hints.items():
-        k = str(kind).lower()
-        if col not in df.columns:
-            # Create missing with target dtype (so empty partitions don’t default to null[pyarrow])
-            if k == "str":
-                df = _add_missing_with_dtype(df, col, DTYPE_STR)
-            elif k == "float":
-                df = _add_missing_with_dtype(df, col, DTYPE_FLOAT)
-            elif k == "int":
-                df = _add_missing_with_dtype(df, col, DTYPE_INT)
-            elif k == "bool":
-                df = _add_missing_with_dtype(df, col, DTYPE_BOOL)
-            continue
-
-        # Cast existing
-        if k == "str":
-            df[col] = df[col].map_partitions(
-                _normalize_string_series_to_na,
-                meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
-            )
-        elif k == "float":
-            coerced = dd.to_numeric(df[col], errors="coerce")
-            df[col] = coerced.map_partitions(
-                lambda s: s.astype(DTYPE_FLOAT),
-                meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
-            )
-        elif k == "int":
-            coerced = dd.to_numeric(df[col], errors="coerce")
-            df[col] = coerced.map_partitions(
-                lambda s: s.astype(DTYPE_INT),
-                meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
-            )
-        elif k == "bool":
-            # Conservative: enforce target dtype only; upstream should already sanitize values
-            df[col] = df[col].map_partitions(
-                lambda s: s.astype(DTYPE_BOOL),
-                meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
-            )
-
-    return df
-
-# -----------------------
-# Saving utilities
-# -----------------------
-def _safe_to_parquet(ddf, path, **kwargs) -> None:
-    """Write Parquet robustly for both plain Dask and nested_dask frames.
-
-    Tries engine="pyarrow"; if backend already sets an engine, retries without it.
-    """
-    try:
-        ddf.to_parquet(path, engine="pyarrow", **kwargs)
-    except TypeError as e:
-        if "multiple values for keyword argument 'engine'" in str(e):
-            ddf.to_parquet(path, **kwargs)
-        else:
-            raise
-
-
-# -----------------------
-# Internal helpers
+# Utilities
 # -----------------------
 def _adjacency_from_pairs(left_ids: pd.Series, right_ids: pd.Series) -> Dict[str, Set[str]]:
-    """Build an undirected adjacency from left-right crossmatch pairs.
-
-    Args:
-        left_ids: Series of left CRD_IDs.
-        right_ids: Series of right CRD_IDs.
-
-    Returns:
-        Mapping CRD_ID -> set of neighbor CRD_IDs.
-    """
+    """Build an undirected adjacency from left-right crossmatch pairs."""
     adj: Dict[str, Set[str]] = {}
     L = left_ids.astype(str).to_numpy(dtype=object, copy=False)
     R = right_ids.astype(str).to_numpy(dtype=object, copy=False)
@@ -186,19 +97,11 @@ def _merge_compared_to_partition(
     part: pd.DataFrame,
     pairs_adj: Dict[str, Iterable[str]],
 ) -> pd.DataFrame:
-    """Partition-wise update of `compared_to` by unioning existing entries with new pairs.
-
-    Args:
-        part: Partition dataframe.
-        pairs_adj: Mapping CRD_ID -> iterable of neighbors.
-
-    Returns:
-        Partition with updated `compared_to` (Arrow string dtype), NA if empty.
-    """
+    """Partition-wise update of `compared_to` by unioning existing entries with new pairs."""
     p = part.copy()
 
     if "compared_to" not in p.columns:
-        p["compared_to"] = pd.Series(pd.NA, index=p.index)
+        p["compared_to"] = pd.Series(pd.array([pd.NA] * len(p), dtype=DTYPE_STR), index=p.index)
 
     crd_list: List[str] = p["CRD_ID"].astype(str).tolist()
 
@@ -245,6 +148,263 @@ def _merge_compared_to_partition(
     return p
 
 
+# -----------------------
+# Dtype normalization helpers (catalog-level, via map_partitions)
+# -----------------------
+_EXPECTED_TYPES = {
+    "CRD_ID": DTYPE_STR,
+    "id": DTYPE_STR,
+    "ra": DTYPE_FLOAT,
+    "dec": DTYPE_FLOAT,
+    "z": DTYPE_FLOAT,
+    "z_flag": DTYPE_FLOAT,
+    "z_err": DTYPE_FLOAT,
+    "instrument_type": DTYPE_STR,
+    "survey": DTYPE_STR,
+    "source": DTYPE_STR,
+    "tie_result": DTYPE_INT8,
+    "z_flag_homogenized": DTYPE_FLOAT,
+    "instrument_type_homogenized": DTYPE_STR,
+    "compared_to": DTYPE_STR,
+}
+
+
+def _cast_partition_expected(
+    part: pd.DataFrame,
+    expected_types: dict,
+    schema_hints: dict | None,
+) -> pd.DataFrame:
+    """Cast/add core columns and optional expr columns on a pandas partition."""
+    df = part.copy()
+
+    # 1) Core expected types
+    for col, dtype in expected_types.items():
+        if col not in df.columns:
+            # Create missing column with target dtype
+            if dtype is DTYPE_STR:
+                df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_STR), index=df.index)
+            elif dtype is DTYPE_FLOAT:
+                df[col] = pd.Series(pd.array([np.nan] * len(df), dtype=DTYPE_FLOAT), index=df.index)
+            elif dtype is DTYPE_INT8:
+                df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_INT8), index=df.index)
+            elif dtype is DTYPE_INT:
+                df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_INT), index=df.index)
+            elif dtype is DTYPE_BOOL:
+                df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_BOOL), index=df.index)
+            continue
+
+        # Cast existing column
+        try:
+            if dtype is DTYPE_STR:
+                df[col] = _normalize_string_series_to_na(df[col])
+            elif dtype is DTYPE_FLOAT:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype(DTYPE_FLOAT)
+            elif dtype is DTYPE_INT8:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype(DTYPE_INT8)
+            elif dtype is DTYPE_INT:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype(DTYPE_INT)
+            elif dtype is DTYPE_BOOL:
+                df[col] = df[col].astype(DTYPE_BOOL)
+        except Exception:
+            # Be lenient: if cast fails, leave column as-is.
+            pass
+
+    # 2) Prev-like columns
+    prev_like_str = [c for c in df.columns if str(c).startswith("CRD_ID_prev")]
+    prev_like_str += [c for c in df.columns if str(c).startswith("compared_to_prev")]
+    for c in prev_like_str:
+        try:
+            df[c] = _normalize_string_series_to_na(df[c])
+        except Exception:
+            pass
+
+    prev_like_int = [c for c in df.columns if str(c).startswith("group_id_prev")]
+    for c in prev_like_int:
+        try:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype(DTYPE_INT)
+        except Exception:
+            pass
+
+    # 3) Optional expr columns guided by hints (if provided)
+    hints = dict(schema_hints or {})
+    for col, kind in hints.items():
+        k = str(kind).lower()
+        if col not in df.columns:
+            # Create missing column with target dtype
+            try:
+                if k == "str":
+                    df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_STR), index=df.index)
+                elif k == "float":
+                    df[col] = pd.Series(pd.array([np.nan] * len(df), dtype=DTYPE_FLOAT), index=df.index)
+                elif k == "int":
+                    df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_INT), index=df.index)
+                elif k == "bool":
+                    df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_BOOL), index=df.index)
+            except Exception:
+                pass
+            continue
+
+        # Cast existing
+        try:
+            if k == "str":
+                df[col] = _normalize_string_series_to_na(df[col])
+            elif k == "float":
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype(DTYPE_FLOAT)
+            elif k == "int":
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype(DTYPE_INT)
+            elif k == "bool":
+                df[col] = df[col].astype(DTYPE_BOOL)
+        except Exception:
+            pass
+
+    return df
+
+
+def _normalize_catalog_dtypes(cat, translation_config: dict | None):
+    """Return a new catalog with normalized dtypes (lazy, via map_partitions)."""
+    cfg = translation_config or {}
+    schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
+
+    # Build meta by running the caster on the meta dataframe
+    meta_in = cat._ddf._meta
+    meta_out = _cast_partition_expected(meta_in, _EXPECTED_TYPES, schema_hints_local)
+    return cat.map_partitions(_cast_partition_expected, _EXPECTED_TYPES, schema_hints_local, meta=meta_out)
+
+
+# -----------------------
+# Dask/DDFrame normalization helpers (for the legacy path)
+# -----------------------
+def _coerce_optional_columns_for_import(
+    df: dd.DataFrame,
+    schema_hints: dict | None = None,
+) -> dd.DataFrame:
+    """Coerce prev/expr columns to consistent Arrow dtypes across partitions."""
+    # 1) Prev columns → normalize
+    prev_like_str = [c for c in df.columns if str(c).startswith("CRD_ID_prev")]
+    prev_like_str += [c for c in df.columns if str(c).startswith("compared_to_prev")]
+    for c in prev_like_str:
+        df[c] = df[c].map_partitions(
+            _normalize_string_series_to_na,
+            meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
+        )
+
+    prev_like_int = [c for c in df.columns if str(c).startswith("group_id_prev")]
+    for c in prev_like_int:
+        coerced = dd.to_numeric(df[c], errors="coerce")
+        df[c] = coerced.map_partitions(
+            lambda s: s.astype(DTYPE_INT),
+            meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
+        )
+
+    # 2) Expr columns guided by hints
+    hints = dict(schema_hints or {})
+    if not hints:
+        return df
+
+    for col, kind in hints.items():
+        k = str(kind).lower()
+        if col not in df.columns:
+            # Create missing with target dtype (avoid null[pyarrow] metas)
+            if k == "str":
+                df = _add_missing_with_dtype(df, col, DTYPE_STR)
+            elif k == "float":
+                df = _add_missing_with_dtype(df, col, DTYPE_FLOAT)
+            elif k == "int":
+                df = _add_missing_with_dtype(df, col, DTYPE_INT)
+            elif k == "bool":
+                df = _add_missing_with_dtype(df, col, DTYPE_BOOL)
+            continue
+
+        # Cast existing
+        if k == "str":
+            df[col] = df[col].map_partitions(
+                _normalize_string_series_to_na,
+                meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
+            )
+        elif k == "float":
+            coerced = dd.to_numeric(df[col], errors="coerce")
+            df[col] = coerced.map_partitions(
+                lambda s: s.astype(DTYPE_FLOAT),
+                meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
+            )
+        elif k == "int":
+            coerced = dd.to_numeric(df[col], errors="coerce")
+            df[col] = coerced.map_partitions(
+                lambda s: s.astype(DTYPE_INT),
+                meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
+            )
+        elif k == "bool":
+            df[col] = df[col].map_partitions(
+                lambda s: s.astype(DTYPE_BOOL),
+                meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
+            )
+
+    return df
+
+
+def _normalize_ddf_expected_types(merged: dd.DataFrame, translation_config: dict | None) -> dd.DataFrame:
+    """Normalize expected/core columns on a merged Dask DataFrame prior to import."""
+    expected_types = dict(_EXPECTED_TYPES)
+
+    # 1) Core expected types
+    for col, dtype in expected_types.items():
+        if col not in merged.columns:
+            continue
+        try:
+            if dtype == DTYPE_STR:
+                merged[col] = merged[col].map_partitions(
+                    _normalize_string_series_to_na,
+                    meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
+                )
+            elif dtype is DTYPE_FLOAT:
+                merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
+                    lambda s: s.astype(DTYPE_FLOAT),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
+                )
+            elif dtype is DTYPE_INT8:
+                merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
+                    lambda s: s.astype(DTYPE_INT8),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
+                )
+            elif dtype is DTYPE_INT:
+                merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
+                    lambda s: s.astype(DTYPE_INT),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
+                )
+            elif dtype is DTYPE_BOOL:
+                merged[col] = merged[col].map_partitions(
+                    lambda s: s.astype(DTYPE_BOOL),
+                    meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
+                )
+        except Exception:
+            # Best-effort only
+            pass
+
+    # 2) Prev/expr columns
+    cfg = translation_config or {}
+    schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
+    merged = _coerce_optional_columns_for_import(merged, schema_hints_local)
+
+    return merged
+
+
+# -----------------------
+# Parquet writer helper (legacy path)
+# -----------------------
+def _safe_to_parquet(ddf, path, **kwargs) -> None:
+    """Write Parquet robustly for both plain Dask and nested_dask frames.
+
+    Tries engine="pyarrow"; if backend already sets an engine, retries without it.
+    """
+    try:
+        ddf.to_parquet(path, engine="pyarrow", **kwargs)
+    except TypeError as e:
+        if "multiple values for keyword argument 'engine'" in str(e):
+            ddf.to_parquet(path, **kwargs)
+        else:
+            raise
+
+
 # =======================
 # Main logic
 # =======================
@@ -254,21 +414,13 @@ def crossmatch_tiebreak(
     logs_dir: str,
     temp_dir: str,
     step,
-    client,  # required if do_import=True
+    client,  # kept for signature compatibility (used in legacy import path)
     translation_config: dict | None = None,
-    do_import: bool = True,
-):
-    """Crossmatch two catalogs, update `compared_to`, and save/import the merged result.
+    do_import: bool = True,  # kept for signature compatibility; ignored in both paths (we always return a collection)
+) -> str:
+    """Crossmatch two catalogs, update `compared_to`, then export to a collection.
 
-    Steps:
-      1) Crossmatch `left_cat` vs `right_cat` (default radius 0.75 arcsec).
-      2) Build undirected adjacency (CRD_ID ↔ CRD_ID) without self-pairs.
-      3) Update `compared_to` on both sides by unioning neighbors.
-      4) Concatenate, harmonize key dtypes, and write Parquet.
-      5) Optionally import as a Collection (margin-first fallback).
-
-    Returns:
-      Collection path (if imported) or merged Parquet folder path if `do_import=False`.
+    Behavior depends on USE_LSDB_CONCAT (see module docstring).
     """
     logger = _get_logger()
     t0_all = time.time()
@@ -278,11 +430,11 @@ def crossmatch_tiebreak(
     k = int((translation_config or {}).get("crossmatch_n_neighbors", 10))
 
     logger.info(
-        "START crossmatch_update_compared_to: step=%s radius=%.3f\" n_neighbors=%d import=%s",
+        "START crossmatch_update_compared_to: step=%s radius=%.3f\" n_neighbors=%d backend=%s",
         step,
         radius,
         k,
-        bool(do_import),
+        ("LSDB+to_hats" if USE_LSDB_CONCAT else "Dask+Parquet+import"),
     )
 
     # 1) Spatial crossmatch
@@ -314,8 +466,10 @@ def crossmatch_tiebreak(
         time.time() - t0,
     )
 
-    # 3) Ensure `compared_to` meta and update both catalogs partition-wise
-    def _meta_with_compared_to(meta_df: pd.DataFrame) -> pd.DataFrame:
+    # 3) Update `compared_to` on both catalogs, partition-wise
+    t0 = time.time()
+
+    def _ensure_meta(meta_df: pd.DataFrame) -> pd.DataFrame:
         m = meta_df.copy()
         if "compared_to" not in m.columns:
             m["compared_to"] = pd.Series(pd.array([], dtype=DTYPE_STR))
@@ -323,96 +477,40 @@ def crossmatch_tiebreak(
             m["compared_to"] = pd.Series(pd.array([], dtype=DTYPE_STR))
         return m
 
-    t0 = time.time()
-    left_meta = _meta_with_compared_to(left_cat._ddf._meta)
-    right_meta = _meta_with_compared_to(right_cat._ddf._meta)
+    left_meta = _ensure_meta(left_cat._ddf._meta)
+    right_meta = _ensure_meta(right_cat._ddf._meta)
 
     left_updated = left_cat.map_partitions(_merge_compared_to_partition, pairs_adj, meta=left_meta)
     right_updated = right_cat.map_partitions(_merge_compared_to_partition, pairs_adj, meta=right_meta)
     logger.info("Compared_to updated on partitions (%.2fs)", time.time() - t0)
 
-    # 4) Concatenate the updated frames
-    t0 = time.time()
-    merged = dd.concat([left_updated._ddf, right_updated._ddf])
-
-    # 5) Normalize expected dtypes (focus on compared_to; keep others if present)
-    expected_types = {
-        "CRD_ID": DTYPE_STR,
-        "id": DTYPE_STR,
-        "ra": DTYPE_FLOAT,
-        "dec": DTYPE_FLOAT,
-        "z": DTYPE_FLOAT,
-        "z_flag": DTYPE_FLOAT,
-        "z_err": DTYPE_FLOAT,
-        "instrument_type": DTYPE_STR,
-        "survey": DTYPE_STR,
-        "source": DTYPE_STR,
-        "tie_result": DTYPE_INT8,
-        "z_flag_homogenized": DTYPE_FLOAT,
-        "instrument_type_homogenized": DTYPE_STR,
-        "compared_to": DTYPE_STR,
-    }
-    for col, dtype in expected_types.items():
-        if col not in merged.columns:
-            continue
-        try:
-            if dtype == DTYPE_STR:
-                merged[col] = merged[col].map_partitions(
-                    _normalize_string_series_to_na,
-                    meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
-                )
-            elif dtype is DTYPE_FLOAT:
-                merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
-                    lambda s: s.astype(DTYPE_FLOAT),
-                    meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
-                )
-            elif dtype is DTYPE_INT8:
-                merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
-                    lambda s: s.astype(DTYPE_INT8),
-                    meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
-                )
-            elif dtype is DTYPE_INT:
-                merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
-                    lambda s: s.astype(DTYPE_INT),
-                    meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
-                )
-            elif dtype is DTYPE_BOOL:
-                merged[col] = merged[col].map_partitions(
-                    lambda s: s.astype(DTYPE_BOOL),
-                    meta=pd.Series(pd.array([], dtype=DTYPE_BOOL)),
-                )
-        except Exception as e:
-            logger.warning("Failed to cast column '%s' to %s: %s", col, dtype, e)
-
-    # 5b) Coerce prev/expr columns to stable Arrow dtypes across partitions
-    cfg = translation_config or {}
-    schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
-    if schema_hints_local:
-        merged = _coerce_optional_columns_for_import(merged, schema_hints_local)
-
-    logger.info("Type normalization complete (%.2fs)", time.time() - t0)
-
-    # 6) Save merged parquet
-    t0 = time.time()
-    merged_path = os.path.join(temp_dir, f"merged_step{step}")
-    _safe_to_parquet(merged, merged_path, write_index=False)
-    logger.info("Parquet written: path=%s (%.2fs)", merged_path, time.time() - t0)
-
-    # 7) Optional import (Collection)
-    if do_import:
+    # 4) Export path A: LSDB concat + to_hats
+    if USE_LSDB_CONCAT:
+        # Normalize dtypes on each catalog independently *before* concat
         t0 = time.time()
-        logger.info("START import_collection: step=%s parquet=%s", step, merged_path)
-        schema_hints = schema_hints_local if schema_hints_local else None
+        left_fixed = _normalize_catalog_dtypes(left_updated, translation_config)
+        right_fixed = _normalize_catalog_dtypes(right_updated, translation_config)
+        logger.info("Per-catalog type normalization attached (lazy) (%.2fs)", time.time() - t0)
 
-        collection_path = _build_collection_with_retry(
-            parquet_path=merged_path,
-            logs_dir=logs_dir,         # interface symmetry; central logger is used
-            logger=logger,
-            client=client,
-            try_margin=True,
-            schema_hints=schema_hints,
+        # Concatenate at the LSDB catalog level
+        t0 = time.time()
+        merged_cat = left_fixed.concat(right_fixed)
+        logger.info("LSDB concat done (%.2fs)", time.time() - t0)
+
+        # Persist as HATS collection and return path
+        t0 = time.time()
+        collection_path = os.path.join(temp_dir, f"merged_step{step}_hats")
+        merged_cat.to_hats(
+            collection_path,
+            as_collection=True,
+            overwrite=True,
         )
-        logger.info("END import_collection: step=%s path=%s (%.2fs)", step, collection_path, time.time() - t0)
+        logger.info(
+            "Write complete (to_hats): step=%s path=%s (%.2fs)",
+            step,
+            collection_path,
+            time.time() - t0,
+        )
         logger.info(
             "END crossmatch_update_compared_to: step=%s links=%d nodes=%d output=%s (%.2fs)",
             step,
@@ -423,15 +521,44 @@ def crossmatch_tiebreak(
         )
         return collection_path
 
+    # 4b) Export path B (legacy): Dask concat + Parquet + import
+    t0 = time.time()
+    lddf = left_updated._ddf
+    rddf = right_updated._ddf
+    merged = dd.concat([lddf, rddf])
+    merged = _normalize_ddf_expected_types(merged, translation_config)
+    logger.info("Dask concat + type normalization (lazy) (%.2fs)", time.time() - t0)
+
+    t0 = time.time()
+    merged_path = os.path.join(temp_dir, f"merged_step{step}")
+    _safe_to_parquet(merged, merged_path, write_index=False)
+    logger.info("Parquet written: path=%s (%.2fs)", merged_path, time.time() - t0)
+
+    # Import as Collection (margin-first, with optional schema hints)
+    t0 = time.time()
+    cfg = translation_config or {}
+    schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
+    schema_hints = schema_hints_local if schema_hints_local else None
+
+    logger.info("START import_collection: step=%s parquet=%s", step, merged_path)
+    collection_path = _build_collection_with_retry(
+        parquet_path=merged_path,
+        logs_dir=logs_dir,
+        logger=logger,
+        client=client,
+        try_margin=True,
+        schema_hints=schema_hints,
+    )
+    logger.info("END import_collection: step=%s path=%s (%.2fs)", step, collection_path, time.time() - t0)
     logger.info(
         "END crossmatch_update_compared_to: step=%s links=%d nodes=%d output=%s (%.2fs)",
         step,
         total_links,
         len(pairs_adj),
-        merged_path,
+        collection_path,
         time.time() - t0_all,
     )
-    return merged_path
+    return collection_path
 
 
 def crossmatch_tiebreak_safe(
@@ -440,19 +567,24 @@ def crossmatch_tiebreak_safe(
     logs_dir: str,
     temp_dir: str,
     step,
-    client,  # required if do_import=True
+    client,  # used in legacy import path
     translation_config: dict | None = None,
-    do_import: bool = True,
-):
+    do_import: bool = True,  # ignored; always returns a collection
+) -> str:
     """Wrapper around `crossmatch_tiebreak` with graceful empty-overlap fallback.
 
-    If the crossmatch yields a known empty-overlap condition, concatenates inputs
-    (no new `compared_to` links), writes the merged Parquet, optionally imports
-    as a Collection, and returns the path.
+    If the crossmatch yields a known empty-overlap condition:
+      - LSDB path: ensure `compared_to`, normalize each catalog, LSDB concat,
+        `to_hats`, return collection.
+      - Legacy path: ensure `compared_to`, Dask concat, Parquet, import, return collection.
     """
     logger = _get_logger()
     t0_safe = time.time()
-    logger.info("START xmatch_update_compared_to_safe: step=%s import=%s", step, bool(do_import))
+    logger.info(
+        "START xmatch_update_compared_to_safe: step=%s backend=%s",
+        step,
+        ("LSDB+to_hats" if USE_LSDB_CONCAT else "Dask+Parquet+import"),
+    )
 
     try:
         out = crossmatch_tiebreak(
@@ -463,7 +595,7 @@ def crossmatch_tiebreak_safe(
             step=step,
             client=client,
             translation_config=translation_config,
-            do_import=do_import,
+            do_import=do_import,  # ignored internally
         )
         logger.info("END xmatch_update_compared_to_safe: step=%s output=%s (%.2fs)", step, out, time.time() - t0_safe)
         return out
@@ -473,41 +605,34 @@ def crossmatch_tiebreak_safe(
         if ("The output catalog is empty" in msg) or ("Catalogs do not overlap" in msg):
             logger.info("Empty-overlap condition detected: %s", msg)
 
-            # Ensure `compared_to` exists with Arrow string dtype on both sides
-            lddf = left_cat._ddf
-            rddf = right_cat._ddf
-            if "compared_to" not in lddf.columns:
-                lddf = _add_missing_with_dtype(lddf, "compared_to", DTYPE_STR)
-            if "compared_to" not in rddf.columns:
-                rddf = _add_missing_with_dtype(rddf, "compared_to", DTYPE_STR)
+            # Ensure `compared_to` exists on both sides
+            def _ensure_compared_to(cat):
+                def _ensure_col(part: pd.DataFrame) -> pd.DataFrame:
+                    if "compared_to" not in part.columns:
+                        part = part.copy()
+                        part["compared_to"] = pd.Series(pd.array([pd.NA] * len(part), dtype=DTYPE_STR), index=part.index)
+                    return part
 
-            # Save merged result
-            t0 = time.time()
-            merged = dd.concat([lddf, rddf])
-            merged_path = os.path.join(temp_dir, f"merged_step{step}")
-            _safe_to_parquet(merged, merged_path, write_index=False)
-            logger.info("Parquet written (safe path): %s (%.2fs)", merged_path, time.time() - t0)
+                meta = cat._ddf._meta.copy()
+                if "compared_to" not in meta.columns:
+                    meta["compared_to"] = pd.Series(pd.array([], dtype=DTYPE_STR))
+                return cat.map_partitions(_ensure_col, meta=meta)
 
-            if do_import:
-                t0 = time.time()
-                logger.info("START import_collection_safe: step=%s parquet=%s", step, merged_path)
-                cfg = translation_config or {}
-                schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
-                schema_hints = schema_hints_local if schema_hints_local else None
+            left_ready = _ensure_compared_to(left_cat)
+            right_ready = _ensure_compared_to(right_cat)
 
-                collection_path = _build_collection_with_retry(
-                    parquet_path=merged_path,
-                    logs_dir=logs_dir,
-                    logger=logger,
-                    client=client,
-                    try_margin=True,
-                    schema_hints=schema_hints,
-                )
-                logger.info(
-                    "END import_collection_safe: step=%s path=%s (%.2fs)",
-                    step,
+            if USE_LSDB_CONCAT:
+                # Normalize dtypes per catalog, then LSDB concat and write HATS
+                left_fixed = _normalize_catalog_dtypes(left_ready, translation_config)
+                right_fixed = _normalize_catalog_dtypes(right_ready, translation_config)
+
+                merged_cat = left_fixed.concat(right_fixed)
+
+                collection_path = os.path.join(temp_dir, f"merged_step{step}_hats")
+                merged_cat.to_hats(
                     collection_path,
-                    time.time() - t0,
+                    as_collection=True,
+                    overwrite=True,
                 )
                 logger.info(
                     "END xmatch_update_compared_to_safe: step=%s output=%s (%.2fs)",
@@ -517,13 +642,34 @@ def crossmatch_tiebreak_safe(
                 )
                 return collection_path
 
+            # Legacy path: Dask concat + Parquet + import
+            lddf = left_ready._ddf
+            rddf = right_ready._ddf
+            merged = dd.concat([lddf, rddf])
+            merged = _normalize_ddf_expected_types(merged, translation_config)
+
+            merged_path = os.path.join(temp_dir, f"merged_step{step}")
+            _safe_to_parquet(merged, merged_path, write_index=False)
+
+            cfg = translation_config or {}
+            schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
+            schema_hints = schema_hints_local if schema_hints_local else None
+
+            collection_path = _build_collection_with_retry(
+                parquet_path=merged_path,
+                logs_dir=logs_dir,
+                logger=logger,
+                client=client,
+                try_margin=True,
+                schema_hints=schema_hints,
+            )
             logger.info(
                 "END xmatch_update_compared_to_safe: step=%s output=%s (%.2fs)",
                 step,
-                merged_path,
+                collection_path,
                 time.time() - t0_safe,
             )
-            return merged_path
+            return collection_path
 
         # Unexpected exceptions are re-raised
         raise

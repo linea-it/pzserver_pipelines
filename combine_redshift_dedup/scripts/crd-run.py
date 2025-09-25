@@ -694,14 +694,26 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         if combine_mode == "concatenate":
             # Simple concat mode still passes through consolidation phase later.
             log_cross.info("Concatenate mode selected (no crossmatch).")
-            df_final = dd.concat([dd.read_parquet(i["prepared_path"]) for i in prepared_info]).compute()
+            try:
+                log_cross.info("Concatenating %d prepared catalogs.", len(prepared_info))
+                for _pi in prepared_info[:5]:
+                    log_cross.debug("Prepared path candidate: %s", _pi.get("prepared_path"))
+                df_final = dd.concat([dd.read_parquet(i["prepared_path"]) for i in prepared_info])
+                # small schema sanity without pulling whole data
+                _ = df_final.head(1, compute=True)
+                df_final = df_final.compute()
+                log_cross.info("Concatenate compute finished: shape=%s", tuple(df_final.shape))
+            except Exception as e:
+                import traceback as _tb
+                log_cross.error("FAILED while concatenating prepared catalogs: %s\n%s", repr(e), _tb.format_exc())
+                raise
 
-            current_workers = len(client.scheduler_info().get("workers", {}))
-            log_cross.info(
-                "WORKERS STILL RUNNING=%d.",
-                current_workers,
-            )
-            
+            try:
+                current_workers = len(client.scheduler_info().get("workers", {}))
+                log_cross.info("WORKERS STILL RUNNING=%d.", current_workers)
+            except Exception as e:
+                log_cross.debug("Could not query scheduler_info workers: %s", e)
+
             log_cross.info("END crossmatch: concatenate mode (no crossmatch performed)")
 
             # Consolidation will run below
@@ -720,8 +732,15 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
             else:
                 # === Normal iterative crossmatch flow ===
-                init = prepared_info[0]
-                cat_prev = lsdb.open_catalog(init["collection_path"])  # *_hats_auto
+                try:
+                    init = prepared_info[0]
+                    log_cross.info("Opening initial *_hats_auto catalog: %s", init.get("collection_path"))
+                    cat_prev = lsdb.open_catalog(init["collection_path"])  # *_hats_auto
+                except Exception as e:
+                    import traceback as _tb
+                    log_cross.error("FAILED to open initial catalog '%s': %s\n%s", init.get("collection_path"), repr(e), _tb.format_exc())
+                    raise
+
                 start_i = 1
                 final_collection_path = None  # set when last step finishes
 
@@ -732,59 +751,104 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     if tag in completed:
                         log_cross.info("Skip completed step: %s", tag)
                         resume_key = f"{tag}.collection_path"
-                        resumed_col = _resume_get(resume_log, resume_key)
-                        resumed_col = _normalize_collection_root(resumed_col)
+                        try:
+                            resumed_col = _resume_get(resume_log, resume_key)
+                            resumed_col = _normalize_collection_root(resumed_col)
+                        except Exception as e:
+                            resumed_col = None
+                            log_cross.warning("Could not read/normalize resume key '%s': %s", resume_key, e)
+
                         if resumed_col and _is_collection_root(resumed_col):
                             log_cross.info("Resume collection root for %s: %s", tag, resumed_col)
-                            cat_prev = lsdb.open_catalog(resumed_col)
+                            try:
+                                cat_prev = lsdb.open_catalog(resumed_col)
+                            except Exception as e:
+                                import traceback as _tb
+                                log_cross.error("FAILED to open resumed catalog '%s': %s\n%s", resumed_col, repr(e), _tb.format_of_exc())
+                                raise
                             if i == final_step:
                                 final_collection_path = resumed_col
                         elif i == final_step and final_collection_path is None:
-                            guessed = _guess_collection_for_step(temp_dir, i)
+                            try:
+                                guessed = _guess_collection_for_step(temp_dir, i)
+                            except Exception as e:
+                                guessed = None
+                                log_cross.debug("Could not guess collection for step %d: %s", i, e)
                             if guessed:
                                 log_cross.info("Guessed collection root for %s: %s", tag, guessed)
                                 final_collection_path = guessed
                         continue
 
                     # Open next *_hats_auto catalog and crossmatch
-                    cat_curr = lsdb.open_catalog(info_i["collection_path"])
-                    target_name = info_i["internal_name"]
-                    log_cross.info("Crossmatching previous result with: %s", target_name)
+                    try:
+                        cat_path = info_i["collection_path"]
+                        target_name = info_i["internal_name"]
+                        log_cross.info("Crossmatching previous result with: %s", target_name)
+                        log_cross.debug("Opening right-hand catalog: %s", cat_path)
+                        cat_curr = lsdb.open_catalog(cat_path)
+                    except Exception as e:
+                        import traceback as _tb
+                        log_cross.error("FAILED to open right-hand catalog '%s' for step %d: %s\n%s",
+                                        info_i.get("collection_path"), i, repr(e), _tb.format_exc())
+                        raise
 
                     is_last = (i == final_step)
-                    crossmatch_result = crossmatch_tiebreak_safe(
-                        left_cat=cat_prev,
-                        right_cat=cat_curr,
-                        logs_dir=logs_dir,
-                        temp_dir=temp_dir,
-                        step=i,
-                        client=client,
-                        translation_config=translation_config,
-                        do_import=True,  # returns collection path (root or subcat)
-                    )
+                    try:
+                        t0 = time.time()
+                        crossmatch_result = crossmatch_tiebreak_safe(
+                            left_cat=cat_prev,
+                            right_cat=cat_curr,
+                            logs_dir=logs_dir,
+                            temp_dir=temp_dir,
+                            step=i,
+                            client=client,
+                            translation_config=translation_config,
+                            do_import=True,  # returns collection path (root or subcat)
+                        )
+                        log_cross.info("crossmatch_tiebreak_safe finished in %.2fs", time.time() - t0)
+                    except Exception as e:
+                        import traceback as _tb
+                        log_cross.error("FAILED during crossmatch_tiebreak_safe at step %d: %s\n%s", i, repr(e), _tb.format_exc())
+                        raise
 
-                    log_cross.info("Raw crossmatch path returned: %s", crossmatch_result)
-                    norm = _normalize_collection_root(crossmatch_result)
-                    if norm != crossmatch_result:
-                        log_cross.info("Normalized to collection root: %s", norm)
+                    try:
+                        log_cross.info("Raw crossmatch path returned: %s", crossmatch_result)
+                        norm = _normalize_collection_root(crossmatch_result)
+                        if norm != crossmatch_result:
+                            log_cross.info("Normalized to collection root: %s", norm)
+                        if not _is_hats_collection(norm):
+                            log_cross.warning("Returned path does not look like a HATS collection: %s", crossmatch_result)
+                    except Exception as e:
+                        import traceback as _tb
+                        log_cross.error("FAILED after crossmatch result normalization at step %d: %s\n%s", i, repr(e), _tb.format_exc())
+                        raise
 
-                    if not _is_hats_collection(norm):
-                        log_cross.warning("Returned path does not look like a HATS collection: %s", crossmatch_result)
+                    try:
+                        cat_prev = lsdb.open_catalog(norm)
+                        _resume_set(resume_log, f"{tag}.collection_path", norm, log_cross)
+                        if is_last:
+                            final_collection_path = norm
+                    except Exception as e:
+                        import traceback as _tb
+                        log_cross.error("FAILED to open/set resume for step %d (path=%s): %s\n%s", i, norm, repr(e), _tb.format_exc())
+                        raise
 
-                    cat_prev = lsdb.open_catalog(norm)
-                    _resume_set(resume_log, f"{tag}.collection_path", norm, log_cross)
-                    if is_last:
-                        final_collection_path = norm
+                    try:
+                        log_step(resume_log, tag)
+                    except Exception as e:
+                        log_cross.debug("Could not log step '%s' to resume: %s", tag, e)
 
-                    log_step(resume_log, tag)
                     if delete_temp_files:
-                        _cleanup_previous_step(i, prepared_info, temp_dir, log_cross)
+                        try:
+                            _cleanup_previous_step(i, prepared_info, temp_dir, log_cross)
+                        except Exception as e:
+                            log_cross.warning("Cleanup after step %d failed (non-fatal): %s", i, e)
 
-                current_workers = len(client.scheduler_info().get("workers", {}))
-                log_cross.info(
-                    "WORKERS STILL RUNNING=%d.",
-                    current_workers,
-                )
+                try:
+                    current_workers = len(client.scheduler_info().get("workers", {}))
+                    log_cross.info("WORKERS STILL RUNNING=%d.", current_workers)
+                except Exception as e:
+                    log_cross.debug("Could not query scheduler_info workers: %s", e)
 
                 log_cross.info("END crossmatch: graph merge completed")
                 start_consolidate = False
@@ -808,16 +872,6 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     if guessed:
                         final_collection_path = guessed
                         log_dedup.info("Guessed final collection root from disk: %s", final_collection_path)
-
-            final_merged_path = os.path.join(temp_dir, f"merged_step{final_step}")
-            if not os.path.exists(final_merged_path):
-                log_dedup.error("Final merged Parquet folder not found: %s", final_merged_path)
-                client.close()
-                cluster.close()
-                return
-
-            n_before = int(dd.read_parquet(final_merged_path).shape[0].compute())
-            log_dedup.info("Rows before dedup (final_merged): %d", n_before)
 
             use_distributed = final_collection_path is not None and _is_collection_root(final_collection_path)
 
@@ -845,45 +899,23 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             #######################################################################
 
             if use_distributed:
-                log_dedup.info("Running graph-based dedup on final merged collection (map_partitions)")
+                log_dedup.info("Running graph-based dedup on final merged collection (Dask merge with catalog ._ddf)")
                 final_collection_path = _normalize_collection_root(final_collection_path)
                 log_dedup.info("final_collection_root: %s", final_collection_path)
 
                 if not _is_collection_root(final_collection_path):
                     raise RuntimeError(f"Expected collection root at: {final_collection_path}")
 
-                # Discover subcatalogs
-                base = os.path.basename(final_collection_path.rstrip("/"))
-                main_subcat_path = os.path.join(final_collection_path, base)
-                log_dedup.info("Expected main subcatalog path: %s", main_subcat_path)
-                if not _is_hats_subcatalog(main_subcat_path):
-                    raise RuntimeError(f"Main subcatalog not found: {main_subcat_path}")
-
-                final_cat = lsdb.open_catalog(main_subcat_path)
-                log_dedup.info("Opened main subcatalog.")
-
-                # Optional margin (*arcs), prefer 5arcs if present
-                arcs_candidates = [p for p in glob.glob(os.path.join(final_collection_path, "*arcs")) if _is_hats_subcatalog(p)]
-                if arcs_candidates:
-                    def _arc_val(p):
-                        m = re.search(r"([\d.]+)\s*arcs$", os.path.basename(p))
-                        return float(m.group(1)) if m else float("inf")
-                    if any(abs(_arc_val(p) - 5.0) < 1e-12 for p in arcs_candidates):
-                        pick = min(arcs_candidates, key=lambda p: abs(_arc_val(p) - 5.0))
-                    else:
-                        pick = min(arcs_candidates, key=lambda p: _arc_val(p))
-                    log_dedup.info("Attaching margin subcatalog: %s", pick)
-                    final_cat.margin = lsdb.open_catalog(pick)
-                else:
-                    log_dedup.info("No *arcs margin found; proceeding without margin.")
-                    final_cat.margin = None
-
-                if not hasattr(final_cat, "_ddf"):
-                    raise RuntimeError("Main subcatalog does not expose _ddf.")
-
-                # Compute labels per partition. Guard-restore is inside deduplicate_pandas.
+                # Open the LSDB collection directly (no subcatalog hunting, no margins here)
                 try:
-                    labels = run_dedup_with_lsdb_map_partitions(
+                    final_cat = lsdb.open_catalog(final_collection_path)
+                    log_dedup.info("Opened LSDB collection at root path.")
+                except Exception as e:
+                    raise RuntimeError(f"Could not open LSDB collection at: {final_collection_path}") from e
+
+                # Build labels lazily over the catalog
+                try:
+                    labels_dd = run_dedup_with_lsdb_map_partitions(
                         final_cat,
                         tiebreaking_priority=tiebreaking_priority_cfg,
                         instrument_type_priority=(instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None),
@@ -895,41 +927,42 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                         edge_log=edge_log,
                         group_col=group_col,
                     )
-                    log_dedup.info("Labels Dask graph built (lazy). Preparing merge...")
+                    log_dedup.info("Labels graph built (lazy). Preparing RHS for Dask merge...")
                 except Exception as e:
                     import traceback as _tb
-                    log_dedup.error("FAILED while building labels Dask graph: %s\n%s", repr(e), _tb.format_exc())
+                    log_dedup.error("FAILED while building labels graph: %s\n%s", repr(e), _tb.format_exc())
                     raise
 
-                # Read once for the final merge; align CRD_ID dtypes with labels.
+                # Prepare RHS minimal schema (Dask DataFrame)
                 try:
-                    df_all = dd.read_parquet(final_merged_path)
-                    try:
-                        df_all  = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
-                        labels  = labels.assign(CRD_ID=labels["CRD_ID"].astype("string[pyarrow]"))
-                    except Exception:
-                        df_all  = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
-                        labels  = labels.assign(CRD_ID=labels["CRD_ID"].astype("string"))
-                    log_dedup.info("Aligned CRD_ID dtypes between base and labels.")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while reading base parquet or aligning dtypes: %s\n%s", repr(e), _tb.format_exc())
-                    raise
-
-                # Keep only the columns needed for the merge; rename tie_result.
-                try:
-                    rhs_dd = labels.rename(columns={"tie_result": "tie_result_new"})
+                    rhs_dd = labels_dd.rename(columns={"tie_result": "tie_result_new"})
                     keep_cols = ["CRD_ID", "tie_result_new"]
                     if group_col and (group_col in rhs_dd.columns):
                         keep_cols.append(group_col)
                     rhs_dd = rhs_dd[keep_cols]
-                    log_dedup.info("Prepared labels rhs_dd with columns: %s", keep_cols)
+                    log_dedup.info("Prepared RHS columns: %s", keep_cols)
                 except Exception as e:
                     import traceback as _tb
-                    log_dedup.error("FAILED while preparing rhs_dd: %s\n%s", repr(e), _tb.format_exc())
+                    log_dedup.error("FAILED while preparing RHS labels: %s\n%s", repr(e), _tb.format_exc())
                     raise
 
-                # Clear divisions before shuffle-based merge (assign back!).
+                # Base Dask DataFrame from the LSDB collection
+                try:
+                    df_all = final_cat._ddf
+                    # Align join key dtype defensively
+                    try:
+                        df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
+                        rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string[pyarrow]"))
+                    except Exception:
+                        df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
+                        rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string"))
+                    log_dedup.info("Aligned CRD_ID dtype on both sides.")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while preparing base from catalog: %s\n%s", repr(e), _tb.format_exc())
+                    raise
+
+                # Clear divisions and perform the distributed merge
                 try:
                     try:
                         df_all = df_all.clear_divisions()
@@ -939,159 +972,52 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                         rhs_dd = rhs_dd.clear_divisions()
                     except Exception:
                         pass
-                    log_dedup.info("Cleared divisions for shuffle merge.")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while clearing divisions: %s\n%s", repr(e), _tb.format_exc())
-                    raise
-
-                # Merge and compute labels to catch issues early
-                try:
                     with dask.config.set({"dataframe.shuffle.method": "tasks"}):
                         merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
-                    log_dedup.info("Dask merge graph built (lazy). Computing a small sample for sanity...")
-                    # Compute a small sample to validate schema early
-                    _ = merged.head(1)
-                    log_dedup.info("Merge sample computed successfully.")
+                    log_dedup.info("Dask merge graph built (lazy).")
                 except Exception as e:
                     import traceback as _tb
-                    log_dedup.error("FAILED during merge (distributed branch): %s\n%s", repr(e), _tb.format_exc())
+                    log_dedup.error("FAILED during Dask merge: %s\n%s", repr(e), _tb.format_exc())
+                    raise
+
+                # Coalesce tie_result in Dask (still lazy)
+                try:
+                    if "tie_result" in merged.columns:
+                        merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
+                    else:
+                        merged = merged.assign(tie_result=merged["tie_result_new"])
+                    if "tie_result_new" in merged.columns:
+                        merged = merged.drop(columns=["tie_result_new"])
+                    log_dedup.info("Coalesced tie_result (lazy).")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while coalescing tie_result: %s\n%s", repr(e), _tb.format_exc())
+                    raise
+
+                # Final materialization: compute only once, at the very end
+                try:
+                    # Small sanity check without pulling everything
+                    _ = merged.head(1)
+                    df_final = merged.compute()
+
+                    if "group_id" in df_final.columns:
+                        dup = df_final["group_id"].value_counts(dropna=True)
+                        n_big = int((dup > 1).sum())
+                        log_dedup.info("Sanity group_id: uniques=%d, ids_with_>1_occurrences=%d", int(dup.size), n_big)
+                    else:
+                        log_dedup.info("No group_id column present after dedup; skipping sanity counts.")
+
+                    current_workers = len(client.scheduler_info().get("workers", {}))
+                    log_dedup.info("WORKERS STILL RUNNING=%d.", current_workers)
+                    log_dedup.info("END deduplication: labels merged back into final dataframe (Dask)")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while computing final dataframe: %s\n%s", repr(e), _tb.format_exc())
                     raise
 
             else:
-                log_dedup.warning(
-                    "final_collection_path missing or not a collection root; falling back to driver-side pandas dedup."
-                )
-                try:
-                    base_dd = dd.read_parquet(final_merged_path, engine="pyarrow", split_row_groups=True)
-                    available = set(map(str, base_dd.columns))
-                    required_base = {"CRD_ID", "compared_to", "z"}
-                    missing_base = sorted(required_base - available)
-                    if missing_base:
-                        raise KeyError(f"Missing required columns: {missing_base}")
-
-                    priority_set = set(tiebreaking_priority_cfg or [])
-                    missing_priority = sorted([c for c in priority_set if c not in available])
-                    if missing_priority:
-                        raise KeyError(f"Missing priority columns: {missing_priority}")
-
-                    optional_candidates = {"z_flag_homogenized", "instrument_type_homogenized"}
-                    optional_present = (optional_candidates - priority_set) & available
-                    maybe_tie_result = {"tie_result"} & available  # bring original tie_result if present
-                    needed = sorted(required_base | priority_set | optional_present | maybe_tie_result)
-                    pdf = base_dd[needed].compute()
-                    log_dedup.info("Driver-side dataframe computed for dedup: shape=%s", tuple(pdf.shape))
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while loading base data for driver-side dedup: %s\n%s", repr(e), _tb.format_exc())
-                    raise
-
-                # Run solver on driver (guard-restore happens inside).
-                try:
-                    pdf_out = deduplicate_pandas(
-                        pdf,
-                        tiebreaking_priority=tiebreaking_priority_cfg,
-                        instrument_type_priority=instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None,
-                        delta_z_threshold=delta_z_threshold_cfg,
-                        crd_col="CRD_ID",
-                        compared_col="compared_to",
-                        z_col="z",
-                        tie_col="tie_result",
-                        edge_log=edge_log,
-                        partition_tag="[driver]",
-                        logger=_phase_logger(),
-                        group_col=group_col,
-                    )
-                    log_dedup.info("Driver-side labels computed: shape=%s", tuple(pdf_out.shape))
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED inside deduplicate_pandas (driver branch): %s\n%s", repr(e), _tb.format_exc())
-                    raise
-
-                # Merge new labels back (driver branch)
-                try:
-                    df_all = dd.read_parquet(final_merged_path)
-                    cols = ["CRD_ID", "tie_result"]
-                    if group_col and (group_col in pdf_out.columns):
-                        cols.append(group_col)
-
-                    rhs_pdf = pdf_out.loc[:, cols].rename(columns={"tie_result": "tie_result_new"})
-                    rhs_dd = dd.from_pandas(rhs_pdf, npartitions=max(1, df_all.npartitions))
-
-                    try:
-                        df_all = df_all.clear_divisions()
-                    except Exception:
-                        pass
-                    try:
-                        rhs_dd = rhs_dd.clear_divisions()
-                    except Exception:
-                        pass
-
-                    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-                        merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
-                    log_dedup.info("Driver-side merge graph built.")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED during merge (driver branch): %s\n%s", repr(e), _tb.format_exc())
-                    raise
-
-            # Coalesce tie_result with the newly computed labels.
-            try:
-                if "tie_result" in merged.columns:
-                    merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
-                else:
-                    merged = merged.assign(tie_result=merged["tie_result_new"])
-                merged = merged.drop(columns=["tie_result_new"])
-                log_dedup.info("Coalesced tie_result with new labels.")
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED while coalescing tie_result: %s\n%s", repr(e), _tb.format_exc())
-                raise
-
-            # Stable dtypes for final output.
-            try:
-                try:
-                    merged = merged.clear_divisions()
-                except Exception:
-                    pass
-
-                merged["tie_result"] = merged["tie_result"].astype("Int8")
-                if "group_id" in merged.columns:
-                    merged["group_id"] = merged["group_id"].astype("Int64")
-                log_dedup.info("Final dtypes stabilized for tie_result/group_id.")
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED while stabilizing final dtypes: %s\n%s", repr(e), _tb.format_exc())
-                raise
-
-            # Materialize result.
-            try:
-                try:
-                    df_final_dd = merged.clear_divisions()
-                except Exception:
-                    df_final_dd = merged
-
-                # Extra sanity before compute
-                head_sample = df_final_dd.head(1, compute=True)
-                log_dedup.info("Pre-compute sample OK: columns=%s", list(head_sample.columns))
-
-                df_final = df_final_dd.compute()
-
-                dup = df_final["group_id"].value_counts(dropna=True)
-                n_big = int((dup > 1).sum())
-                log_dedup.info("Sanity group_id: uniques=%d, ids_com_>1_ocorr=%d", int(dup.size), n_big)
-
-                current_workers = len(client.scheduler_info().get("workers", {}))
-                log_dedup.info(
-                    "WORKERS STILL RUNNING=%d.",
-                    current_workers,
-                )
-
-                log_dedup.info("END deduplication: labels merged back into final dataframe")
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED while computing final dataframe: %s\n%s", repr(e), _tb.format_exc())
-                raise
+                # We require a valid LSDB collection root; Parquet fallback is no longer supported.
+                raise RuntimeError("Cannot run dedup: missing or invalid LSDB collection root; Parquet fallback removed.")
 
             # Next phase runs below:
             start_consolidate = True
@@ -1108,6 +1034,22 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     log_cons = _phase_logger(base_logger, "consolidation")
     log_cons.info("START consolidation: staging artifacts into process dir (base_dir=%s)", base_dir)
 
+    # Snapshot about df_final to aid debugging
+    try:
+        log_cons.info("df_final shape: %s", tuple(df_final.shape))
+        try:
+            mem_bytes = int(df_final.memory_usage(deep=True).sum())
+            log_cons.info("df_final memory footprint: %.2f MB", mem_bytes / (1024 * 1024))
+        except Exception as e_mem:
+            log_cons.debug("Could not compute memory footprint: %s", e_mem)
+        try:
+            dtypes_preview = {str(k): str(v) for k, v in list(df_final.dtypes.items())[:20]}
+            log_cons.info("df_final dtypes (first 20): %s", dtypes_preview)
+        except Exception as e_dt:
+            log_cons.debug("Could not collect dtype preview: %s", e_dt)
+    except Exception as e_snap:
+        log_cons.warning("Could not snapshot df_final: %s", e_snap)
+
     try:
         n_after_dedup = int(len(df_final))
         log_cons.info("Rows after dedup (in-memory): %d", n_after_dedup)
@@ -1116,43 +1058,80 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
     if combine_mode == "concatenate" and "tie_result" in df_final.columns:
         log_cons.info("Dropping 'tie_result' (concatenate mode)")
-        df_final = df_final.drop(columns=["tie_result"])
+        try:
+            df_final = df_final.drop(columns=["tie_result"])
+        except Exception as e:
+            log_cons.error("FAILED dropping 'tie_result' in concatenate mode: %s", e)
+            raise
 
     if combine_mode == "concatenate_and_remove_duplicates":
         if "tie_result" not in df_final.columns:
             log_cons.warning("Expected 'tie_result' column for removal mode, but it is missing; skipping row filter.")
         else:
-            # Keep only rows marked as winners (tie_result == 1)
-            tie_num = pd.to_numeric(df_final["tie_result"], errors="coerce").fillna(0).astype("int8")
-            keep_mask = tie_num.eq(1)
-            kept = int(keep_mask.sum())
-            dropped = int(len(df_final) - kept)
-            df_final = df_final.loc[keep_mask].copy()
-            log_cons.info("Removed duplicates by tie_result==1: kept=%d rows, dropped=%d rows.", kept, dropped)
+            log_cons.info("Filtering winners by tie_result == 1 (remove-duplicates mode)")
+            try:
+                tie_num = pd.to_numeric(df_final["tie_result"], errors="coerce").fillna(0).astype("int8")
+                keep_mask = tie_num.eq(1)
+                kept = int(keep_mask.sum())
+                dropped = int(len(df_final) - kept)
+                df_final = df_final.loc[keep_mask].copy()
+                log_cons.info("Removed duplicates by tie_result==1: kept=%d rows, dropped=%d rows.", kept, dropped)
+            except Exception as e:
+                log_cons.error("FAILED while filtering by tie_result==1: %s", e)
+                raise
 
     if USE_ARROW_TYPES:
-        df_final = df_final.convert_dtypes(dtype_backend="pyarrow")
-        for c in df_final.columns:
-            if pd.api.types.is_string_dtype(df_final[c].dtype):
-                df_final[c] = df_final[c].astype(DTYPE_STR)
+        log_cons.info("Converting dtypes with dtype_backend='pyarrow' (USE_ARROW_TYPES=True)")
+        try:
+            df_final = df_final.convert_dtypes(dtype_backend="pyarrow")
+            for c in df_final.columns:
+                try:
+                    if pd.api.types.is_string_dtype(df_final[c].dtype):
+                        df_final[c] = df_final[c].astype(DTYPE_STR)
+                except Exception as e_cast:
+                    log_cons.debug("Could not cast column '%s' to Arrow string: %s", c, e_cast)
+        except Exception as e:
+            log_cons.error("FAILED during convert_dtypes(dtype_backend='pyarrow'): %s", e)
+            raise
 
     # Drop all-empty columns
-    to_drop = []
-    for col in df_final.columns:
-        dt = df_final[col].dtype
-        if str(dt) == "string[pyarrow]" or str(dt) == "object":
-            all_missing = df_final[col].apply(lambda x: (pd.isna(x) or str(x).strip() == ""))
+    try:
+        to_drop = []
+        for col in df_final.columns:
+            dt = df_final[col].dtype
+            try:
+                if str(dt) == "string[pyarrow]" or str(dt) == "object":
+                    all_missing = df_final[col].apply(lambda x: (pd.isna(x) or str(x).strip() == ""))
+                else:
+                    all_missing = df_final[col].isna()
+                if bool(all_missing.all()):
+                    to_drop.append(col)
+            except Exception as e_col:
+                log_cons.debug("Skip emptiness check for column '%s' (dtype=%s): %s", col, dt, e_col)
+        if to_drop:
+            log_cons.info("Dropping all-missing columns: %s", ", ".join(sorted(map(str, to_drop))))
+            df_final = df_final.drop(columns=to_drop)
         else:
-            all_missing = df_final[col].isna()
-        if bool(all_missing.all()):
-            to_drop.append(col)
-    if to_drop:
-        log_cons.info("Dropping all-missing columns: %s", ", ".join(sorted(map(str, to_drop))))
-        df_final = df_final.drop(columns=to_drop)
+            log_cons.info("No all-missing columns to drop.")
+    except Exception as e:
+        log_cons.error("FAILED while dropping all-missing columns: %s", e)
+        raise
 
+    # Stage final output with your save_dataframe
     staged_output_base = os.path.join(base_dir, output_name)
-    save_dataframe(df_final, staged_output_base, output_format)
-    log_cons.info("Staged final output at %s.%s", staged_output_base, output_format)
+    log_cons.info("About to call save_dataframe(base=%s, format=%s)", staged_output_base, output_format)
+    try:
+        try:
+            log_cons.debug("df_final head(3):\n%s", df_final.head(3))
+        except Exception as e_head:
+            log_cons.debug("Could not preview df_final.head(3): %s", e_head)
+
+        save_dataframe(df_final, staged_output_base, output_format)
+        log_cons.info("Staged final output at %s.%s", staged_output_base, output_format)
+    except Exception as e:
+        import traceback as _tb
+        log_cons.error("FAILED in save_dataframe: %s\n%s", repr(e), _tb.format_exc())
+        raise
 
     relative_path = os.path.join(output_dir, f"{output_name}.{output_format}")
 
@@ -1160,40 +1139,56 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     columns_assoc = {}
 
     # Special handling for id
-    if "CRD_ID" in df_final.columns:
-        columns_assoc["id"] = "CRD_ID"
-    elif "id" in df_final.columns:
-        columns_assoc["id"] = "id"
+    try:
+        if "CRD_ID" in df_final.columns:
+            columns_assoc["id"] = "CRD_ID"
+        elif "id" in df_final.columns:
+            columns_assoc["id"] = "id"
+    except Exception as e:
+        log_cons.debug("While mapping 'id' column: %s", e)
 
     # Special handling for z_flag
-    if "z_flag_homogenized" in df_final.columns:
-        columns_assoc["z_flag"] = "z_flag_homogenized"
-    elif "z_flag" in df_final.columns:
-        columns_assoc["z_flag"] = "z_flag"
+    try:
+        if "z_flag_homogenized" in df_final.columns:
+            columns_assoc["z_flag"] = "z_flag_homogenized"
+        elif "z_flag" in df_final.columns:
+            columns_assoc["z_flag"] = "z_flag"
+    except Exception as e:
+        log_cons.debug("While mapping 'z_flag' column: %s", e)
 
     # Identity mapping for the others
-    for col in expected_columns:
-        if col not in ("id", "z_flag") and col in df_final.columns:
-            columns_assoc[col] = col
+    try:
+        for col in expected_columns:
+            if col not in ("id", "z_flag") and col in df_final.columns:
+                columns_assoc[col] = col
+        log_cons.info("columns_assoc: %s", columns_assoc)
+    except Exception as e:
+        log_cons.debug("While building columns_assoc: %s", e)
 
+    # Update process info
+    try:
+        update_process_info(
+            process_info,
+            process_info_path,
+            "outputs",
+            [
+                {
+                    "path": relative_path,
+                    "root_dir": output_root_dir,
+                    "role": "main",
+                    "columns_assoc": columns_assoc,
+                }
+            ],
+        )
+        update_process_info(process_info, process_info_path, "end_time", str(pd.Timestamp.now()))
+        update_process_info(process_info, process_info_path, "status", "Successful")
+        log_cons.info("Process info updated with output: %s", relative_path)
+    except Exception as e:
+        import traceback as _tb
+        log_cons.error("FAILED to update process_info: %s\n%s", e, _tb.format_exc())
+        raise
 
-    update_process_info(
-        process_info,
-        process_info_path,
-        "outputs",
-        [
-            {
-                "path": relative_path,
-                "root_dir": output_root_dir,
-                "role": "main",
-                "columns_assoc": columns_assoc,
-            }
-        ],
-    )
-    update_process_info(process_info, process_info_path, "end_time", str(pd.Timestamp.now()))
-    update_process_info(process_info, process_info_path, "status", "Successful")
-
-    # ----------------- PUBLISH STEP (finalzinho) -----------------
+    # ----------------- PUBLISH STEP -----------------
     publish_logger = _phase_logger(base_logger, "register")
     publish_logger.info("START publish: copying staged artifacts from process dir to out_root_and_dir (%s)", out_root_and_dir)
 
@@ -1201,27 +1196,49 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         _snapshot_shell_logs(str(launch_dir), launch_snap_dir, publish_logger, max_size_mb=100)
         publish_logger.info("Snapshotted shell logs from %s into %s", launch_dir, launch_snap_dir)
     except Exception as e:
-        publish_logger.warning("Snapshot of shell logs failed: %s", e)    
+        publish_logger.warning("Snapshot of shell logs failed: %s", e)
 
-    # Cria pasta de publicação só agora
-    os.makedirs(out_root_and_dir, exist_ok=True)
+    # Create publish dir only now
+    try:
+        os.makedirs(out_root_and_dir, exist_ok=True)
+        publish_logger.info("Ensured publish dir exists: %s", out_root_and_dir)
+    except Exception as e:
+        publish_logger.error("FAILED to create publish dir '%s': %s", out_root_and_dir, e)
+        raise
 
     # 1) process_info/
-    _copy_tree(os.path.join(base_dir, "process_info"), os.path.join(out_root_and_dir, "process_info"), publish_logger)
+    try:
+        _copy_tree(os.path.join(base_dir, "process_info"), os.path.join(out_root_and_dir, "process_info"), publish_logger)
+    except Exception as e:
+        publish_logger.error("FAILED to copy process_info/: %s", e)
+        raise
 
-    # 2) process.yml e alias process.yaml
-    _copy_file(os.path.join(base_dir, "process.yml"),  os.path.join(out_root_and_dir, "process.yml"),  publish_logger)
-    if os.path.exists(os.path.join(base_dir, "process.yaml")):
-        _copy_file(os.path.join(base_dir, "process.yaml"), os.path.join(out_root_and_dir, "process.yaml"), publish_logger)
+    # 2) process.yml and process.yaml
+    try:
+        _copy_file(os.path.join(base_dir, "process.yml"),  os.path.join(out_root_and_dir, "process.yml"),  publish_logger)
+        if os.path.exists(os.path.join(base_dir, "process.yaml")):
+            _copy_file(os.path.join(base_dir, "process.yaml"), os.path.join(out_root_and_dir, "process.yaml"), publish_logger)
+    except Exception as e:
+        publish_logger.error("FAILED to copy process.yml/.yaml: %s", e)
+        raise
 
     # 3) config.yaml
-    if os.path.exists(os.path.join(base_dir, "config.yaml")):
-        _copy_file(os.path.join(base_dir, "config.yaml"), os.path.join(out_root_and_dir, "config.yaml"), publish_logger)
+    try:
+        if os.path.exists(os.path.join(base_dir, "config.yaml")):
+            _copy_file(os.path.join(base_dir, "config.yaml"), os.path.join(out_root_and_dir, "config.yaml"), publish_logger)
+    except Exception as e:
+        publish_logger.error("FAILED to copy config.yaml: %s", e)
+        raise
 
-    # 4) output final
-    _copy_file(f"{staged_output_base}.{output_format}",
-               os.path.join(out_root_and_dir, f"{output_name}.{output_format}"),
-               publish_logger)
+    # 4) final output
+    try:
+        src_out = f"{staged_output_base}.{output_format}"
+        dst_out = os.path.join(out_root_and_dir, f"{output_name}.{output_format}")
+        publish_logger.info("Copying final output: %s -> %s", src_out, dst_out)
+        _copy_file(src_out, dst_out, publish_logger)
+    except Exception as e:
+        publish_logger.error("FAILED to copy final output to publish dir: %s", e)
+        raise
 
     publish_logger.info("END publish: artifacts copied to %s", out_root_and_dir)
 
@@ -1232,12 +1249,6 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         except Exception as e:
             log_cons.warning("Could not delete temp_dir %s: %s", temp_dir, e)
 
-    current_workers = len(client.scheduler_info().get("workers", {}))
-    log_cons.info(
-        "WORKERS STILL RUNNING=%d.",
-        current_workers,
-    )
-    
     log_cons.info("END consolidation: export complete")
     client.close()
     cluster.close()

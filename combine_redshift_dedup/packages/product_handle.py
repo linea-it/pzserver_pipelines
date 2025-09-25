@@ -7,6 +7,9 @@ import tables_io
 from astropy.table import Table
 import csv
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 class ProductHandle:
     """
     A unified interface to read data files of various formats into a Dask DataFrame.
@@ -83,9 +86,8 @@ class ProductHandle:
 def save_dataframe(df, output_path, format_):
     """Save DataFrame to disk in the requested format.
 
-    For Parquet, writes with engine='pyarrow' to preserve Arrow-backed dtypes.
-    For CSV/HDF5/FITS, uses NumPy-backed dtypes to avoid extension-type issues
-    in downstream writers.
+    For Parquet, write via PyArrow directly to avoid nested_pandas shim issues.
+    For CSV/HDF5/FITS, use NumPy-backed dtypes for compatibility.
 
     Args:
       df: Pandas DataFrame (may contain Arrow-backed dtypes).
@@ -95,24 +97,25 @@ def save_dataframe(df, output_path, format_):
     ext = format_.lower()
 
     if ext == "parquet":
-        # Keep Arrow-backed dtypes and schema (fast path).
-        df.to_parquet(f"{output_path}.parquet", index=False, engine="pyarrow")
+        # Bypass nested_pandas.DataFrame.to_parquet shim; PyArrow doesn't accept
+        # "index" or "engine" kwargs from that path.
+        try:
+            df2 = df.reset_index(drop=True)
+        except Exception:
+            df2 = df
+        table = pa.Table.from_pandas(df2, preserve_index=False)
+        pq.write_table(table, f"{output_path}.parquet")
         return
 
     # Non-Parquet formats: convert to NumPy-backed dtypes for compatibility.
-    # This avoids issues with pyarrow-backed string/boolean in third-party IO.
     df_np = df.convert_dtypes(dtype_backend="numpy_nullable")
 
     if ext == "csv":
-        # CSV is text; NumPy-backed avoids edge cases with extension dtypes.
         df_np.to_csv(f"{output_path}.csv", index=False)
     elif ext == "hdf5":
-        # Assumes `tables_io.write` expects NumPy/pandas-native dtypes.
         tables_io.write(df_np, f"{output_path}.hdf5")
     elif ext == "fits":
-        # Astropy Table prefers NumPy dtypes; disable index passthrough.
         table = Table.from_pandas(df_np, preserve_index=False)
         table.write(f"{output_path}.fits", overwrite=True)
     else:
         raise ValueError(f"Unsupported output format: {format_}")
-
