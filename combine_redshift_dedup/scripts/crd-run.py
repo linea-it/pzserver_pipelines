@@ -67,6 +67,23 @@ from combine_redshift_dedup.packages.utils import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _log_remote_future_exception(
+    lg: logging.LoggerAdapter, fut, msg_prefix: str, extra: dict | None = None
+) -> None:
+    """
+    Logs the remote (worker-side) traceback carried by a Dask Future.
+    """
+    import traceback as _tb
+    try:
+        err = fut.exception()
+        tb = fut.traceback()  # remote TB; can be None
+        if tb is not None:
+            lg.error("%s: %r", msg_prefix, err, exc_info=(type(err), err, tb), extra=extra)
+        else:
+            # Fallback: driver-side traceback (should still exist)
+            lg.error("%s: %r\n%s", msg_prefix, err, _tb.format_exc(), extra=extra)
+    except Exception:
+        lg.error("%s (and failed to render remote traceback)\n%s", msg_prefix, _tb.format_exc(), extra=extra)
 
 def _phase_logger(base_logger: logging.Logger, phase: str) -> logging.LoggerAdapter:
     """Return a LoggerAdapter that injects the phase into records."""
@@ -267,6 +284,74 @@ def _auto_cross_worker(info: dict, logs_dir: str, translation_config: dict):
         translation_config=translation_config,
     )
     return out_auto
+
+# ---------------------------------------------------------------------------
+# Parallel crossmatch worker
+# ---------------------------------------------------------------------------
+def _xmatch_worker(
+    left_collection_path: str,
+    right_collection_path: str,
+    logs_dir: str,
+    temp_dir: str,
+    step: int,
+    translation_config: dict,
+) -> str:
+    """
+    Open two HATS collections and run crossmatch_tiebreak_safe.
+    Returns a collection path (root or subcatalog).
+    """
+    try:
+        ensure_crc_logger(logs_dir)
+    except Exception:
+        pass
+
+    left_cat = lsdb.open_catalog(left_collection_path)
+    right_cat = lsdb.open_catalog(right_collection_path)
+
+    return crossmatch_tiebreak_safe(
+        left_cat=left_cat,
+        right_cat=right_cat,
+        logs_dir=logs_dir,
+        temp_dir=temp_dir,
+        step=step,
+        client=None,  # not needed on LSDB path
+        translation_config=translation_config,
+        do_import=True,
+    )
+
+# ---------------------------------------------------------------------------
+# Cleanup for crossmatch tournment
+# ---------------------------------------------------------------------------
+def _cleanup_inputs_of_merge(
+    left_root: str,
+    right_root: str,
+    lg: logging.LoggerAdapter,
+) -> None:
+    """
+    Remove only the two input collections that were just merged.
+    Accepts either a collection root or a subcatalog and normalizes to root.
+    """
+    def _to_root(p: str) -> str:
+        n = _normalize_collection_root(p) or p
+        return n
+
+    def _rm_root(p: str) -> None:
+        if not p:
+            return
+        try:
+            if os.path.isdir(p) and _is_collection_root(p):
+                shutil.rmtree(p, ignore_errors=True)
+                lg.info("Deleted input collection: %s", p)
+        except Exception as e:
+            lg.warning("Could not delete input collection %s: %s", p, e)
+
+    lroot = _to_root(left_root)
+    rroot = _to_root(right_root)
+    if lroot and rroot and (lroot != rroot):
+        if _is_collection_root(lroot):
+            _rm_root(lroot)
+        if _is_collection_root(rroot):
+            _rm_root(rroot)
 
 # ---------------------------------------------------------------------------
 # Publish / copy helpers
@@ -686,10 +771,10 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
 
         # ---------------------------------------------------------------
-        # 3) CROSSMATCH (no tie-breaking)
+        # 3) CROSSMATCH (parallel tournament; no per-step resume)
         # ---------------------------------------------------------------
         log_cross = _phase_logger(base_logger, "crossmatch")
-        log_cross.info("START crossmatch: iterative merges over prepared *_hats_auto")
+        log_cross.info("START crossmatch (parallel tournament) over prepared *_hats_auto")
 
         if combine_mode == "concatenate":
             # Simple concat mode still passes through consolidation phase later.
@@ -699,8 +784,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 for _pi in prepared_info[:5]:
                     log_cross.debug("Prepared path candidate: %s", _pi.get("prepared_path"))
                 df_final = dd.concat([dd.read_parquet(i["prepared_path"]) for i in prepared_info])
-                # small schema sanity without pulling whole data
-                _ = df_final.head(1, compute=True)
+                _ = df_final.head(1, compute=True)  # small schema sanity
                 df_final = df_final.compute()
                 log_cross.info("Concatenate compute finished: shape=%s", tuple(df_final.shape))
             except Exception as e:
@@ -715,318 +799,342 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 log_cross.debug("Could not query scheduler_info workers: %s", e)
 
             log_cross.info("END crossmatch: concatenate mode (no crossmatch performed)")
-
-            # Consolidation will run below
             start_consolidate = True
 
         elif combine_mode in ("concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"):
 
             if crossmatch_already_done:
-                # Crossmatch chain already finished previously (by resume log or presence of merged_step{final})
+                # Crossmatch chain already finished previously (by merged_step{final} presence)
                 log_cross.info(
-                    "Skip crossmatch loop: already finalized at step %d (resume/merged present).",
+                    "Skip crossmatch: already finalized at step %d (merged_step present).",
                     final_step,
                 )
-                # No df_final here; dedup will read merged_step{final} directly.
                 start_consolidate = False  # dedup still runs before consolidation
 
             else:
-                # === Normal iterative crossmatch flow ===
+                # === Parallel tournament without per-step resume ===
                 try:
-                    init = prepared_info[0]
-                    log_cross.info("Opening initial *_hats_auto catalog: %s", init.get("collection_path"))
-                    cat_prev = lsdb.open_catalog(init["collection_path"])  # *_hats_auto
-                except Exception as e:
-                    import traceback as _tb
-                    log_cross.error("FAILED to open initial catalog '%s': %s\n%s", init.get("collection_path"), repr(e), _tb.format_exc())
-                    raise
+                    _resume_set(resume_log, "phase.crossmatch", "started", log_cross)
 
-                start_i = 1
-                final_collection_path = None  # set when last step finishes
+                    # Ensure all prepared_info[i]["collection_path"] are *_hats_auto
+                    for info in prepared_info:
+                        hats_auto = info["prepared_path"] + "_hats_auto"
+                        if os.path.isdir(hats_auto):
+                            info["collection_path"] = hats_auto
+                        else:
+                            raise FileNotFoundError(f"Missing *_hats_auto for: {info['internal_name']}")
 
-                for i in range(start_i, len(prepared_info)):
-                    tag = f"crossmatch_step{i}"
-                    info_i = prepared_info[i]
+                    max_inflight_pairs = int(param_config.get("cross_max_inflight", 5))
+                    log_cross.info("Max inflight crossmatch pairs: %d", max_inflight_pairs)
 
-                    if tag in completed:
-                        log_cross.info("Skip completed step: %s", tag)
-                        resume_key = f"{tag}.collection_path"
-                        try:
-                            resumed_col = _resume_get(resume_log, resume_key)
-                            resumed_col = _normalize_collection_root(resumed_col)
-                        except Exception as e:
-                            resumed_col = None
-                            log_cross.warning("Could not read/normalize resume key '%s': %s", resume_key, e)
+                    # Build initial queue of nodes (label, root_path)
+                    from collections import deque
+                    nodes = deque()
+                    for info in prepared_info:
+                        root = _normalize_collection_root(info["collection_path"]) or info["collection_path"]
+                        if not _is_hats_collection(root):
+                            raise RuntimeError(f"Not a HATS collection: {root}")
+                        root = _normalize_collection_root(root) or root  # normalize to root if subcatalog
+                        nodes.append((info["internal_name"], root))
 
-                        if resumed_col and _is_collection_root(resumed_col):
-                            log_cross.info("Resume collection root for %s: %s", tag, resumed_col)
-                            try:
-                                cat_prev = lsdb.open_catalog(resumed_col)
-                            except Exception as e:
-                                import traceback as _tb
-                                log_cross.error("FAILED to open resumed catalog '%s': %s\n%s", resumed_col, repr(e), _tb.format_of_exc())
-                                raise
-                            if i == final_step:
-                                final_collection_path = resumed_col
-                        elif i == final_step and final_collection_path is None:
-                            try:
-                                guessed = _guess_collection_for_step(temp_dir, i)
-                            except Exception as e:
-                                guessed = None
-                                log_cross.debug("Could not guess collection for step %d: %s", i, e)
-                            if guessed:
-                                log_cross.info("Guessed collection root for %s: %s", tag, guessed)
-                                final_collection_path = guessed
-                        continue
+                    # Edge case: only one catalog
+                    if len(nodes) == 1:
+                        final_collection_path = nodes[0][1]
+                        _resume_set(resume_log, "phase.crossmatch", "completed", log_cross)
+                        log_cross.info("Only one prepared collection; skipping crossmatch. final=%s", final_collection_path)
+                        start_consolidate = False
+                    else:
+                        # Futures pipeline
+                        ready = deque(nodes)
+                        carry: tuple[str, str] | None = None
 
-                    # Open next *_hats_auto catalog and crossmatch
+                        # Use future.key (string) to avoid identity KeyError
+                        inflight_meta: dict[str, tuple] = {}  # fut.key -> (l_lab, l_path, r_lab, r_path, step_id)
+                        step_id = 1  # diagnostic numbering only
+
+                        # as_completed instance where we add futures as we submit them
+                        ac3 = as_completed()
+
+                        def _submit_pair() -> bool:
+                            nonlocal step_id
+                            if len(ready) < 2:
+                                return False
+                            if len(inflight_meta) >= max_inflight_pairs:
+                                return False
+                            l_lab, l_path = ready.popleft()
+                            r_lab, r_path = ready.popleft()
+                            fut = client.submit(
+                                _xmatch_worker,
+                                l_path,
+                                r_path,
+                                logs_dir,
+                                temp_dir,
+                                step_id,
+                                translation_config,
+                                pure=False,
+                            )
+                            inflight_meta[fut.key] = (l_lab, l_path, r_lab, r_path, step_id)
+                            ac3.add(fut)  # add immediately to as_completed
+                            log_cross.info("Submitted crossmatch pair: step=%d | %s VS %s", step_id, l_lab, r_lab)
+                            step_id += 1
+                            return True
+
+                        # Prime the pump
+                        while _submit_pair():
+                            pass
+
+                        final_collection_path: str | None = None
+
+                        while inflight_meta or (len(ready) + (1 if carry else 0) > 1):
+                            # Process the next completed pair if any
+                            if inflight_meta:
+                                fut = next(ac3)
+                                meta = inflight_meta.pop(fut.key, None)
+                                if meta is None:
+                                    # Received a completion for an unknown/detached future; log and continue.
+                                    _log_remote_future_exception(
+                                        log_cross, fut,
+                                        "Received completion for an unknown Future"
+                                    )
+                                    continue
+
+                                l_lab, l_path, r_lab, r_path, sid = meta
+                                try:
+                                    raw_out = fut.result()
+                                except Exception:
+                                    _log_remote_future_exception(
+                                        log_cross, fut,
+                                        f"Crossmatch failed (step {sid}: {l_lab} vs {r_lab})"
+                                    )
+                                    raise
+
+                                out_root = _normalize_collection_root(raw_out) or raw_out
+                                if not _is_hats_collection(out_root):
+                                    log_cross.warning("crossmatch returned a non-HATS path (step %d): %s", sid, raw_out)
+
+                                # Delicate cleanup — delete only the two inputs consumed by this merge
+                                if delete_temp_files:
+                                    try:
+                                        _cleanup_inputs_of_merge(l_path, r_path, log_cross)
+                                    except Exception as e:
+                                        log_cross.warning("Cleanup of inputs for step %d failed (non-fatal): %s", sid, e)
+
+                                # Winner goes back into the queue
+                                ready.append((f"merged_step{sid}", out_root))
+                                final_collection_path = out_root  # keep last seen
+
+                                # Keep the pipeline saturated
+                                while _submit_pair():
+                                    pass
+
+                            # If we have a carry and something ready, try to form a new pair
+                            if carry and ready:
+                                ready.appendleft(carry)
+                                carry = None
+                                while _submit_pair():
+                                    pass
+
+                            # If odd and nothing inflight, stash one as carry
+                            if not inflight_meta and len(ready) > 1 and (len(ready) % 2 == 1):
+                                carry = ready.pop()
+
+                        # Finalization
+                        if final_collection_path is None:
+                            if ready:
+                                final_collection_path = ready[0][1]
+                            elif carry:
+                                final_collection_path = carry[1]
+
+                        final_collection_path = _normalize_collection_root(final_collection_path) or final_collection_path
+                        if not _is_collection_root(final_collection_path):
+                            raise RuntimeError(f"Final path is not a HATS collection root: {final_collection_path}")
+
+                        _resume_set(resume_log, "phase.crossmatch", "completed", log_cross)
+                        log_cross.info("END crossmatch: parallel tournament done; final root: %s", final_collection_path)
+                        start_consolidate = False
+
+                except Exception:
+                    # Catch ANY driver-side error in the tournament
+                    log_cross.exception("Crossmatch tournament FAILED with an unhandled error")
                     try:
-                        cat_path = info_i["collection_path"]
-                        target_name = info_i["internal_name"]
-                        log_cross.info("Crossmatching previous result with: %s", target_name)
-                        log_cross.debug("Opening right-hand catalog: %s", cat_path)
-                        cat_curr = lsdb.open_catalog(cat_path)
-                    except Exception as e:
-                        import traceback as _tb
-                        log_cross.error("FAILED to open right-hand catalog '%s' for step %d: %s\n%s",
-                                        info_i.get("collection_path"), i, repr(e), _tb.format_exc())
-                        raise
-
-                    is_last = (i == final_step)
-                    try:
-                        t0 = time.time()
-                        crossmatch_result = crossmatch_tiebreak_safe(
-                            left_cat=cat_prev,
-                            right_cat=cat_curr,
-                            logs_dir=logs_dir,
-                            temp_dir=temp_dir,
-                            step=i,
-                            client=client,
-                            translation_config=translation_config,
-                            do_import=True,  # returns collection path (root or subcat)
-                        )
-                        log_cross.info("crossmatch_tiebreak_safe finished in %.2fs", time.time() - t0)
-                    except Exception as e:
-                        import traceback as _tb
-                        log_cross.error("FAILED during crossmatch_tiebreak_safe at step %d: %s\n%s", i, repr(e), _tb.format_exc())
-                        raise
-
-                    try:
-                        log_cross.info("Raw crossmatch path returned: %s", crossmatch_result)
-                        norm = _normalize_collection_root(crossmatch_result)
-                        if norm != crossmatch_result:
-                            log_cross.info("Normalized to collection root: %s", norm)
-                        if not _is_hats_collection(norm):
-                            log_cross.warning("Returned path does not look like a HATS collection: %s", crossmatch_result)
-                    except Exception as e:
-                        import traceback as _tb
-                        log_cross.error("FAILED after crossmatch result normalization at step %d: %s\n%s", i, repr(e), _tb.format_exc())
-                        raise
-
-                    try:
-                        cat_prev = lsdb.open_catalog(norm)
-                        _resume_set(resume_log, f"{tag}.collection_path", norm, log_cross)
-                        if is_last:
-                            final_collection_path = norm
-                    except Exception as e:
-                        import traceback as _tb
-                        log_cross.error("FAILED to open/set resume for step %d (path=%s): %s\n%s", i, norm, repr(e), _tb.format_exc())
-                        raise
-
-                    try:
-                        log_step(resume_log, tag)
-                    except Exception as e:
-                        log_cross.debug("Could not log step '%s' to resume: %s", tag, e)
-
-                    if delete_temp_files:
-                        try:
-                            _cleanup_previous_step(i, prepared_info, temp_dir, log_cross)
-                        except Exception as e:
-                            log_cross.warning("Cleanup after step %d failed (non-fatal): %s", i, e)
-
-                try:
-                    current_workers = len(client.scheduler_info().get("workers", {}))
-                    log_cross.info("WORKERS STILL RUNNING=%d.", current_workers)
-                except Exception as e:
-                    log_cross.debug("Could not query scheduler_info workers: %s", e)
-
-                log_cross.info("END crossmatch: graph merge completed")
-                start_consolidate = False
-
-
-            # -----------------------------------------------------------
-            # 4) DEDUPLICATION
-            # -----------------------------------------------------------
-            log_dedup = _phase_logger(base_logger, "deduplication")
-            log_dedup.info("START deduplication: LSDB graph labeling and tie consolidation")
-
-            # Ensure final collection root for dedup
-            if not final_collection_path:
-                resumed = _resume_get(resume_log, f"crossmatch_step{final_step}.collection_path")
-                resumed = _normalize_collection_root(resumed)
-                if resumed and _is_collection_root(resumed):
-                    final_collection_path = resumed
-                    log_dedup.info("Recovered final collection root from resume: %s", final_collection_path)
-                else:
-                    guessed = _guess_collection_for_step(temp_dir, final_step)
-                    if guessed:
-                        final_collection_path = guessed
-                        log_dedup.info("Guessed final collection root from disk: %s", final_collection_path)
-
-            use_distributed = final_collection_path is not None and _is_collection_root(final_collection_path)
-
-            # --- Safe config parsing ---
-            tiebreaking_priority_cfg = translation_config.get("tiebreaking_priority")
-            if isinstance(tiebreaking_priority_cfg, (str, bytes)):
-                tiebreaking_priority_cfg = [str(tiebreaking_priority_cfg)]
-            if not isinstance(tiebreaking_priority_cfg, (list, tuple)) or not tiebreaking_priority_cfg:
-                raise TypeError("tiebreaking_priority must be a non-empty list of column names.")
-
-            instrument_type_priority_cfg = translation_config.get("instrument_type_priority")
-            if "instrument_type_homogenized" in set(tiebreaking_priority_cfg) and not isinstance(instrument_type_priority_cfg, dict):
-                raise TypeError(
-                    "instrument_type_priority must be a mapping when "
-                    "'instrument_type_homogenized' is present in tiebreaking_priority."
-                )
-            delta_z_threshold_cfg = float(translation_config.get("delta_z_threshold", 0.0))
-
-            #######################################################################
-            # Diagnostics / outputs
-            # - edge_log: enable edge diagnostics (warn on star-neighbor exclusions)
-            # - group_col: set to None to disable exporting group labels
-            edge_log = True
-            group_col = "group_id"  # None to deactivate
-            #######################################################################
-
-            if use_distributed:
-                log_dedup.info("Running graph-based dedup on final merged collection (Dask merge with catalog ._ddf)")
-                final_collection_path = _normalize_collection_root(final_collection_path)
-                log_dedup.info("final_collection_root: %s", final_collection_path)
-
-                if not _is_collection_root(final_collection_path):
-                    raise RuntimeError(f"Expected collection root at: {final_collection_path}")
-
-                # Open the LSDB collection directly (no subcatalog hunting, no margins here)
-                try:
-                    final_cat = lsdb.open_catalog(final_collection_path)
-                    log_dedup.info("Opened LSDB collection at root path.")
-                except Exception as e:
-                    raise RuntimeError(f"Could not open LSDB collection at: {final_collection_path}") from e
-
-                # Build labels lazily over the catalog
-                try:
-                    labels_dd = run_dedup_with_lsdb_map_partitions(
-                        final_cat,
-                        tiebreaking_priority=tiebreaking_priority_cfg,
-                        instrument_type_priority=(instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None),
-                        delta_z_threshold=delta_z_threshold_cfg,
-                        crd_col="CRD_ID",
-                        compared_col="compared_to",
-                        z_col="z",
-                        tie_col="tie_result",
-                        edge_log=edge_log,
-                        group_col=group_col,
-                    )
-                    log_dedup.info("Labels graph built (lazy). Preparing RHS for Dask merge...")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while building labels graph: %s\n%s", repr(e), _tb.format_exc())
-                    raise
-
-                # Prepare RHS minimal schema (Dask DataFrame)
-                try:
-                    rhs_dd = labels_dd.rename(columns={"tie_result": "tie_result_new"})
-                    keep_cols = ["CRD_ID", "tie_result_new"]
-                    if group_col and (group_col in rhs_dd.columns):
-                        keep_cols.append(group_col)
-                    rhs_dd = rhs_dd[keep_cols]
-                    log_dedup.info("Prepared RHS columns: %s", keep_cols)
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while preparing RHS labels: %s\n%s", repr(e), _tb.format_exc())
-                    raise
-
-                # Base Dask DataFrame from the LSDB collection
-                try:
-                    df_all = final_cat._ddf
-                    # Align join key dtype defensively
-                    try:
-                        df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
-                        rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string[pyarrow]"))
-                    except Exception:
-                        df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
-                        rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string"))
-                    log_dedup.info("Aligned CRD_ID dtype on both sides.")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while preparing base from catalog: %s\n%s", repr(e), _tb.format_exc())
-                    raise
-
-                # Clear divisions and perform the distributed merge
-                try:
-                    try:
-                        df_all = df_all.clear_divisions()
+                        _resume_set(resume_log, "phase.crossmatch", "failed", log_cross)
                     except Exception:
                         pass
-                    try:
-                        rhs_dd = rhs_dd.clear_divisions()
-                    except Exception:
-                        pass
-                    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-                        merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
-                    log_dedup.info("Dask merge graph built (lazy).")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED during Dask merge: %s\n%s", repr(e), _tb.format_exc())
                     raise
-
-                # Coalesce tie_result in Dask (still lazy)
-                try:
-                    if "tie_result" in merged.columns:
-                        merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
-                    else:
-                        merged = merged.assign(tie_result=merged["tie_result_new"])
-                    if "tie_result_new" in merged.columns:
-                        merged = merged.drop(columns=["tie_result_new"])
-                    log_dedup.info("Coalesced tie_result (lazy).")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while coalescing tie_result: %s\n%s", repr(e), _tb.format_exc())
-                    raise
-
-                # Final materialization: compute only once, at the very end
-                try:
-                    # Small sanity check without pulling everything
-                    _ = merged.head(1)
-                    df_final = merged.compute()
-
-                    if "group_id" in df_final.columns:
-                        dup = df_final["group_id"].value_counts(dropna=True)
-                        n_big = int((dup > 1).sum())
-                        log_dedup.info("Sanity group_id: uniques=%d, ids_with_>1_occurrences=%d", int(dup.size), n_big)
-                    else:
-                        log_dedup.info("No group_id column present after dedup; skipping sanity counts.")
-
-                    current_workers = len(client.scheduler_info().get("workers", {}))
-                    log_dedup.info("WORKERS STILL RUNNING=%d.", current_workers)
-                    log_dedup.info("END deduplication: labels merged back into final dataframe (Dask)")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while computing final dataframe: %s\n%s", repr(e), _tb.format_exc())
-                    raise
-
-            else:
-                # We require a valid LSDB collection root; Parquet fallback is no longer supported.
-                raise RuntimeError("Cannot run dedup: missing or invalid LSDB collection root; Parquet fallback removed.")
-
-            # Next phase runs below:
-            start_consolidate = True
 
         else:
             base_logger.error("Unknown combine_mode: %s", combine_mode, extra={"phase": "crossmatch"})
             client.close()
             cluster.close()
             return
+
+        # -----------------------------------------------------------
+        # 4) DEDUPLICATION
+        # -----------------------------------------------------------
+        log_dedup = _phase_logger(base_logger, "deduplication")
+        log_dedup.info("START deduplication: LSDB graph labeling and tie consolidation")
+
+        # Ensure final collection root for dedup
+        if not final_collection_path:
+            resumed = _resume_get(resume_log, f"crossmatch_step{final_step}.collection_path")
+            resumed = _normalize_collection_root(resumed)
+            if resumed and _is_collection_root(resumed):
+                final_collection_path = resumed
+                log_dedup.info("Recovered final collection root from resume: %s", final_collection_path)
+            else:
+                guessed = _guess_collection_for_step(temp_dir, final_step)
+                if guessed:
+                    final_collection_path = guessed
+                    log_dedup.info("Guessed final collection root from disk: %s", final_collection_path)
+
+        use_distributed = final_collection_path is not None and _is_collection_root(final_collection_path)
+
+        # --- Safe config parsing ---
+        tiebreaking_priority_cfg = translation_config.get("tiebreaking_priority")
+        if isinstance(tiebreaking_priority_cfg, (str, bytes)):
+            tiebreaking_priority_cfg = [str(tiebreaking_priority_cfg)]
+        if not isinstance(tiebreaking_priority_cfg, (list, tuple)) or not tiebreaking_priority_cfg:
+            raise TypeError("tiebreaking_priority must be a non-empty list of column names.")
+
+        instrument_type_priority_cfg = translation_config.get("instrument_type_priority")
+        if "instrument_type_homogenized" in set(tiebreaking_priority_cfg) and not isinstance(instrument_type_priority_cfg, dict):
+            raise TypeError(
+                "instrument_type_priority must be a mapping when "
+                "'instrument_type_homogenized' is present in tiebreaking_priority."
+            )
+        delta_z_threshold_cfg = float(translation_config.get("delta_z_threshold", 0.0))
+
+        #######################################################################
+        # Diagnostics / outputs
+        # - edge_log: enable edge diagnostics (warn on star-neighbor exclusions)
+        # - group_col: set to None to disable exporting group labels
+        edge_log = True
+        group_col = "group_id"  # None to deactivate
+        #######################################################################
+
+        if use_distributed:
+            log_dedup.info("Running graph-based dedup on final merged collection (Dask merge with catalog ._ddf)")
+            final_collection_path = _normalize_collection_root(final_collection_path)
+            log_dedup.info("final_collection_root: %s", final_collection_path)
+
+            if not _is_collection_root(final_collection_path):
+                raise RuntimeError(f"Expected collection root at: {final_collection_path}")
+
+            # Open the LSDB collection directly (no subcatalog hunting, no margins here)
+            try:
+                final_cat = lsdb.open_catalog(final_collection_path)
+                log_dedup.info("Opened LSDB collection at root path.")
+            except Exception as e:
+                raise RuntimeError(f"Could not open LSDB collection at: {final_collection_path}") from e
+
+            # Build labels lazily over the catalog
+            try:
+                labels_dd = run_dedup_with_lsdb_map_partitions(
+                    final_cat,
+                    tiebreaking_priority=tiebreaking_priority_cfg,
+                    instrument_type_priority=(instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None),
+                    delta_z_threshold=delta_z_threshold_cfg,
+                    crd_col="CRD_ID",
+                    compared_col="compared_to",
+                    z_col="z",
+                    tie_col="tie_result",
+                    edge_log=edge_log,
+                    group_col=group_col,
+                )
+                log_dedup.info("Labels graph built (lazy). Preparing RHS for Dask merge...")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while building labels graph: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+            # Prepare RHS minimal schema (Dask DataFrame)
+            try:
+                rhs_dd = labels_dd.rename(columns={"tie_result": "tie_result_new"})
+                keep_cols = ["CRD_ID", "tie_result_new"]
+                if group_col and (group_col in rhs_dd.columns):
+                    keep_cols.append(group_col)
+                rhs_dd = rhs_dd[keep_cols]
+                log_dedup.info("Prepared RHS columns: %s", keep_cols)
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while preparing RHS labels: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+            # Base Dask DataFrame from the LSDB collection
+            try:
+                df_all = final_cat._ddf
+                # Align join key dtype defensively
+                try:
+                    df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
+                    rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string[pyarrow]"))
+                except Exception:
+                    df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
+                    rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string"))
+                log_dedup.info("Aligned CRD_ID dtype on both sides.")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while preparing base from catalog: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+            # Clear divisions and perform the distributed merge
+            try:
+                try:
+                    df_all = df_all.clear_divisions()
+                except Exception:
+                    pass
+                try:
+                    rhs_dd = rhs_dd.clear_divisions()
+                except Exception:
+                    pass
+                with dask.config.set({"dataframe.shuffle.method": "tasks"}):
+                    merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
+                log_dedup.info("Dask merge graph built (lazy).")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED during Dask merge: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+            # Coalesce tie_result in Dask (still lazy)
+            try:
+                if "tie_result" in merged.columns:
+                    merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
+                else:
+                    merged = merged.assign(tie_result=merged["tie_result_new"])
+                if "tie_result_new" in merged.columns:
+                    merged = merged.drop(columns=["tie_result_new"])
+                log_dedup.info("Coalesced tie_result (lazy).")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while coalescing tie_result: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+            # Final materialization: compute only once, at the very end
+            try:
+                # Small sanity check without pulling everything
+                _ = merged.head(1)
+                df_final = merged.compute()
+
+                if "group_id" in df_final.columns:
+                    dup = df_final["group_id"].value_counts(dropna=True)
+                    n_big = int((dup > 1).sum())
+                    log_dedup.info("Sanity group_id: uniques=%d, ids_with_>1_occurrences=%d", int(dup.size), n_big)
+                else:
+                    log_dedup.info("No group_id column present after dedup; skipping sanity counts.")
+
+                current_workers = len(client.scheduler_info().get("workers", {}))
+                log_dedup.info("WORKERS STILL RUNNING=%d.", current_workers)
+                log_dedup.info("END deduplication: labels merged back into final dataframe (Dask)")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while computing final dataframe: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+        else:
+            # We require a valid LSDB collection root; Parquet fallback is no longer supported.
+            raise RuntimeError("Cannot run dedup: missing or invalid LSDB collection root; Parquet fallback removed.")
+
+        # Next phase runs below:
+        start_consolidate = True
 
     # ---------------------------------------------------------------
     # 5) CONSOLIDATION / EXPORT
