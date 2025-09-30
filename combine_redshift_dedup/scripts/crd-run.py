@@ -968,173 +968,183 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             cluster.close()
             return
 
+
         # -----------------------------------------------------------
         # 4) DEDUPLICATION
         # -----------------------------------------------------------
         log_dedup = _phase_logger(base_logger, "deduplication")
-        log_dedup.info("START deduplication: LSDB graph labeling and tie consolidation")
 
-        # Ensure final collection root for dedup
-        if not final_collection_path:
-            resumed = _resume_get(resume_log, f"crossmatch_step{final_step}.collection_path")
-            resumed = _normalize_collection_root(resumed)
-            if resumed and _is_collection_root(resumed):
-                final_collection_path = resumed
-                log_dedup.info("Recovered final collection root from resume: %s", final_collection_path)
-            else:
-                guessed = _guess_collection_for_step(temp_dir, final_step)
-                if guessed:
-                    final_collection_path = guessed
-                    log_dedup.info("Guessed final collection root from disk: %s", final_collection_path)
-
-        use_distributed = final_collection_path is not None and _is_collection_root(final_collection_path)
-
-        # --- Safe config parsing ---
-        tiebreaking_priority_cfg = translation_config.get("tiebreaking_priority")
-        if isinstance(tiebreaking_priority_cfg, (str, bytes)):
-            tiebreaking_priority_cfg = [str(tiebreaking_priority_cfg)]
-        if not isinstance(tiebreaking_priority_cfg, (list, tuple)) or not tiebreaking_priority_cfg:
-            raise TypeError("tiebreaking_priority must be a non-empty list of column names.")
-
-        instrument_type_priority_cfg = translation_config.get("instrument_type_priority")
-        if "instrument_type_homogenized" in set(tiebreaking_priority_cfg) and not isinstance(instrument_type_priority_cfg, dict):
-            raise TypeError(
-                "instrument_type_priority must be a mapping when "
-                "'instrument_type_homogenized' is present in tiebreaking_priority."
-            )
-        delta_z_threshold_cfg = float(translation_config.get("delta_z_threshold", 0.0))
-
-        #######################################################################
-        # Diagnostics / outputs
-        # - edge_log: enable edge diagnostics (warn on star-neighbor exclusions)
-        # - group_col: set to None to disable exporting group labels
-        edge_log = True
-        group_col = "group_id"  # None to deactivate
-        #######################################################################
-
-        if use_distributed:
-            log_dedup.info("Running graph-based dedup on final merged collection (Dask merge with catalog ._ddf)")
-            final_collection_path = _normalize_collection_root(final_collection_path)
-            log_dedup.info("final_collection_root: %s", final_collection_path)
-
-            if not _is_collection_root(final_collection_path):
-                raise RuntimeError(f"Expected collection root at: {final_collection_path}")
-
-            # Open the LSDB collection directly (no subcatalog hunting, no margins here)
-            try:
-                final_cat = lsdb.open_catalog(final_collection_path)
-                log_dedup.info("Opened LSDB collection at root path.")
-            except Exception as e:
-                raise RuntimeError(f"Could not open LSDB collection at: {final_collection_path}") from e
-
-            # Build labels lazily over the catalog
-            try:
-                labels_dd = run_dedup_with_lsdb_map_partitions(
-                    final_cat,
-                    tiebreaking_priority=tiebreaking_priority_cfg,
-                    instrument_type_priority=(instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None),
-                    delta_z_threshold=delta_z_threshold_cfg,
-                    crd_col="CRD_ID",
-                    compared_col="compared_to",
-                    z_col="z",
-                    tie_col="tie_result",
-                    edge_log=edge_log,
-                    group_col=group_col,
-                )
-                log_dedup.info("Labels graph built (lazy). Preparing RHS for Dask merge...")
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED while building labels graph: %s\n%s", repr(e), _tb.format_exc())
-                raise
-
-            # Prepare RHS minimal schema (Dask DataFrame)
-            try:
-                rhs_dd = labels_dd.rename(columns={"tie_result": "tie_result_new"})
-                keep_cols = ["CRD_ID", "tie_result_new"]
-                if group_col and (group_col in rhs_dd.columns):
-                    keep_cols.append(group_col)
-                rhs_dd = rhs_dd[keep_cols]
-                log_dedup.info("Prepared RHS columns: %s", keep_cols)
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED while preparing RHS labels: %s\n%s", repr(e), _tb.format_exc())
-                raise
-
-            # Base Dask DataFrame from the LSDB collection
-            try:
-                df_all = final_cat._ddf
-                # Align join key dtype defensively
-                try:
-                    df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
-                    rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string[pyarrow]"))
-                except Exception:
-                    df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
-                    rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string"))
-                log_dedup.info("Aligned CRD_ID dtype on both sides.")
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED while preparing base from catalog: %s\n%s", repr(e), _tb.format_exc())
-                raise
-
-            # Clear divisions and perform the distributed merge
-            try:
-                try:
-                    df_all = df_all.clear_divisions()
-                except Exception:
-                    pass
-                try:
-                    rhs_dd = rhs_dd.clear_divisions()
-                except Exception:
-                    pass
-                with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-                    merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
-                log_dedup.info("Dask merge graph built (lazy).")
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED during Dask merge: %s\n%s", repr(e), _tb.format_exc())
-                raise
-
-            # Coalesce tie_result in Dask (still lazy)
-            try:
-                if "tie_result" in merged.columns:
-                    merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
-                else:
-                    merged = merged.assign(tie_result=merged["tie_result_new"])
-                if "tie_result_new" in merged.columns:
-                    merged = merged.drop(columns=["tie_result_new"])
-                log_dedup.info("Coalesced tie_result (lazy).")
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED while coalescing tie_result: %s\n%s", repr(e), _tb.format_exc())
-                raise
-
-            # Final materialization: compute only once, at the very end
-            try:
-                # Small sanity check without pulling everything
-                _ = merged.head(1)
-                df_final = merged.compute()
-
-                if "group_id" in df_final.columns:
-                    dup = df_final["group_id"].value_counts(dropna=True)
-                    n_big = int((dup > 1).sum())
-                    log_dedup.info("Sanity group_id: uniques=%d, ids_with_>1_occurrences=%d", int(dup.size), n_big)
-                else:
-                    log_dedup.info("No group_id column present after dedup; skipping sanity counts.")
-
-                current_workers = len(client.scheduler_info().get("workers", {}))
-                log_dedup.info("WORKERS STILL RUNNING=%d.", current_workers)
-                log_dedup.info("END deduplication: labels merged back into final dataframe (Dask)")
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED while computing final dataframe: %s\n%s", repr(e), _tb.format_exc())
-                raise
+        # In "concatenate" mode there is no LSDB collection root; skip dedup entirely.
+        if combine_mode == "concatenate":
+            log_dedup.info("Skip deduplication: combine_mode='concatenate' (no LSDB collection root).")
+            # Next phase runs below:
+            start_consolidate = True
 
         else:
-            # We require a valid LSDB collection root; Parquet fallback is no longer supported.
-            raise RuntimeError("Cannot run dedup: missing or invalid LSDB collection root; Parquet fallback removed.")
+            log_dedup.info("START deduplication: LSDB graph labeling and tie consolidation")
 
-        # Next phase runs below:
-        start_consolidate = True
+            # Ensure final collection root for dedup
+            if not final_collection_path:
+                resumed = _resume_get(resume_log, f"crossmatch_step{final_step}.collection_path")
+                resumed = _normalize_collection_root(resumed)
+                if resumed and _is_collection_root(resumed):
+                    final_collection_path = resumed
+                    log_dedup.info("Recovered final collection root from resume: %s", final_collection_path)
+                else:
+                    guessed = _guess_collection_for_step(temp_dir, final_step)
+                    if guessed:
+                        final_collection_path = guessed
+                        log_dedup.info("Guessed final collection root from disk: %s", final_collection_path)
+
+            use_distributed = final_collection_path is not None and _is_collection_root(final_collection_path)
+
+            # --- Safe config parsing ---
+            tiebreaking_priority_cfg = translation_config.get("tiebreaking_priority")
+            if isinstance(tiebreaking_priority_cfg, (str, bytes)):
+                tiebreaking_priority_cfg = [str(tiebreaking_priority_cfg)]
+            if not isinstance(tiebreaking_priority_cfg, (list, tuple)) or not tiebreaking_priority_cfg:
+                raise TypeError("tiebreaking_priority must be a non-empty list of column names.")
+
+            instrument_type_priority_cfg = translation_config.get("instrument_type_priority")
+            if "instrument_type_homogenized" in set(tiebreaking_priority_cfg) and not isinstance(instrument_type_priority_cfg, dict):
+                raise TypeError(
+                    "instrument_type_priority must be a mapping when "
+                    "'instrument_type_homogenized' is present in tiebreaking_priority."
+                )
+            delta_z_threshold_cfg = float(translation_config.get("delta_z_threshold", 0.0))
+
+            #######################################################################
+            # Diagnostics / outputs
+            # - edge_log: enable edge diagnostics (warn on star-neighbor exclusions)
+            # - group_col: set to None to disable exporting group labels
+            edge_log = True
+            group_col = "group_id"  # None to deactivate
+            #######################################################################
+
+            if use_distributed:
+                log_dedup.info("Running graph-based dedup on final merged collection (Dask merge with catalog ._ddf)")
+                final_collection_path = _normalize_collection_root(final_collection_path)
+                log_dedup.info("final_collection_root: %s", final_collection_path)
+
+                if not _is_collection_root(final_collection_path):
+                    raise RuntimeError(f"Expected collection root at: {final_collection_path}")
+
+                # Open the LSDB collection directly (no subcatalog hunting, no margins here)
+                try:
+                    final_cat = lsdb.open_catalog(final_collection_path)
+                    log_dedup.info("Opened LSDB collection at root path.")
+                except Exception as e:
+                    raise RuntimeError(f"Could not open LSDB collection at: {final_collection_path}") from e
+
+                # Build labels lazily over the catalog
+                try:
+                    labels_dd = run_dedup_with_lsdb_map_partitions(
+                        final_cat,
+                        tiebreaking_priority=tiebreaking_priority_cfg,
+                        instrument_type_priority=(instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None),
+                        delta_z_threshold=delta_z_threshold_cfg,
+                        crd_col="CRD_ID",
+                        compared_col="compared_to",
+                        z_col="z",
+                        tie_col="tie_result",
+                        edge_log=edge_log,
+                        group_col=group_col,
+                    )
+                    log_dedup.info("Labels graph built (lazy). Preparing RHS for Dask merge...")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while building labels graph: %s\n%s", repr(e), _tb.format_exc())
+                    raise
+
+                # Prepare RHS minimal schema (Dask DataFrame)
+                try:
+                    rhs_dd = labels_dd.rename(columns={"tie_result": "tie_result_new"})
+                    keep_cols = ["CRD_ID", "tie_result_new"]
+                    if group_col and (group_col in rhs_dd.columns):
+                        keep_cols.append(group_col)
+                    rhs_dd = rhs_dd[keep_cols]
+                    log_dedup.info("Prepared RHS columns: %s", keep_cols)
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while preparing RHS labels: %s\n%s", repr(e), _tb.format_exc())
+                    raise
+
+                # Base Dask DataFrame from the LSDB collection
+                try:
+                    df_all = final_cat._ddf
+                    # Align join key dtype defensively
+                    try:
+                        df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
+                        rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string[pyarrow]"))
+                    except Exception:
+                        df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
+                        rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string"))
+                    log_dedup.info("Aligned CRD_ID dtype on both sides.")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while preparing base from catalog: %s\n%s", repr(e), _tb.format_exc())
+                    raise
+
+                # Clear divisions and perform the distributed merge
+                try:
+                    try:
+                        df_all = df_all.clear_divisions()
+                    except Exception:
+                        pass
+                    try:
+                        rhs_dd = rhs_dd.clear_divisions()
+                    except Exception:
+                        pass
+                    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
+                        merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
+                    log_dedup.info("Dask merge graph built (lazy).")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED during Dask merge: %s\n%s", repr(e), _tb.format_exc())
+                    raise
+
+                # Coalesce tie_result in Dask (still lazy)
+                try:
+                    if "tie_result" in merged.columns:
+                        merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
+                    else:
+                        merged = merged.assign(tie_result=merged["tie_result_new"])
+                    if "tie_result_new" in merged.columns:
+                        merged = merged.drop(columns=["tie_result_new"])
+                    log_dedup.info("Coalesced tie_result (lazy).")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while coalescing tie_result: %s\n%s", repr(e), _tb.format_exc())
+                    raise
+
+                # Final materialization: compute only once, at the very end
+                try:
+                    # Small sanity check without pulling everything
+                    _ = merged.head(1)
+                    df_final = merged.compute()
+
+                    if "group_id" in df_final.columns:
+                        dup = df_final["group_id"].value_counts(dropna=True)
+                        n_big = int((dup > 1).sum())
+                        log_dedup.info("Sanity group_id: uniques=%d, ids_with_>1_occurrences=%d", int(dup.size), n_big)
+                    else:
+                        log_dedup.info("No group_id column present after dedup; skipping sanity counts.")
+
+                    current_workers = len(client.scheduler_info().get("workers", {}))
+                    log_dedup.info("WORKERS STILL RUNNING=%d.", current_workers)
+                    log_dedup.info("END deduplication: labels merged back into final dataframe (Dask)")
+                except Exception as e:
+                    import traceback as _tb
+                    log_dedup.error("FAILED while computing final dataframe: %s\n%s", repr(e), _tb.format_exc())
+                    raise
+
+            else:
+                # We require a valid LSDB collection root; Parquet fallback is no longer supported.
+                raise RuntimeError("Cannot run dedup: missing or invalid LSDB collection root; Parquet fallback removed.")
+
+            # Next phase runs below:
+            start_consolidate = True
+
 
     # ---------------------------------------------------------------
     # 5) CONSOLIDATION / EXPORT
@@ -1159,10 +1169,11 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         log_cons.warning("Could not snapshot df_final: %s", e_snap)
 
     try:
-        n_after_dedup = int(len(df_final))
-        log_cons.info("Rows after dedup (in-memory): %d", n_after_dedup)
+        n_rows_final = int(len(df_final))
+        log_cons.info("Rows in final dataframe (in-memory): %d", n_rows_final)
     except Exception as e:
         log_cons.warning("Could not compute len(df_final): %s", e)
+
 
     if combine_mode == "concatenate" and "tie_result" in df_final.columns:
         log_cons.info("Dropping 'tie_result' (concatenate mode)")
