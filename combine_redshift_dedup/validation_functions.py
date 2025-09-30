@@ -1438,30 +1438,64 @@ def analyze_groups_by_compared_to_fast(
 def analyze_groups_by_group_id_fast(
     df_final: pd.DataFrame,
     threshold: float = 0.0005,
-    max_groups: int | None = 5000,          # corte ANTES das agregações
+    max_groups: int | None = 5000,          # early cut BEFORE aggregations
     max_examples_per_case: int = 4,
     render: bool = True,
-    compute_same_source_pair: bool = False,  # desligue p/ ganhar tempo
+    compute_same_source_pair: bool = False,  # turn off to save time
     desired_order: list[str] | None = None,
     final_columns: list[str] | None = None,
 ) -> dict:
-    # --- cols mínimas
+    """
+    Ultra-fast manual inspection helper for dedup groups keyed by `group_id`.
+
+    Parameters
+    ----------
+    df_final : pd.DataFrame
+        Input DataFrame containing, at least, the columns listed in `need`.
+    threshold : float, default 0.0005
+        Delta-z threshold used to classify groups into "small" (<=) vs "large" (>).
+    max_groups : int | None, default 5000
+        Limit on number of groups (with size >= 2) considered for aggregation/rendering.
+        If None, consider all.
+    max_examples_per_case : int, default 4
+        Max number of example groups rendered per bucket/case.
+    render : bool, default True
+        If True, display summary and per-case sample groups.
+    compute_same_source_pair : bool, default False
+        If True, additionally compute SAME_SOURCE_PAIR bucket (slower).
+    desired_order : list[str] | None
+        Preferred column order for example tables (render only).
+    final_columns : list[str] | None
+        Minimal set of columns to display in example tables (render only).
+
+    Returns
+    -------
+    dict
+        {
+          "processed_groups": int,
+          "groups_by_case": dict[str, list[pd.DataFrame]],
+          "case_descriptions": dict[str, str],
+          "summary_counts": dict[str, int],
+        }
+    """
+    # --- minimal columns
     need = [
-        "group_id","CRD_ID","z","survey","z_flag_homogenized",
-        "instrument_type_homogenized","source","tie_result","compared_to","ra","dec"
+        "group_id", "CRD_ID", "z", "survey", "z_flag_homogenized",
+        "instrument_type_homogenized", "source", "tie_result", "compared_to", "ra", "dec",
     ]
     need = [c for c in need if c in df_final.columns]
     df = df_final[need].copy()
 
-    # --- dtypes rápidos
+    # --- fast dtypes
+    # group_id as nullable integer
     df["group_id"] = pd.to_numeric(df["group_id"], errors="coerce").astype("Int64")
     valid = df["group_id"].notna()
     if not valid.any():
         empty = {k: 0 for k in [
-            "CASE1_small_same","CASE1_small_diff","CASE1_large_same","CASE1_large_diff",
-            "CASE2_small_same","CASE2_small_diff","CASE2_large_same","CASE2_large_diff",
-            "TIE_FLAG_TYPE_BREAK_PAIR","TIE_FLAG_TYPE_BREAK_GROUP",
-            "SAME_FLAG_DIFF_TYPE","SAME_SOURCE_PAIR",
+            "CASE1_small_same", "CASE1_small_diff", "CASE1_large_same", "CASE1_large_diff",
+            "CASE2_small_same", "CASE2_small_diff", "CASE2_large_same", "CASE2_large_diff",
+            "TIE_FLAG_TYPE_BREAK_PAIR", "TIE_FLAG_TYPE_BREAK_GROUP",
+            "SAME_FLAG_DIFF_TYPE", "SAME_SOURCE_PAIR",
         ]}
         return {
             "processed_groups": 0,
@@ -1470,26 +1504,32 @@ def analyze_groups_by_group_id_fast(
             "summary_counts": empty,
         }
 
-    # z como float (uma vez só)
+    # z as float (only once for valid rows)
     zf = pd.to_numeric(df.loc[valid, "z"], errors="coerce").astype("float64")
     df.loc[valid, "z"] = zf.values
 
-    # strings -> category (barateia nunique)
-    for col in ("survey","z_flag_homogenized","instrument_type_homogenized"):
+    # --- SAFE categorical promotion for string-like columns
+    # NOTE: never cast only a slice to category (it breaks with StringDtype/CSV).
+    # Cast the entire column after normalizing to StringDtype and (optionally) masking non-valid rows.
+    for col in ("survey", "z_flag_homogenized", "instrument_type_homogenized"):
         if col in df.columns:
-            df.loc[valid, col] = df.loc[valid, col].astype("string").astype("category")
+            # Normalize whole column to StringDtype
+            df[col] = df[col].astype("string")
+            # Optional: ensure rows outside 'valid' are NA so categories reflect valid groups
+            df.loc[~valid, col] = pd.NA
+            # Cast entire column to category
+            df[col] = df[col].astype("category")
 
-    # --- corte prévio de grupos
+    # --- pre-cut groups: keep only groups with size >= 2
     gids_all = df.loc[valid, "group_id"]
-    # mantenha apenas grupos com tamanho >=2
     vc = gids_all.value_counts(sort=False)
     gids_ge2 = vc.index[vc.ge(2)]
     if len(gids_ge2) == 0:
         empty = {k: 0 for k in [
-            "CASE1_small_same","CASE1_small_diff","CASE1_large_same","CASE1_large_diff",
-            "CASE2_small_same","CASE2_small_diff","CASE2_large_same","CASE2_large_diff",
-            "TIE_FLAG_TYPE_BREAK_PAIR","TIE_FLAG_TYPE_BREAK_GROUP",
-            "SAME_FLAG_DIFF_TYPE","SAME_SOURCE_PAIR",
+            "CASE1_small_same", "CASE1_small_diff", "CASE1_large_same", "CASE1_large_diff",
+            "CASE2_small_same", "CASE2_small_diff", "CASE2_large_same", "CASE2_large_diff",
+            "TIE_FLAG_TYPE_BREAK_PAIR", "TIE_FLAG_TYPE_BREAK_GROUP",
+            "SAME_FLAG_DIFF_TYPE", "SAME_SOURCE_PAIR",
         ]}
         return {
             "processed_groups": 0,
@@ -1499,29 +1539,29 @@ def analyze_groups_by_group_id_fast(
         }
 
     if max_groups is not None and len(gids_ge2) > max_groups:
-        # cortes simples: pegue os primeiros N (mantém ordem natural/índice)
+        # Simple truncation: first N (preserve natural order/index)
         gids_ge2 = gids_ge2[:max_groups]
 
     df = df[df["group_id"].isin(gids_ge2)]
 
-    # --- agregações vetorizadas
+    # --- vectorized aggregations
     gb = df.groupby("group_id", sort=False)
     agg_meta = gb.agg(
-        size=("CRD_ID","size"),
-        z_min=("z","min"),
-        z_max=("z","max"),
-        survey_nuniq=("survey","nunique"),
-        zflag_nuniq=("z_flag_homogenized","nunique"),
-        itype_nuniq=("instrument_type_homogenized","nunique"),
+        size=("CRD_ID", "size"),
+        z_min=("z", "min"),
+        z_max=("z", "max"),
+        survey_nuniq=("survey", "nunique"),
+        zflag_nuniq=("z_flag_homogenized", "nunique"),
+        itype_nuniq=("instrument_type_homogenized", "nunique"),
     )
 
     dz = (agg_meta["z_max"] - agg_meta["z_min"]).astype(float)
     all_leq = dz.le(float(threshold)).fillna(False)
     same_survey = agg_meta["survey_nuniq"].eq(1)
-    is_pair  = agg_meta["size"].eq(2)
+    is_pair = agg_meta["size"].eq(2)
     is_group = agg_meta["size"].ge(3)
 
-    # classificações
+    # --- case classification
     case = pd.Series(index=agg_meta.index, dtype="string")
     case.loc[is_pair & all_leq &  same_survey] = "CASE1_small_same"
     case.loc[is_pair & all_leq & ~same_survey] = "CASE1_small_diff"
@@ -1534,23 +1574,23 @@ def analyze_groups_by_group_id_fast(
     case.loc[is_group & ~all_leq & ~same_survey] = "CASE2_large_diff"
 
     tie_mask = (
-        agg_meta["zflag_nuniq"].eq(1) &
-        agg_meta["itype_nuniq"].gt(1) &
-        agg_meta["survey_nuniq"].gt(1)
+        agg_meta["zflag_nuniq"].eq(1)
+        & agg_meta["itype_nuniq"].gt(1)
+        & agg_meta["survey_nuniq"].gt(1)
     )
-    tie_pair_ids  = set(agg_meta.index[ is_pair  & tie_mask])
-    tie_group_ids = set(agg_meta.index[ is_group & tie_mask])
+    tie_pair_ids = set(agg_meta.index[is_pair & tie_mask])
+    tie_group_ids = set(agg_meta.index[is_group & tie_mask])
 
     samesrc_ids = set()
     if compute_same_source_pair and len(tie_pair_ids) != 0:
-        # restrinja ao universo de pares (barato)
+        # Restrict to pairs (cheap)
         pair_ids = agg_meta.index[is_pair]
-        sub = df[df["group_id"].isin(pair_ids)][["group_id","source"]].copy()
+        sub = df[df["group_id"].isin(pair_ids)][["group_id", "source"]].copy()
         src = sub["source"].astype("string").str.strip().str.lower().fillna("")
         nun = sub.assign(_src=src).groupby("group_id")["_src"].nunique(dropna=False)
         samesrc_ids = set(nun.index[nun.eq(1)])
 
-    # buckets -> sets de group_id
+    # --- buckets (sets of group_id)
     buckets = {
         "CASE1_small_same": set(case.index[case.eq("CASE1_small_same")]),
         "CASE1_small_diff": set(case.index[case.eq("CASE1_small_diff")]),
@@ -1562,13 +1602,15 @@ def analyze_groups_by_group_id_fast(
         "CASE2_large_diff": set(case.index[case.eq("CASE2_large_diff")]),
         "TIE_FLAG_TYPE_BREAK_PAIR":  tie_pair_ids,
         "TIE_FLAG_TYPE_BREAK_GROUP": tie_group_ids,
-        "SAME_FLAG_DIFF_TYPE": set(agg_meta.index[ is_group & agg_meta["zflag_nuniq"].eq(1) & agg_meta["itype_nuniq"].gt(1) ]),
+        "SAME_FLAG_DIFF_TYPE": set(
+            agg_meta.index[is_group & agg_meta["zflag_nuniq"].eq(1) & agg_meta["itype_nuniq"].gt(1)]
+        ),
         "SAME_SOURCE_PAIR": samesrc_ids,
     }
 
     summary_counts = {k: len(v) for k, v in buckets.items()}
 
-    # --- mapeamento de descrições disponível também durante o render
+    # --- case descriptions (also used during rendering)
     case_descriptions_local = {
         "CASE1_small_same": f"pair with Δz ≤ {threshold} from the same survey",
         "CASE1_small_diff": f"pair with Δz ≤ {threshold} from different surveys",
@@ -1584,28 +1626,28 @@ def analyze_groups_by_group_id_fast(
         "SAME_SOURCE_PAIR": "pair with identical source (normalized, non-null)",
     }
 
-    # --- render only samples
+    # --- render examples per bucket
     groups_by_case = {k: [] for k in buckets}
 
     if render and max_examples_per_case > 0:
-        # Safe defaults para ordenação/seleção de colunas
+        # Safe defaults for column ordering/selection
         if desired_order is None:
             desired_order = [
-                "CRD_ID","ra","dec","z","z_flag_homogenized","instrument_type_homogenized",
-                "survey","source","tie_result","compared_to","group_id",
+                "CRD_ID", "ra", "dec", "z", "z_flag_homogenized", "instrument_type_homogenized",
+                "survey", "source", "tie_result", "compared_to", "group_id",
             ]
         if final_columns is None:
             final_columns = [
-                "CRD_ID","ra","dec","z","z_flag_homogenized","instrument_type_homogenized",
-                "survey","source","tie_result","compared_to","group_id",
+                "CRD_ID", "ra", "dec", "z", "z_flag_homogenized", "instrument_type_homogenized",
+                "survey", "source", "tie_result", "compared_to", "group_id",
             ]
 
-        sizes = agg_meta["size"]  # índice = group_id (Int64)
+        sizes = agg_meta["size"]  # index = group_id (Int64)
         for name, gid_set in buckets.items():
             if not gid_set:
                 continue
 
-            # Alinha ids do bucket à série sizes, ordena maiores primeiro
+            # Align ids with sizes, then sort by size (desc)
             idx = pd.Index(list(gid_set), dtype="Int64")
             s = sizes.reindex(idx)
             s = s.sort_values(ascending=False, kind="stable")
@@ -1615,29 +1657,29 @@ def analyze_groups_by_group_id_fast(
 
             sample = df[df["group_id"].isin(pick)].copy()
 
-            # “role”: menor CRD_ID do grupo = principal
+            # "role": principal = smallest CRD_ID within the group
             sample["CRD_ID_str"] = sample["CRD_ID"].astype(str)
             first = sample.groupby("group_id")["CRD_ID_str"].transform("min")
             sample["role"] = np.where(sample["CRD_ID_str"].eq(first), "principal", "compared")
             sample = sample.drop(columns=["CRD_ID_str"])
 
-            # Reordenar colunas para leitura
+            # Reorder columns for readability
             ordered = desired_order + [c for c in sample.columns if c not in desired_order]
             sample = sample.reindex(columns=ordered)
             cols_present = [c for c in final_columns if c in sample.columns]
             sample = sample[cols_present + (["role"] if "role" in sample.columns else [])]
 
-            # 1 DataFrame por group_id
+            # One DataFrame per group_id
             for gid in pick:
                 gdf = sample[sample["group_id"].eq(gid)].reset_index(drop=True)
                 groups_by_case[name].append(gdf)
 
-        # ---- rendering (robusto)
+        # --- robust rendering
         try:
             try:
                 from IPython.display import display, Markdown  # type: ignore
             except Exception:
-                def display(x): print(x)
+                def display(x): print(x)       # fallback: plain print
                 def Markdown(x): return x
 
             compute_same_source_pair_safe = bool(locals().get("compute_same_source_pair", False))
@@ -1651,8 +1693,8 @@ def analyze_groups_by_group_id_fast(
 
             if any(summary_counts.values()):
                 summary_df = (
-                    pd.DataFrame(summary_counts.items(), columns=["case","count"])
-                    .sort_values(["count","case"], ascending=[False, True], ignore_index=True)
+                    pd.DataFrame(summary_counts.items(), columns=["case", "count"])
+                    .sort_values(["count", "case"], ascending=[False, True], ignore_index=True)
                 )
                 display(Markdown("#### Groups per bucket"))
                 display(summary_df)
@@ -1679,12 +1721,11 @@ def analyze_groups_by_group_id_fast(
             print(_tb.format_exc())
 
     return {
-        "processed_groups": int((agg_meta["size"]>=2).sum()),
+        "processed_groups": int((agg_meta["size"] >= 2).sum()),
         "groups_by_case": groups_by_case,
         "case_descriptions": case_descriptions_local,
         "summary_counts": summary_counts,
     }
-
 
 
 def _parse_tokens(s: pd.Series) -> pd.Series:

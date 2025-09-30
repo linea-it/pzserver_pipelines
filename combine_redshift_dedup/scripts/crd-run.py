@@ -67,6 +67,23 @@ from combine_redshift_dedup.packages.utils import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _log_remote_future_exception(
+    lg: logging.LoggerAdapter, fut, msg_prefix: str, extra: dict | None = None
+) -> None:
+    """
+    Logs the remote (worker-side) traceback carried by a Dask Future.
+    """
+    import traceback as _tb
+    try:
+        err = fut.exception()
+        tb = fut.traceback()  # remote TB; can be None
+        if tb is not None:
+            lg.error("%s: %r", msg_prefix, err, exc_info=(type(err), err, tb), extra=extra)
+        else:
+            # Fallback: driver-side traceback (should still exist)
+            lg.error("%s: %r\n%s", msg_prefix, err, _tb.format_exc(), extra=extra)
+    except Exception:
+        lg.error("%s (and failed to render remote traceback)\n%s", msg_prefix, _tb.format_exc(), extra=extra)
 
 def _phase_logger(base_logger: logging.Logger, phase: str) -> logging.LoggerAdapter:
     """Return a LoggerAdapter that injects the phase into records."""
@@ -269,6 +286,74 @@ def _auto_cross_worker(info: dict, logs_dir: str, translation_config: dict):
     return out_auto
 
 # ---------------------------------------------------------------------------
+# Parallel crossmatch worker
+# ---------------------------------------------------------------------------
+def _xmatch_worker(
+    left_collection_path: str,
+    right_collection_path: str,
+    logs_dir: str,
+    temp_dir: str,
+    step: int,
+    translation_config: dict,
+) -> str:
+    """
+    Open two HATS collections and run crossmatch_tiebreak_safe.
+    Returns a collection path (root or subcatalog).
+    """
+    try:
+        ensure_crc_logger(logs_dir)
+    except Exception:
+        pass
+
+    left_cat = lsdb.open_catalog(left_collection_path)
+    right_cat = lsdb.open_catalog(right_collection_path)
+
+    return crossmatch_tiebreak_safe(
+        left_cat=left_cat,
+        right_cat=right_cat,
+        logs_dir=logs_dir,
+        temp_dir=temp_dir,
+        step=step,
+        client=None,  # not needed on LSDB path
+        translation_config=translation_config,
+        do_import=True,
+    )
+
+# ---------------------------------------------------------------------------
+# Cleanup for crossmatch tournment
+# ---------------------------------------------------------------------------
+def _cleanup_inputs_of_merge(
+    left_root: str,
+    right_root: str,
+    lg: logging.LoggerAdapter,
+) -> None:
+    """
+    Remove only the two input collections that were just merged.
+    Accepts either a collection root or a subcatalog and normalizes to root.
+    """
+    def _to_root(p: str) -> str:
+        n = _normalize_collection_root(p) or p
+        return n
+
+    def _rm_root(p: str) -> None:
+        if not p:
+            return
+        try:
+            if os.path.isdir(p) and _is_collection_root(p):
+                shutil.rmtree(p, ignore_errors=True)
+                lg.info("Deleted input collection: %s", p)
+        except Exception as e:
+            lg.warning("Could not delete input collection %s: %s", p, e)
+
+    lroot = _to_root(left_root)
+    rroot = _to_root(right_root)
+    if lroot and rroot and (lroot != rroot):
+        if _is_collection_root(lroot):
+            _rm_root(lroot)
+        if _is_collection_root(rroot):
+            _rm_root(rroot)
+
+# ---------------------------------------------------------------------------
 # Publish / copy helpers
 # ---------------------------------------------------------------------------
 def _copy_file(src: str, dst: str, lg: logging.LoggerAdapter) -> None:
@@ -414,11 +499,47 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
     combine_mode = param_config.get("combine_type", "concatenate_and_mark_duplicates").lower()
     completed = read_completed_steps(os.path.join(temp_dir, "process_resume.log"))
-    log_init.info("END init: pipeline bootstrap")
-
+ 
     # --- Dask cluster/client ---
     cluster = get_executor(config["executor"], logs_dir=logs_dir)
     client = Client(cluster)
+    
+    # Ensure the minimum number of workers start within 10 seconds
+    exec_args = config.get("executor", {}).get("args", {}) or {}
+    instance_cfg = exec_args.get("instance", {}) or {}
+    scale_cfg = exec_args.get("scale", {}) or {}
+    
+    procs = int(instance_cfg.get("processes", 1) or 1)
+    min_jobs = scale_cfg.get("minimum_jobs")
+    min_workers = 0 if min_jobs is None else int(min_jobs) * procs
+    
+    if min_workers > 0:
+        log_init.info("Waiting up to 10s for minimum_workers=%d to start...", min_workers)
+        try:
+            client.wait_for_workers(min_workers, timeout=10)
+        except Exception:
+            current_workers = len(client.scheduler_info().get("workers", {}))
+            log_init.warning(
+                "Timeout: waited 10 seconds but minimum_workers=%d did not start "
+                "(current=%d). Proceeding anyway.",
+                min_workers,
+                current_workers,
+            )
+        else:
+            current_workers = len(client.scheduler_info().get("workers", {}))
+            log_init.info(
+                "Confirmed: minimum_workers=%d started within 10s (current=%d).",
+                min_workers,
+                current_workers,
+            )
+
+    current_workers = len(client.scheduler_info().get("workers", {}))
+    log_init.info(
+        "WORKERS STILL RUNNING=%d.",
+        current_workers,
+    )
+    
+    log_init.info("END init: pipeline bootstrap")
 
     # Dask perf report (global)
     global_report_path = os.path.join(logs_dir, "main_dask_report.html")
@@ -516,6 +637,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             if tag not in completed:
                 log_step(resume_log, tag)
 
+        current_workers = len(client.scheduler_info().get("workers", {}))
+        log_prep.info(
+            "WORKERS STILL RUNNING=%d.",
+            current_workers,
+        )
+
         log_prep.info("END preparation: finished prepared collections")
 
         # ---------------------------------------------------------------
@@ -544,7 +671,6 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
         # If you have already finished crossmatching, retrieve the collection root (if it exists) for distributed dedup.
         final_collection_path = _recover_final_collection_path() if crossmatch_already_done else None
-
 
         # ---------------------------------------------------------------
         # 2) AUTO MATCH (self crossmatch over each prepared)
@@ -617,6 +743,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 else:
                     log_auto.info("No auto-crossmatch needed (all *_hats_auto present).")
 
+                current_workers = len(client.scheduler_info().get("workers", {}))
+                log_auto.info(
+                    "WORKERS STILL RUNNING=%d.",
+                    current_workers,
+                )
+
                 log_auto.info("END automatch: all *_hats_auto guaranteed on disk")
 
             # -----------------------------------------------------------
@@ -639,396 +771,196 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
 
         # ---------------------------------------------------------------
-        # 3) CROSSMATCH (no tie-breaking)
+        # 3) CROSSMATCH (parallel tournament; no per-step resume)
         # ---------------------------------------------------------------
         log_cross = _phase_logger(base_logger, "crossmatch")
-        log_cross.info("START crossmatch: iterative merges over prepared *_hats_auto")
+        log_cross.info("START crossmatch (parallel tournament) over prepared *_hats_auto")
 
         if combine_mode == "concatenate":
             # Simple concat mode still passes through consolidation phase later.
             log_cross.info("Concatenate mode selected (no crossmatch).")
-            df_final = dd.concat([dd.read_parquet(i["prepared_path"]) for i in prepared_info]).compute()
-            log_cross.info("END crossmatch: concatenate mode (no crossmatch performed)")
+            try:
+                log_cross.info("Concatenating %d prepared catalogs.", len(prepared_info))
+                for _pi in prepared_info[:5]:
+                    log_cross.debug("Prepared path candidate: %s", _pi.get("prepared_path"))
+                df_final = dd.concat([dd.read_parquet(i["prepared_path"]) for i in prepared_info])
+                _ = df_final.head(1, compute=True)  # small schema sanity
+                df_final = df_final.compute()
+                log_cross.info("Concatenate compute finished: shape=%s", tuple(df_final.shape))
+            except Exception as e:
+                import traceback as _tb
+                log_cross.error("FAILED while concatenating prepared catalogs: %s\n%s", repr(e), _tb.format_exc())
+                raise
 
-            # Consolidation will run below
+            try:
+                current_workers = len(client.scheduler_info().get("workers", {}))
+                log_cross.info("WORKERS STILL RUNNING=%d.", current_workers)
+            except Exception as e:
+                log_cross.debug("Could not query scheduler_info workers: %s", e)
+
+            log_cross.info("END crossmatch: concatenate mode (no crossmatch performed)")
             start_consolidate = True
 
         elif combine_mode in ("concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"):
 
             if crossmatch_already_done:
-                # Crossmatch chain already finished previously (by resume log or presence of merged_step{final})
+                # Crossmatch chain already finished previously (by merged_step{final} presence)
                 log_cross.info(
-                    "Skip crossmatch loop: already finalized at step %d (resume/merged present).",
+                    "Skip crossmatch: already finalized at step %d (merged_step present).",
                     final_step,
                 )
-                # No df_final here; dedup will read merged_step{final} directly.
                 start_consolidate = False  # dedup still runs before consolidation
 
             else:
-                # === Normal iterative crossmatch flow ===
-                init = prepared_info[0]
-                cat_prev = lsdb.open_catalog(init["collection_path"])  # *_hats_auto
-                start_i = 1
-                final_collection_path = None  # set when last step finishes
+                # === Parallel tournament without per-step resume ===
+                try:
+                    _resume_set(resume_log, "phase.crossmatch", "started", log_cross)
 
-                for i in range(start_i, len(prepared_info)):
-                    tag = f"crossmatch_step{i}"
-                    info_i = prepared_info[i]
+                    # Ensure all prepared_info[i]["collection_path"] are *_hats_auto
+                    for info in prepared_info:
+                        hats_auto = info["prepared_path"] + "_hats_auto"
+                        if os.path.isdir(hats_auto):
+                            info["collection_path"] = hats_auto
+                        else:
+                            raise FileNotFoundError(f"Missing *_hats_auto for: {info['internal_name']}")
 
-                    if tag in completed:
-                        log_cross.info("Skip completed step: %s", tag)
-                        resume_key = f"{tag}.collection_path"
-                        resumed_col = _resume_get(resume_log, resume_key)
-                        resumed_col = _normalize_collection_root(resumed_col)
-                        if resumed_col and _is_collection_root(resumed_col):
-                            log_cross.info("Resume collection root for %s: %s", tag, resumed_col)
-                            cat_prev = lsdb.open_catalog(resumed_col)
-                            if i == final_step:
-                                final_collection_path = resumed_col
-                        elif i == final_step and final_collection_path is None:
-                            guessed = _guess_collection_for_step(temp_dir, i)
-                            if guessed:
-                                log_cross.info("Guessed collection root for %s: %s", tag, guessed)
-                                final_collection_path = guessed
-                        continue
+                    max_inflight_pairs = int(param_config.get("cross_max_inflight", 5))
+                    log_cross.info("Max inflight crossmatch pairs: %d", max_inflight_pairs)
 
-                    # Open next *_hats_auto catalog and crossmatch
-                    cat_curr = lsdb.open_catalog(info_i["collection_path"])
-                    target_name = info_i["internal_name"]
-                    log_cross.info("Crossmatching previous result with: %s", target_name)
+                    # Build initial queue of nodes (label, root_path)
+                    from collections import deque
+                    nodes = deque()
+                    for info in prepared_info:
+                        root = _normalize_collection_root(info["collection_path"]) or info["collection_path"]
+                        if not _is_hats_collection(root):
+                            raise RuntimeError(f"Not a HATS collection: {root}")
+                        root = _normalize_collection_root(root) or root  # normalize to root if subcatalog
+                        nodes.append((info["internal_name"], root))
 
-                    is_last = (i == final_step)
-                    crossmatch_result = crossmatch_tiebreak_safe(
-                        left_cat=cat_prev,
-                        right_cat=cat_curr,
-                        logs_dir=logs_dir,
-                        temp_dir=temp_dir,
-                        step=i,
-                        client=client,
-                        translation_config=translation_config,
-                        do_import=True,  # returns collection path (root or subcat)
-                    )
-
-                    log_cross.info("Raw crossmatch path returned: %s", crossmatch_result)
-                    norm = _normalize_collection_root(crossmatch_result)
-                    if norm != crossmatch_result:
-                        log_cross.info("Normalized to collection root: %s", norm)
-
-                    if not _is_hats_collection(norm):
-                        log_cross.warning("Returned path does not look like a HATS collection: %s", crossmatch_result)
-
-                    cat_prev = lsdb.open_catalog(norm)
-                    _resume_set(resume_log, f"{tag}.collection_path", norm, log_cross)
-                    if is_last:
-                        final_collection_path = norm
-
-                    log_step(resume_log, tag)
-                    if delete_temp_files:
-                        _cleanup_previous_step(i, prepared_info, temp_dir, log_cross)
-
-                log_cross.info("END crossmatch: graph merge completed")
-                start_consolidate = False
-
-
-            # -----------------------------------------------------------
-            # 4) DEDUPLICATION
-            # -----------------------------------------------------------
-            log_dedup = _phase_logger(base_logger, "deduplication")
-            log_dedup.info("START deduplication: LSDB graph labeling and tie consolidation")
-
-            # Ensure final collection root for dedup
-            if not final_collection_path:
-                resumed = _resume_get(resume_log, f"crossmatch_step{final_step}.collection_path")
-                resumed = _normalize_collection_root(resumed)
-                if resumed and _is_collection_root(resumed):
-                    final_collection_path = resumed
-                    log_dedup.info("Recovered final collection root from resume: %s", final_collection_path)
-                else:
-                    guessed = _guess_collection_for_step(temp_dir, final_step)
-                    if guessed:
-                        final_collection_path = guessed
-                        log_dedup.info("Guessed final collection root from disk: %s", final_collection_path)
-
-            final_merged_path = os.path.join(temp_dir, f"merged_step{final_step}")
-            if not os.path.exists(final_merged_path):
-                log_dedup.error("Final merged Parquet folder not found: %s", final_merged_path)
-                client.close()
-                cluster.close()
-                return
-
-            n_before = int(dd.read_parquet(final_merged_path).shape[0].compute())
-            log_dedup.info("Rows before dedup (final_merged): %d", n_before)
-
-            use_distributed = final_collection_path is not None and _is_collection_root(final_collection_path)
-
-            # --- Safe config parsing ---
-            tiebreaking_priority_cfg = translation_config.get("tiebreaking_priority")
-            if isinstance(tiebreaking_priority_cfg, (str, bytes)):
-                tiebreaking_priority_cfg = [str(tiebreaking_priority_cfg)]
-            if not isinstance(tiebreaking_priority_cfg, (list, tuple)) or not tiebreaking_priority_cfg:
-                raise TypeError("tiebreaking_priority must be a non-empty list of column names.")
-
-            instrument_type_priority_cfg = translation_config.get("instrument_type_priority")
-            if "instrument_type_homogenized" in set(tiebreaking_priority_cfg) and not isinstance(instrument_type_priority_cfg, dict):
-                raise TypeError(
-                    "instrument_type_priority must be a mapping when "
-                    "'instrument_type_homogenized' is present in tiebreaking_priority."
-                )
-            delta_z_threshold_cfg = float(translation_config.get("delta_z_threshold", 0.0))
-
-            #######################################################################
-            # Diagnostics / outputs
-            # - edge_log: enable edge diagnostics (warn on star-neighbor exclusions)
-            # - group_col: set to None to disable exporting group labels
-            edge_log = True
-            group_col = "group_id"  # None to deactivate
-            #######################################################################
-
-            if use_distributed:
-                log_dedup.info("Running graph-based dedup on final merged collection (map_partitions)")
-                final_collection_path = _normalize_collection_root(final_collection_path)
-                log_dedup.info("final_collection_root: %s", final_collection_path)
-
-                if not _is_collection_root(final_collection_path):
-                    raise RuntimeError(f"Expected collection root at: {final_collection_path}")
-
-                # Discover subcatalogs
-                base = os.path.basename(final_collection_path.rstrip("/"))
-                main_subcat_path = os.path.join(final_collection_path, base)
-                log_dedup.info("Expected main subcatalog path: %s", main_subcat_path)
-                if not _is_hats_subcatalog(main_subcat_path):
-                    raise RuntimeError(f"Main subcatalog not found: {main_subcat_path}")
-
-                final_cat = lsdb.open_catalog(main_subcat_path)
-                log_dedup.info("Opened main subcatalog.")
-
-                # Optional margin (*arcs), prefer 5arcs if present
-                arcs_candidates = [p for p in glob.glob(os.path.join(final_collection_path, "*arcs")) if _is_hats_subcatalog(p)]
-                if arcs_candidates:
-                    def _arc_val(p):
-                        m = re.search(r"([\d.]+)\s*arcs$", os.path.basename(p))
-                        return float(m.group(1)) if m else float("inf")
-                    if any(abs(_arc_val(p) - 5.0) < 1e-12 for p in arcs_candidates):
-                        pick = min(arcs_candidates, key=lambda p: abs(_arc_val(p) - 5.0))
+                    # Edge case: only one catalog
+                    if len(nodes) == 1:
+                        final_collection_path = nodes[0][1]
+                        _resume_set(resume_log, "phase.crossmatch", "completed", log_cross)
+                        log_cross.info("Only one prepared collection; skipping crossmatch. final=%s", final_collection_path)
+                        start_consolidate = False
                     else:
-                        pick = min(arcs_candidates, key=lambda p: _arc_val(p))
-                    log_dedup.info("Attaching margin subcatalog: %s", pick)
-                    final_cat.margin = lsdb.open_catalog(pick)
-                else:
-                    log_dedup.info("No *arcs margin found; proceeding without margin.")
-                    final_cat.margin = None
+                        # Futures pipeline
+                        ready = deque(nodes)
+                        carry: tuple[str, str] | None = None
 
-                if not hasattr(final_cat, "_ddf"):
-                    raise RuntimeError("Main subcatalog does not expose _ddf.")
+                        # Use future.key (string) to avoid identity KeyError
+                        inflight_meta: dict[str, tuple] = {}  # fut.key -> (l_lab, l_path, r_lab, r_path, step_id)
+                        step_id = 1  # diagnostic numbering only
 
-                # Compute labels per partition. Guard-restore is inside deduplicate_pandas.
-                try:
-                    labels = run_dedup_with_lsdb_map_partitions(
-                        final_cat,
-                        tiebreaking_priority=tiebreaking_priority_cfg,
-                        instrument_type_priority=(instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None),
-                        delta_z_threshold=delta_z_threshold_cfg,
-                        crd_col="CRD_ID",
-                        compared_col="compared_to",
-                        z_col="z",
-                        tie_col="tie_result",
-                        edge_log=edge_log,
-                        group_col=group_col,
-                    )
-                    log_dedup.info("Labels Dask graph built (lazy). Preparing merge...")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while building labels Dask graph: %s\n%s", repr(e), _tb.format_exc())
-                    raise
+                        # as_completed instance where we add futures as we submit them
+                        ac3 = as_completed()
 
-                # Read once for the final merge; align CRD_ID dtypes with labels.
-                try:
-                    df_all = dd.read_parquet(final_merged_path)
-                    try:
-                        df_all  = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
-                        labels  = labels.assign(CRD_ID=labels["CRD_ID"].astype("string[pyarrow]"))
-                    except Exception:
-                        df_all  = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
-                        labels  = labels.assign(CRD_ID=labels["CRD_ID"].astype("string"))
-                    log_dedup.info("Aligned CRD_ID dtypes between base and labels.")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while reading base parquet or aligning dtypes: %s\n%s", repr(e), _tb.format_exc())
-                    raise
+                        def _submit_pair() -> bool:
+                            nonlocal step_id
+                            if len(ready) < 2:
+                                return False
+                            if len(inflight_meta) >= max_inflight_pairs:
+                                return False
+                            l_lab, l_path = ready.popleft()
+                            r_lab, r_path = ready.popleft()
+                            fut = client.submit(
+                                _xmatch_worker,
+                                l_path,
+                                r_path,
+                                logs_dir,
+                                temp_dir,
+                                step_id,
+                                translation_config,
+                                pure=False,
+                            )
+                            inflight_meta[fut.key] = (l_lab, l_path, r_lab, r_path, step_id)
+                            ac3.add(fut)  # add immediately to as_completed
+                            log_cross.info("Submitted crossmatch pair: step=%d | %s VS %s", step_id, l_lab, r_lab)
+                            step_id += 1
+                            return True
 
-                # Keep only the columns needed for the merge; rename tie_result.
-                try:
-                    rhs_dd = labels.rename(columns={"tie_result": "tie_result_new"})
-                    keep_cols = ["CRD_ID", "tie_result_new"]
-                    if group_col and (group_col in rhs_dd.columns):
-                        keep_cols.append(group_col)
-                    rhs_dd = rhs_dd[keep_cols]
-                    log_dedup.info("Prepared labels rhs_dd with columns: %s", keep_cols)
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while preparing rhs_dd: %s\n%s", repr(e), _tb.format_exc())
-                    raise
+                        # Prime the pump
+                        while _submit_pair():
+                            pass
 
-                # Clear divisions before shuffle-based merge (assign back!).
-                try:
-                    try:
-                        df_all = df_all.clear_divisions()
-                    except Exception:
-                        pass
-                    try:
-                        rhs_dd = rhs_dd.clear_divisions()
-                    except Exception:
-                        pass
-                    log_dedup.info("Cleared divisions for shuffle merge.")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while clearing divisions: %s\n%s", repr(e), _tb.format_exc())
-                    raise
+                        final_collection_path: str | None = None
 
-                # Merge and compute labels to catch issues early
-                try:
-                    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-                        merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
-                    log_dedup.info("Dask merge graph built (lazy). Computing a small sample for sanity...")
-                    # Compute a small sample to validate schema early
-                    _ = merged.head(1)
-                    log_dedup.info("Merge sample computed successfully.")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED during merge (distributed branch): %s\n%s", repr(e), _tb.format_exc())
-                    raise
+                        while inflight_meta or (len(ready) + (1 if carry else 0) > 1):
+                            # Process the next completed pair if any
+                            if inflight_meta:
+                                fut = next(ac3)
+                                meta = inflight_meta.pop(fut.key, None)
+                                if meta is None:
+                                    # Received a completion for an unknown/detached future; log and continue.
+                                    _log_remote_future_exception(
+                                        log_cross, fut,
+                                        "Received completion for an unknown Future"
+                                    )
+                                    continue
 
-            else:
-                log_dedup.warning(
-                    "final_collection_path missing or not a collection root; falling back to driver-side pandas dedup."
-                )
-                try:
-                    base_dd = dd.read_parquet(final_merged_path, engine="pyarrow", split_row_groups=True)
-                    available = set(map(str, base_dd.columns))
-                    required_base = {"CRD_ID", "compared_to", "z"}
-                    missing_base = sorted(required_base - available)
-                    if missing_base:
-                        raise KeyError(f"Missing required columns: {missing_base}")
+                                l_lab, l_path, r_lab, r_path, sid = meta
+                                try:
+                                    raw_out = fut.result()
+                                except Exception:
+                                    _log_remote_future_exception(
+                                        log_cross, fut,
+                                        f"Crossmatch failed (step {sid}: {l_lab} vs {r_lab})"
+                                    )
+                                    raise
 
-                    priority_set = set(tiebreaking_priority_cfg or [])
-                    missing_priority = sorted([c for c in priority_set if c not in available])
-                    if missing_priority:
-                        raise KeyError(f"Missing priority columns: {missing_priority}")
+                                out_root = _normalize_collection_root(raw_out) or raw_out
+                                if not _is_hats_collection(out_root):
+                                    log_cross.warning("crossmatch returned a non-HATS path (step %d): %s", sid, raw_out)
 
-                    optional_candidates = {"z_flag_homogenized", "instrument_type_homogenized"}
-                    optional_present = (optional_candidates - priority_set) & available
-                    maybe_tie_result = {"tie_result"} & available  # bring original tie_result if present
-                    needed = sorted(required_base | priority_set | optional_present | maybe_tie_result)
-                    pdf = base_dd[needed].compute()
-                    log_dedup.info("Driver-side dataframe computed for dedup: shape=%s", tuple(pdf.shape))
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED while loading base data for driver-side dedup: %s\n%s", repr(e), _tb.format_exc())
-                    raise
+                                # Delicate cleanup — delete only the two inputs consumed by this merge
+                                if delete_temp_files:
+                                    try:
+                                        _cleanup_inputs_of_merge(l_path, r_path, log_cross)
+                                    except Exception as e:
+                                        log_cross.warning("Cleanup of inputs for step %d failed (non-fatal): %s", sid, e)
 
-                # Run solver on driver (guard-restore happens inside).
-                try:
-                    pdf_out = deduplicate_pandas(
-                        pdf,
-                        tiebreaking_priority=tiebreaking_priority_cfg,
-                        instrument_type_priority=instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None,
-                        delta_z_threshold=delta_z_threshold_cfg,
-                        crd_col="CRD_ID",
-                        compared_col="compared_to",
-                        z_col="z",
-                        tie_col="tie_result",
-                        edge_log=edge_log,
-                        partition_tag="[driver]",
-                        logger=_phase_logger(),
-                        group_col=group_col,
-                    )
-                    log_dedup.info("Driver-side labels computed: shape=%s", tuple(pdf_out.shape))
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED inside deduplicate_pandas (driver branch): %s\n%s", repr(e), _tb.format_exc())
-                    raise
+                                # Winner goes back into the queue
+                                ready.append((f"merged_step{sid}", out_root))
+                                final_collection_path = out_root  # keep last seen
 
-                # Merge new labels back (driver branch)
-                try:
-                    df_all = dd.read_parquet(final_merged_path)
-                    cols = ["CRD_ID", "tie_result"]
-                    if group_col and (group_col in pdf_out.columns):
-                        cols.append(group_col)
+                                # Keep the pipeline saturated
+                                while _submit_pair():
+                                    pass
 
-                    rhs_pdf = pdf_out.loc[:, cols].rename(columns={"tie_result": "tie_result_new"})
-                    rhs_dd = dd.from_pandas(rhs_pdf, npartitions=max(1, df_all.npartitions))
+                            # If we have a carry and something ready, try to form a new pair
+                            if carry and ready:
+                                ready.appendleft(carry)
+                                carry = None
+                                while _submit_pair():
+                                    pass
 
-                    try:
-                        df_all = df_all.clear_divisions()
-                    except Exception:
-                        pass
-                    try:
-                        rhs_dd = rhs_dd.clear_divisions()
-                    except Exception:
-                        pass
+                            # If odd and nothing inflight, stash one as carry
+                            if not inflight_meta and len(ready) > 1 and (len(ready) % 2 == 1):
+                                carry = ready.pop()
 
-                    with dask.config.set({"dataframe.shuffle.method": "tasks"}):
-                        merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
-                    log_dedup.info("Driver-side merge graph built.")
-                except Exception as e:
-                    import traceback as _tb
-                    log_dedup.error("FAILED during merge (driver branch): %s\n%s", repr(e), _tb.format_exc())
-                    raise
+                        # Finalization
+                        if final_collection_path is None:
+                            if ready:
+                                final_collection_path = ready[0][1]
+                            elif carry:
+                                final_collection_path = carry[1]
 
-            # Coalesce tie_result with the newly computed labels.
-            try:
-                if "tie_result" in merged.columns:
-                    merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
-                else:
-                    merged = merged.assign(tie_result=merged["tie_result_new"])
-                merged = merged.drop(columns=["tie_result_new"])
-                log_dedup.info("Coalesced tie_result with new labels.")
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED while coalescing tie_result: %s\n%s", repr(e), _tb.format_exc())
-                raise
+                        final_collection_path = _normalize_collection_root(final_collection_path) or final_collection_path
+                        if not _is_collection_root(final_collection_path):
+                            raise RuntimeError(f"Final path is not a HATS collection root: {final_collection_path}")
 
-            # Stable dtypes for final output.
-            try:
-                try:
-                    merged = merged.clear_divisions()
+                        _resume_set(resume_log, "phase.crossmatch", "completed", log_cross)
+                        log_cross.info("END crossmatch: parallel tournament done; final root: %s", final_collection_path)
+                        start_consolidate = False
+
                 except Exception:
-                    pass
-
-                merged["tie_result"] = merged["tie_result"].astype("Int8")
-                if "group_id" in merged.columns:
-                    merged["group_id"] = merged["group_id"].astype("Int64")
-                log_dedup.info("Final dtypes stabilized for tie_result/group_id.")
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED while stabilizing final dtypes: %s\n%s", repr(e), _tb.format_exc())
-                raise
-
-            # Materialize result.
-            try:
-                try:
-                    df_final_dd = merged.clear_divisions()
-                except Exception:
-                    df_final_dd = merged
-
-                # Extra sanity before compute
-                head_sample = df_final_dd.head(1, compute=True)
-                log_dedup.info("Pre-compute sample OK: columns=%s", list(head_sample.columns))
-
-                df_final = df_final_dd.compute()
-
-                dup = df_final["group_id"].value_counts(dropna=True)
-                n_big = int((dup > 1).sum())
-                log_dedup.info("Sanity group_id: uniques=%d, ids_com_>1_ocorr=%d", int(dup.size), n_big)
-
-                log_dedup.info("END deduplication: labels merged back into final dataframe")
-            except Exception as e:
-                import traceback as _tb
-                log_dedup.error("FAILED while computing final dataframe: %s\n%s", repr(e), _tb.format_exc())
-                raise
-
-            # Next phase runs below:
-            start_consolidate = True
+                    # Catch ANY driver-side error in the tournament
+                    log_cross.exception("Crossmatch tournament FAILED with an unhandled error")
+                    try:
+                        _resume_set(resume_log, "phase.crossmatch", "failed", log_cross)
+                    except Exception:
+                        pass
+                    raise
 
         else:
             base_logger.error("Unknown combine_mode: %s", combine_mode, extra={"phase": "crossmatch"})
@@ -1036,11 +968,195 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             cluster.close()
             return
 
+        # -----------------------------------------------------------
+        # 4) DEDUPLICATION
+        # -----------------------------------------------------------
+        log_dedup = _phase_logger(base_logger, "deduplication")
+        log_dedup.info("START deduplication: LSDB graph labeling and tie consolidation")
+
+        # Ensure final collection root for dedup
+        if not final_collection_path:
+            resumed = _resume_get(resume_log, f"crossmatch_step{final_step}.collection_path")
+            resumed = _normalize_collection_root(resumed)
+            if resumed and _is_collection_root(resumed):
+                final_collection_path = resumed
+                log_dedup.info("Recovered final collection root from resume: %s", final_collection_path)
+            else:
+                guessed = _guess_collection_for_step(temp_dir, final_step)
+                if guessed:
+                    final_collection_path = guessed
+                    log_dedup.info("Guessed final collection root from disk: %s", final_collection_path)
+
+        use_distributed = final_collection_path is not None and _is_collection_root(final_collection_path)
+
+        # --- Safe config parsing ---
+        tiebreaking_priority_cfg = translation_config.get("tiebreaking_priority")
+        if isinstance(tiebreaking_priority_cfg, (str, bytes)):
+            tiebreaking_priority_cfg = [str(tiebreaking_priority_cfg)]
+        if not isinstance(tiebreaking_priority_cfg, (list, tuple)) or not tiebreaking_priority_cfg:
+            raise TypeError("tiebreaking_priority must be a non-empty list of column names.")
+
+        instrument_type_priority_cfg = translation_config.get("instrument_type_priority")
+        if "instrument_type_homogenized" in set(tiebreaking_priority_cfg) and not isinstance(instrument_type_priority_cfg, dict):
+            raise TypeError(
+                "instrument_type_priority must be a mapping when "
+                "'instrument_type_homogenized' is present in tiebreaking_priority."
+            )
+        delta_z_threshold_cfg = float(translation_config.get("delta_z_threshold", 0.0))
+
+        #######################################################################
+        # Diagnostics / outputs
+        # - edge_log: enable edge diagnostics (warn on star-neighbor exclusions)
+        # - group_col: set to None to disable exporting group labels
+        edge_log = True
+        group_col = "group_id"  # None to deactivate
+        #######################################################################
+
+        if use_distributed:
+            log_dedup.info("Running graph-based dedup on final merged collection (Dask merge with catalog ._ddf)")
+            final_collection_path = _normalize_collection_root(final_collection_path)
+            log_dedup.info("final_collection_root: %s", final_collection_path)
+
+            if not _is_collection_root(final_collection_path):
+                raise RuntimeError(f"Expected collection root at: {final_collection_path}")
+
+            # Open the LSDB collection directly (no subcatalog hunting, no margins here)
+            try:
+                final_cat = lsdb.open_catalog(final_collection_path)
+                log_dedup.info("Opened LSDB collection at root path.")
+            except Exception as e:
+                raise RuntimeError(f"Could not open LSDB collection at: {final_collection_path}") from e
+
+            # Build labels lazily over the catalog
+            try:
+                labels_dd = run_dedup_with_lsdb_map_partitions(
+                    final_cat,
+                    tiebreaking_priority=tiebreaking_priority_cfg,
+                    instrument_type_priority=(instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None),
+                    delta_z_threshold=delta_z_threshold_cfg,
+                    crd_col="CRD_ID",
+                    compared_col="compared_to",
+                    z_col="z",
+                    tie_col="tie_result",
+                    edge_log=edge_log,
+                    group_col=group_col,
+                )
+                log_dedup.info("Labels graph built (lazy). Preparing RHS for Dask merge...")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while building labels graph: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+            # Prepare RHS minimal schema (Dask DataFrame)
+            try:
+                rhs_dd = labels_dd.rename(columns={"tie_result": "tie_result_new"})
+                keep_cols = ["CRD_ID", "tie_result_new"]
+                if group_col and (group_col in rhs_dd.columns):
+                    keep_cols.append(group_col)
+                rhs_dd = rhs_dd[keep_cols]
+                log_dedup.info("Prepared RHS columns: %s", keep_cols)
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while preparing RHS labels: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+            # Base Dask DataFrame from the LSDB collection
+            try:
+                df_all = final_cat._ddf
+                # Align join key dtype defensively
+                try:
+                    df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
+                    rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string[pyarrow]"))
+                except Exception:
+                    df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
+                    rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string"))
+                log_dedup.info("Aligned CRD_ID dtype on both sides.")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while preparing base from catalog: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+            # Clear divisions and perform the distributed merge
+            try:
+                try:
+                    df_all = df_all.clear_divisions()
+                except Exception:
+                    pass
+                try:
+                    rhs_dd = rhs_dd.clear_divisions()
+                except Exception:
+                    pass
+                with dask.config.set({"dataframe.shuffle.method": "tasks"}):
+                    merged = dd.merge(df_all, rhs_dd, on="CRD_ID", how="left")
+                log_dedup.info("Dask merge graph built (lazy).")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED during Dask merge: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+            # Coalesce tie_result in Dask (still lazy)
+            try:
+                if "tie_result" in merged.columns:
+                    merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
+                else:
+                    merged = merged.assign(tie_result=merged["tie_result_new"])
+                if "tie_result_new" in merged.columns:
+                    merged = merged.drop(columns=["tie_result_new"])
+                log_dedup.info("Coalesced tie_result (lazy).")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while coalescing tie_result: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+            # Final materialization: compute only once, at the very end
+            try:
+                # Small sanity check without pulling everything
+                _ = merged.head(1)
+                df_final = merged.compute()
+
+                if "group_id" in df_final.columns:
+                    dup = df_final["group_id"].value_counts(dropna=True)
+                    n_big = int((dup > 1).sum())
+                    log_dedup.info("Sanity group_id: uniques=%d, ids_with_>1_occurrences=%d", int(dup.size), n_big)
+                else:
+                    log_dedup.info("No group_id column present after dedup; skipping sanity counts.")
+
+                current_workers = len(client.scheduler_info().get("workers", {}))
+                log_dedup.info("WORKERS STILL RUNNING=%d.", current_workers)
+                log_dedup.info("END deduplication: labels merged back into final dataframe (Dask)")
+            except Exception as e:
+                import traceback as _tb
+                log_dedup.error("FAILED while computing final dataframe: %s\n%s", repr(e), _tb.format_exc())
+                raise
+
+        else:
+            # We require a valid LSDB collection root; Parquet fallback is no longer supported.
+            raise RuntimeError("Cannot run dedup: missing or invalid LSDB collection root; Parquet fallback removed.")
+
+        # Next phase runs below:
+        start_consolidate = True
+
     # ---------------------------------------------------------------
     # 5) CONSOLIDATION / EXPORT
     # ---------------------------------------------------------------
     log_cons = _phase_logger(base_logger, "consolidation")
     log_cons.info("START consolidation: staging artifacts into process dir (base_dir=%s)", base_dir)
+
+    # Snapshot about df_final to aid debugging
+    try:
+        log_cons.info("df_final shape: %s", tuple(df_final.shape))
+        try:
+            mem_bytes = int(df_final.memory_usage(deep=True).sum())
+            log_cons.info("df_final memory footprint: %.2f MB", mem_bytes / (1024 * 1024))
+        except Exception as e_mem:
+            log_cons.debug("Could not compute memory footprint: %s", e_mem)
+        try:
+            dtypes_preview = {str(k): str(v) for k, v in list(df_final.dtypes.items())[:20]}
+            log_cons.info("df_final dtypes (first 20): %s", dtypes_preview)
+        except Exception as e_dt:
+            log_cons.debug("Could not collect dtype preview: %s", e_dt)
+    except Exception as e_snap:
+        log_cons.warning("Could not snapshot df_final: %s", e_snap)
 
     try:
         n_after_dedup = int(len(df_final))
@@ -1050,43 +1166,80 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
     if combine_mode == "concatenate" and "tie_result" in df_final.columns:
         log_cons.info("Dropping 'tie_result' (concatenate mode)")
-        df_final = df_final.drop(columns=["tie_result"])
+        try:
+            df_final = df_final.drop(columns=["tie_result"])
+        except Exception as e:
+            log_cons.error("FAILED dropping 'tie_result' in concatenate mode: %s", e)
+            raise
 
     if combine_mode == "concatenate_and_remove_duplicates":
         if "tie_result" not in df_final.columns:
             log_cons.warning("Expected 'tie_result' column for removal mode, but it is missing; skipping row filter.")
         else:
-            # Keep only rows marked as winners (tie_result == 1)
-            tie_num = pd.to_numeric(df_final["tie_result"], errors="coerce").fillna(0).astype("int8")
-            keep_mask = tie_num.eq(1)
-            kept = int(keep_mask.sum())
-            dropped = int(len(df_final) - kept)
-            df_final = df_final.loc[keep_mask].copy()
-            log_cons.info("Removed duplicates by tie_result==1: kept=%d rows, dropped=%d rows.", kept, dropped)
+            log_cons.info("Filtering winners by tie_result == 1 (remove-duplicates mode)")
+            try:
+                tie_num = pd.to_numeric(df_final["tie_result"], errors="coerce").fillna(0).astype("int8")
+                keep_mask = tie_num.eq(1)
+                kept = int(keep_mask.sum())
+                dropped = int(len(df_final) - kept)
+                df_final = df_final.loc[keep_mask].copy()
+                log_cons.info("Removed duplicates by tie_result==1: kept=%d rows, dropped=%d rows.", kept, dropped)
+            except Exception as e:
+                log_cons.error("FAILED while filtering by tie_result==1: %s", e)
+                raise
 
     if USE_ARROW_TYPES:
-        df_final = df_final.convert_dtypes(dtype_backend="pyarrow")
-        for c in df_final.columns:
-            if pd.api.types.is_string_dtype(df_final[c].dtype):
-                df_final[c] = df_final[c].astype(DTYPE_STR)
+        log_cons.info("Converting dtypes with dtype_backend='pyarrow' (USE_ARROW_TYPES=True)")
+        try:
+            df_final = df_final.convert_dtypes(dtype_backend="pyarrow")
+            for c in df_final.columns:
+                try:
+                    if pd.api.types.is_string_dtype(df_final[c].dtype):
+                        df_final[c] = df_final[c].astype(DTYPE_STR)
+                except Exception as e_cast:
+                    log_cons.debug("Could not cast column '%s' to Arrow string: %s", c, e_cast)
+        except Exception as e:
+            log_cons.error("FAILED during convert_dtypes(dtype_backend='pyarrow'): %s", e)
+            raise
 
     # Drop all-empty columns
-    to_drop = []
-    for col in df_final.columns:
-        dt = df_final[col].dtype
-        if str(dt) == "string[pyarrow]" or str(dt) == "object":
-            all_missing = df_final[col].apply(lambda x: (pd.isna(x) or str(x).strip() == ""))
+    try:
+        to_drop = []
+        for col in df_final.columns:
+            dt = df_final[col].dtype
+            try:
+                if str(dt) == "string[pyarrow]" or str(dt) == "object":
+                    all_missing = df_final[col].apply(lambda x: (pd.isna(x) or str(x).strip() == ""))
+                else:
+                    all_missing = df_final[col].isna()
+                if bool(all_missing.all()):
+                    to_drop.append(col)
+            except Exception as e_col:
+                log_cons.debug("Skip emptiness check for column '%s' (dtype=%s): %s", col, dt, e_col)
+        if to_drop:
+            log_cons.info("Dropping all-missing columns: %s", ", ".join(sorted(map(str, to_drop))))
+            df_final = df_final.drop(columns=to_drop)
         else:
-            all_missing = df_final[col].isna()
-        if bool(all_missing.all()):
-            to_drop.append(col)
-    if to_drop:
-        log_cons.info("Dropping all-missing columns: %s", ", ".join(sorted(map(str, to_drop))))
-        df_final = df_final.drop(columns=to_drop)
+            log_cons.info("No all-missing columns to drop.")
+    except Exception as e:
+        log_cons.error("FAILED while dropping all-missing columns: %s", e)
+        raise
 
+    # Stage final output with your save_dataframe
     staged_output_base = os.path.join(base_dir, output_name)
-    save_dataframe(df_final, staged_output_base, output_format)
-    log_cons.info("Staged final output at %s.%s", staged_output_base, output_format)
+    log_cons.info("About to call save_dataframe(base=%s, format=%s)", staged_output_base, output_format)
+    try:
+        try:
+            log_cons.debug("df_final head(3):\n%s", df_final.head(3))
+        except Exception as e_head:
+            log_cons.debug("Could not preview df_final.head(3): %s", e_head)
+
+        save_dataframe(df_final, staged_output_base, output_format)
+        log_cons.info("Staged final output at %s.%s", staged_output_base, output_format)
+    except Exception as e:
+        import traceback as _tb
+        log_cons.error("FAILED in save_dataframe: %s\n%s", repr(e), _tb.format_exc())
+        raise
 
     relative_path = os.path.join(output_dir, f"{output_name}.{output_format}")
 
@@ -1094,40 +1247,56 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     columns_assoc = {}
 
     # Special handling for id
-    if "CRD_ID" in df_final.columns:
-        columns_assoc["id"] = "CRD_ID"
-    elif "id" in df_final.columns:
-        columns_assoc["id"] = "id"
+    try:
+        if "CRD_ID" in df_final.columns:
+            columns_assoc["id"] = "CRD_ID"
+        elif "id" in df_final.columns:
+            columns_assoc["id"] = "id"
+    except Exception as e:
+        log_cons.debug("While mapping 'id' column: %s", e)
 
     # Special handling for z_flag
-    if "z_flag_homogenized" in df_final.columns:
-        columns_assoc["z_flag"] = "z_flag_homogenized"
-    elif "z_flag" in df_final.columns:
-        columns_assoc["z_flag"] = "z_flag"
+    try:
+        if "z_flag_homogenized" in df_final.columns:
+            columns_assoc["z_flag"] = "z_flag_homogenized"
+        elif "z_flag" in df_final.columns:
+            columns_assoc["z_flag"] = "z_flag"
+    except Exception as e:
+        log_cons.debug("While mapping 'z_flag' column: %s", e)
 
     # Identity mapping for the others
-    for col in expected_columns:
-        if col not in ("id", "z_flag") and col in df_final.columns:
-            columns_assoc[col] = col
+    try:
+        for col in expected_columns:
+            if col not in ("id", "z_flag") and col in df_final.columns:
+                columns_assoc[col] = col
+        log_cons.info("columns_assoc: %s", columns_assoc)
+    except Exception as e:
+        log_cons.debug("While building columns_assoc: %s", e)
 
+    # Update process info
+    try:
+        update_process_info(
+            process_info,
+            process_info_path,
+            "outputs",
+            [
+                {
+                    "path": relative_path,
+                    "root_dir": output_root_dir,
+                    "role": "main",
+                    "columns_assoc": columns_assoc,
+                }
+            ],
+        )
+        update_process_info(process_info, process_info_path, "end_time", str(pd.Timestamp.now()))
+        update_process_info(process_info, process_info_path, "status", "Successful")
+        log_cons.info("Process info updated with output: %s", relative_path)
+    except Exception as e:
+        import traceback as _tb
+        log_cons.error("FAILED to update process_info: %s\n%s", e, _tb.format_exc())
+        raise
 
-    update_process_info(
-        process_info,
-        process_info_path,
-        "outputs",
-        [
-            {
-                "path": relative_path,
-                "root_dir": output_root_dir,
-                "role": "main",
-                "columns_assoc": columns_assoc,
-            }
-        ],
-    )
-    update_process_info(process_info, process_info_path, "end_time", str(pd.Timestamp.now()))
-    update_process_info(process_info, process_info_path, "status", "Successful")
-
-    # ----------------- PUBLISH STEP (finalzinho) -----------------
+    # ----------------- PUBLISH STEP -----------------
     publish_logger = _phase_logger(base_logger, "register")
     publish_logger.info("START publish: copying staged artifacts from process dir to out_root_and_dir (%s)", out_root_and_dir)
 
@@ -1135,27 +1304,49 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         _snapshot_shell_logs(str(launch_dir), launch_snap_dir, publish_logger, max_size_mb=100)
         publish_logger.info("Snapshotted shell logs from %s into %s", launch_dir, launch_snap_dir)
     except Exception as e:
-        publish_logger.warning("Snapshot of shell logs failed: %s", e)    
+        publish_logger.warning("Snapshot of shell logs failed: %s", e)
 
-    # Cria pasta de publicação só agora
-    os.makedirs(out_root_and_dir, exist_ok=True)
+    # Create publish dir only now
+    try:
+        os.makedirs(out_root_and_dir, exist_ok=True)
+        publish_logger.info("Ensured publish dir exists: %s", out_root_and_dir)
+    except Exception as e:
+        publish_logger.error("FAILED to create publish dir '%s': %s", out_root_and_dir, e)
+        raise
 
     # 1) process_info/
-    _copy_tree(os.path.join(base_dir, "process_info"), os.path.join(out_root_and_dir, "process_info"), publish_logger)
+    try:
+        _copy_tree(os.path.join(base_dir, "process_info"), os.path.join(out_root_and_dir, "process_info"), publish_logger)
+    except Exception as e:
+        publish_logger.error("FAILED to copy process_info/: %s", e)
+        raise
 
-    # 2) process.yml e alias process.yaml
-    _copy_file(os.path.join(base_dir, "process.yml"),  os.path.join(out_root_and_dir, "process.yml"),  publish_logger)
-    if os.path.exists(os.path.join(base_dir, "process.yaml")):
-        _copy_file(os.path.join(base_dir, "process.yaml"), os.path.join(out_root_and_dir, "process.yaml"), publish_logger)
+    # 2) process.yml and process.yaml
+    try:
+        _copy_file(os.path.join(base_dir, "process.yml"),  os.path.join(out_root_and_dir, "process.yml"),  publish_logger)
+        if os.path.exists(os.path.join(base_dir, "process.yaml")):
+            _copy_file(os.path.join(base_dir, "process.yaml"), os.path.join(out_root_and_dir, "process.yaml"), publish_logger)
+    except Exception as e:
+        publish_logger.error("FAILED to copy process.yml/.yaml: %s", e)
+        raise
 
     # 3) config.yaml
-    if os.path.exists(os.path.join(base_dir, "config.yaml")):
-        _copy_file(os.path.join(base_dir, "config.yaml"), os.path.join(out_root_and_dir, "config.yaml"), publish_logger)
+    try:
+        if os.path.exists(os.path.join(base_dir, "config.yaml")):
+            _copy_file(os.path.join(base_dir, "config.yaml"), os.path.join(out_root_and_dir, "config.yaml"), publish_logger)
+    except Exception as e:
+        publish_logger.error("FAILED to copy config.yaml: %s", e)
+        raise
 
-    # 4) output final
-    _copy_file(f"{staged_output_base}.{output_format}",
-               os.path.join(out_root_and_dir, f"{output_name}.{output_format}"),
-               publish_logger)
+    # 4) final output
+    try:
+        src_out = f"{staged_output_base}.{output_format}"
+        dst_out = os.path.join(out_root_and_dir, f"{output_name}.{output_format}")
+        publish_logger.info("Copying final output: %s -> %s", src_out, dst_out)
+        _copy_file(src_out, dst_out, publish_logger)
+    except Exception as e:
+        publish_logger.error("FAILED to copy final output to publish dir: %s", e)
+        raise
 
     publish_logger.info("END publish: artifacts copied to %s", out_root_and_dir)
 
