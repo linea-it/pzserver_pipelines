@@ -46,6 +46,7 @@ The `setup.sh` will suggest a directory where the pipelines and datasets are ins
 
 The installation script creates new conda environments `pipe_crd` and `pipe_tsm`. 
 
+
 ## Run a pipeline
 
 To execute, simply:
