@@ -434,7 +434,11 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     print(f"Pipeline was called from: {launch_dir}")
 
     try:
-        _copy_file(config_path, os.path.join(base_dir, "config.yaml"), logging.LoggerAdapter(logging.getLogger("crc"), {"phase": "init"}))
+        _copy_file(
+            config_path,
+            os.path.join(base_dir, "config.yaml"),
+            logging.LoggerAdapter(logging.getLogger("crc"), {"phase": "init"}),
+        )
     except Exception:
         pass
 
@@ -483,12 +487,57 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     )
     configure_exception_hook(base_logger, process_info, process_info_path)
 
+    # --- Quick config sanity logs (minimal, non-invasive) ---
+    try:
+        n_inputs = len((config.get("inputs") or {}).get("specz") or [])
+        sample_names = [e.get("internal_name") for e in (config["inputs"]["specz"][:3] if n_inputs else [])]
+        log_init.info(
+            "Config sanity: output_root_dir=%s, output_dir=%s, output_name=%s, output_format=%s, specz_inputs=%d (sample=%s)",
+            config.get("output_root_dir"),
+            config.get("output_dir"),
+            config.get("output_name"),
+            config.get("output_format", "parquet"),
+            n_inputs,
+            ", ".join(sample_names),
+        )
+    except Exception:
+        log_init.warning("Could not summarize config/inputs.", exc_info=True)
+
     # --- Translation file ---
     path_to_translation_file = param_config.get("flags_translation_file")
     if path_to_translation_file is None:
         log_init.error("Missing 'flags_translation_file' in config!")
         return
-    translation_config = load_yml(path_to_translation_file)
+    # Resolve relative paths against the config file location (minimal safety)
+    if not os.path.isabs(path_to_translation_file):
+        path_to_translation_file = os.path.abspath(
+            os.path.join(os.path.dirname(config_path), path_to_translation_file)
+        )
+    exists = os.path.isfile(path_to_translation_file)
+    size_kb = (os.path.getsize(path_to_translation_file) / 1024.0) if exists else 0.0
+    log_init.info(
+        "flags_translation_file=%s (exists=%s, size=%.1f KB)",
+        path_to_translation_file,
+        exists,
+        size_kb,
+    )
+    if not exists:
+        raise FileNotFoundError(f"flags_translation_file not found: {path_to_translation_file}")
+    try:
+        translation_config = load_yml(path_to_translation_file)
+    except Exception as e:
+        log_init.error("Failed to parse flags_translation_file: %s", e, exc_info=True)
+        raise
+    # Minimal summary of loaded translation (no heavy dumping)
+    try:
+        tb = translation_config.get("tiebreaking_priority")
+        log_init.info("Loaded translation_config keys: %s", ", ".join(sorted(list(translation_config.keys()))[:8]))
+        if tb is not None:
+            log_init.info("tiebreaking_priority=%s", tb)
+        if "delta_z_threshold" in translation_config:
+            log_init.info("delta_z_threshold=%s", translation_config.get("delta_z_threshold"))
+    except Exception:
+        log_init.debug("Could not log translation_config summary.", exc_info=True)
 
     # --- Inputs sorted by size ---
     catalogs_unsorted = config["inputs"]["specz"]
@@ -499,20 +548,20 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
     combine_mode = param_config.get("combine_type", "concatenate_and_mark_duplicates").lower()
     completed = read_completed_steps(os.path.join(temp_dir, "process_resume.log"))
- 
+
     # --- Dask cluster/client ---
     cluster = get_executor(config["executor"], logs_dir=logs_dir)
     client = Client(cluster)
-    
+
     # Ensure the minimum number of workers start within 10 seconds
     exec_args = config.get("executor", {}).get("args", {}) or {}
     instance_cfg = exec_args.get("instance", {}) or {}
     scale_cfg = exec_args.get("scale", {}) or {}
-    
+
     procs = int(instance_cfg.get("processes", 1) or 1)
     min_jobs = scale_cfg.get("minimum_jobs")
     min_workers = 0 if min_jobs is None else int(min_jobs) * procs
-    
+
     if min_workers > 0:
         log_init.info("Waiting up to 10s for minimum_workers=%d to start...", min_workers)
         try:
@@ -538,7 +587,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         "WORKERS STILL RUNNING=%d.",
         current_workers,
     )
-    
+
     log_init.info("END init: pipeline bootstrap")
 
     # Dask perf report (global)
