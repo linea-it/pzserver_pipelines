@@ -140,7 +140,7 @@ class Runner:
                 df, use_pyarrow_types=False, ra_column=ra, dec_column=dec
             )
 
-            dataset_path, margin_cache_path = self.__get_photometric_data_path()
+            dataset_path = self.__get_photometric_data_path()
             dataset_id = self.inputs.get("dataset").get("columns", {}).get("id", "id")
 
             if not os.path.exists(dataset_path):
@@ -149,7 +149,7 @@ class Runner:
                     f"Dataset path does not exist: {str(dataset_path)}"
                 )
 
-            dataset = lsdb.open_catalog(path=dataset_path, margin_cache=margin_cache_path)
+            dataset = lsdb.open_catalog(dataset_path)
             duplicate_criteria = self.param.get("duplicate_criteria", "closest")
             cm_args = self.param.get("crossmatch", {})
             self.logger.debug("Crossmatch args: %s", cm_args)
@@ -220,19 +220,17 @@ class Runner:
             self.config, str(Path(self.output_root_dir, self.output_dir, "config.yml"))
         )
         # Also copying to the working directory for consistency
-        copy_file(
-            self.config, str(Path(self.cwd, "config.yml"))
-        )
+        copy_file(self.config, str(Path(self.cwd, "config.yml")))
         copy_directory(
             self.logdir,
             str(Path(self.output_root_dir, self.output_dir, "process_info")),
         )
 
     def __get_photometric_data_path(self):
-        """Get photometric data path and margin cache path
+        """Get photometric data path
 
         Returns:
-            tuple: dataset path and margin cache path
+            str: dataset path
         """
         dataset_path = self.inputs.get("dataset").get("path")
 
@@ -248,14 +246,7 @@ class Runner:
 
         ptmd_path = Path(dataset_path, flux_or_mag, flux_type, dereddening, "catalog")
 
-        margin_cache_path = Path(
-            dataset_path, flux_or_mag, flux_type, dereddening, "catalog_1arcsec"
-        )
-
-        if not margin_cache_path.exists():
-            margin_cache_path = None
-
-        return str(ptmd_path), margin_cache_path
+        return str(ptmd_path)
 
     def __get_columns_associations(self, columns, specz_columns):
         """Get columns associations of the product output
