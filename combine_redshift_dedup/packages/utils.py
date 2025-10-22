@@ -76,10 +76,19 @@ class _EnsurePhase(logging.Filter):
 
 
 class _OnlyCRC(logging.Filter):
-    """Allows only records from logger 'crc' and its children."""
+    """Allows 'crc' logs; also lets non-CRC WARNING+ through (opt-in via env)."""
+
+    def __init__(self):
+        super().__init__()
+        self._include_noncrc_warn = os.getenv("CRC_LOG_INCLUDE_NONCRC_WARNINGS", "1") == "1"
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return record.name == "crc" or record.name.startswith("crc.")
+        if record.name == "crc" or record.name.startswith("crc."):
+            return True
+        # Se habilitado, deixa WARNING/ERROR/CRITICAL de terceiros passarem
+        if self._include_noncrc_warn and record.levelno >= logging.WARNING:
+            return True
+        return False
 
 
 # =============================================================================
@@ -249,6 +258,26 @@ def ensure_crc_logger(log_dir: str, level: int = logging.INFO) -> logging.Logger
 
     with _CRC_LOG_LOCK:
         logger = logging.getLogger("crc")
+
+        # --- BEGIN: env override for log level (CRC_LOG_LEVEL) ---
+        # Accepts "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL" or numeric ("10", "20", ...)
+        lvl_env = os.getenv("CRC_LOG_LEVEL", "").strip()
+        if lvl_env:
+            lvl_candidate = None
+            u = lvl_env.upper()
+            # Try named level
+            if hasattr(logging, u):
+                lvl_candidate = getattr(logging, u, None)
+            else:
+                # Try numeric level
+                try:
+                    lvl_candidate = int(lvl_env)
+                except Exception:
+                    lvl_candidate = None
+            if isinstance(lvl_candidate, int):
+                level = lvl_candidate
+        # --- END: env override for log level ---
+        
         logger.setLevel(level)
         logger.propagate = False
 
@@ -267,6 +296,7 @@ def ensure_crc_logger(log_dir: str, level: int = logging.INFO) -> logging.Logger
                 obj.propagate = True
                 if obj.handlers:
                     obj.handlers.clear()
+                obj.setLevel(logging.NOTSET)  # <<< ADICIONE ESTA LINHA
 
         # Fresh handler set.
         if logger.handlers:
@@ -319,10 +349,10 @@ def ensure_crc_logger(log_dir: str, level: int = logging.INFO) -> logging.Logger
         # Reduce third-party verbosity once per PID (or if reconfiguring).
         if already_configured_pid != current_pid or force_reconfig:
             logging.getLogger().setLevel(logging.WARNING)
-            logging.getLogger("dask").setLevel(logging.ERROR)
-            logging.getLogger("distributed").setLevel(logging.ERROR)
-            logging.getLogger("lsdb").setLevel(logging.WARNING)
-            logging.getLogger("urllib3").setLevel(logging.ERROR)
+            logging.getLogger("dask").setLevel(logging.WARNING)
+            logging.getLogger("distributed").setLevel(logging.WARNING)
+            logging.getLogger("lsdb").setLevel(logging.INFO)  
+            logging.getLogger("urllib3").setLevel(logging.WARNING)
 
         # Mark configured for this PID.
         logger._crc_configured_pid = current_pid
