@@ -657,7 +657,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             try:
                 out = fut.result()
             except Exception:
-                # Loga traceback remoto do worker e repropaga
+                # Logs remote worker traceback and repropagates
                 _log_remote_future_exception(
                     log_prep,
                     fut,
