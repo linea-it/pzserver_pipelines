@@ -194,6 +194,22 @@ fi
 log "CRC_LOG_COLLECTOR=${CRC_LOG_COLLECTOR}"
 
 # =========================
+# Verbosity toggles (CRC logger + Python warnings)
+# =========================
+# Aceita override via CLI: ex: CRC_LOG_LEVEL=INFO ./run.sh cfg.yaml
+: "${CRC_LOG_LEVEL:=DEBUG}"                 # DEBUG/INFO/WARNING/ERROR/CRITICAL or numeric (10/20/30/40/50)
+: "${CRC_LOG_INCLUDE_NONCRC_WARNINGS:=1}"   # 1 = allows third-party WARNING to pass through the filter
+: "${CRC_LOG_FORCE_RECONFIG:=1}"            # force recreate handlers on this PID (useful for re-runs)
+: "${PYTHONWARNINGS:=default}"              # ensures that warnings are not silenced by Python
+
+export CRC_LOG_LEVEL CRC_LOG_INCLUDE_NONCRC_WARNINGS CRC_LOG_FORCE_RECONFIG PYTHONWARNINGS
+
+log "CRC_LOG_LEVEL=${CRC_LOG_LEVEL}"
+log "CRC_LOG_INCLUDE_NONCRC_WARNINGS=${CRC_LOG_INCLUDE_NONCRC_WARNINGS}"
+log "CRC_LOG_FORCE_RECONFIG=${CRC_LOG_FORCE_RECONFIG}"
+log "PYTHONWARNINGS=${PYTHONWARNINGS}"
+
+# =========================
 # Run the pipeline
 # =========================
 export CRC_LAUNCH_DIR="$PWD"

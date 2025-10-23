@@ -42,6 +42,7 @@ LOGGER_NAME = "crc.crossmatch_auto"  # child of the central pipeline logger
 def _get_logger() -> logging.LoggerAdapter:
     """Return a phase-aware logger ('crc.crossmatch_auto' with phase='automatch')."""
     base = logging.getLogger(LOGGER_NAME)
+    base.setLevel(logging.NOTSET)
     base.propagate = True
     return get_phase_logger("automatch", base)
 
