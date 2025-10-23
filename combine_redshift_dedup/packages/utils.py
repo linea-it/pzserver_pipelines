@@ -85,7 +85,7 @@ class _OnlyCRC(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if record.name == "crc" or record.name.startswith("crc."):
             return True
-        # Se habilitado, deixa WARNING/ERROR/CRITICAL de terceiros passarem
+        # If enabled, lets third-party WARNING/ERROR/CRITICAL pass through
         if self._include_noncrc_warn and record.levelno >= logging.WARNING:
             return True
         return False
@@ -296,7 +296,7 @@ def ensure_crc_logger(log_dir: str, level: int = logging.INFO) -> logging.Logger
                 obj.propagate = True
                 if obj.handlers:
                     obj.handlers.clear()
-                obj.setLevel(logging.NOTSET)  # <<< ADICIONE ESTA LINHA
+                obj.setLevel(logging.NOTSET)
 
         # Fresh handler set.
         if logger.handlers:
