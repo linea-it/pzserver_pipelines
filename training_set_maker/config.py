@@ -13,8 +13,8 @@ class Slurm(BaseModel):
         cores: int = 20
         processes: int = 1
         memory: str = "50GB"
-        queue: str = "lsst_cpu"
-        account: str = "hpc-lsst"
+        queue: str = "cpu"
+        account: str = "hpc-bpglsst"
         job_extra_directives: list[str] = ["--propagate", "--time=2:00:00"]
 
     class Adapt(BaseModel):
