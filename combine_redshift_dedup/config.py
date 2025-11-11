@@ -80,7 +80,7 @@ class Inputs(BaseModel):
 
 class Param(BaseModel):
     combine_type: str = "concatenate"
-    z_flag_homogenized_value_to_cut: float = 0.0
+    z_flag_homogenized_value_to_cut: float = 3.0
     flags_translation_file: str = str(Path(MAINDIR, "flags_translation.yaml"))
 
 
