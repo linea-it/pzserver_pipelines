@@ -654,20 +654,30 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         while inflight:
             fut = next(ac)
             inflight.remove(fut)
-            results.append(fut.result())
+            try:
+                out = fut.result()
+            except Exception:
+                # Logs remote worker traceback and repropagates
+                _log_remote_future_exception(
+                    log_prep,
+                    fut,
+                    msg_prefix="PREPARE FAILED (remote worker traceback)"
+                )
+                raise
+            results.append(out)
             prepared_count += 1
             if queue:
                 fut2 = _submit_prepare(queue.pop(0))
                 ac.add(fut2)
                 inflight.append(fut2)
-
+        
         log_prep.info(
             "Prepared %d new catalogs; total results now %d / %d",
             prepared_count, len(results), len(catalogs),
         )
         if len(results) != len(catalogs):
             raise RuntimeError("Internal error: prepared results count mismatch.")
-
+        
         prepared_info = [
             {
                 "collection_path": r[0],
@@ -773,10 +783,14 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                         inflight2.remove(fut)
                         try:
                             out_path = fut.result()
-                        except Exception as e:
-                            info_err = fut2info.pop(fut)
-                            log_auto.error("Auto crossmatch failed for %s: %s", info_err["internal_name"], e)
+                        except Exception:
+                            _log_remote_future_exception(
+                                log_auto,
+                                fut,
+                                msg_prefix=f"AUTO-CROSS FAILED for {info_err['internal_name']} (remote worker traceback)"
+                            )
                             raise
+
                         info_ok = fut2info.pop(fut)
                         info_ok["collection_path"] = out_path
                         log_step(resume_log, f"autocross_{info_ok['internal_name']}")

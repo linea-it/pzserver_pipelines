@@ -39,6 +39,7 @@ LOGGER_NAME = "crc.dedup"
 def _base_logger() -> logging.Logger:
     """Return the child base logger ('crc.dedup')."""
     lg = logging.getLogger(LOGGER_NAME)
+    lg.setLevel(logging.NOTSET)
     lg.propagate = True
     return lg
 
