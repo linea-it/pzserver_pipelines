@@ -1,0 +1,19 @@
+#!/bin/bash
+
+#SBATCH --job-name={jobname}
+#SBATCH --chdir={cwd}
+#SBATCH --account=hpc-bpglsst
+#SBATCH --time=01:00:00
+#SBATCH --ntasks=1
+#SBATCH --output={out}
+#SBATCH --error={err}
+#SBATCH --partition=cpu
+#SBATCH --propagate
+#SBATCH --exclusive
+
+{cmd} .
+
+echo $? >> return.code
+
+echo "Done!"
+

@@ -1,0 +1,253 @@
+##################################################################
+# Parameters file. Should follow the syntax defined in:
+# http://docs.ansible.com/ansible/latest/YAMLSyntax.html
+# More general reference: http://www.yaml.org/spec/1.2/spec.html
+
+executor:
+  name: "local"
+  args:
+    n_workers: 3
+    threads_per_worker: 2
+    memory_limit: "6GB"
+
+#executor:
+#  name: "slurm" # Name of the job scheduler
+#  args:
+#    instance:
+#      cores: 25 # Number of cores per job
+#      processes: 1 # Number of processes per job
+#      memory: "50GB" # Memory allocated per job
+#      queue: "cpu" # Queue name
+#      account: "hpc-bpglsst"
+#      job_extra_directives: # Extra directives for Slurm
+#        - "--propagate"
+#        - "--time=2:00:00"
+#    scale:
+#      minimum_jobs: 10
+#      maximum_jobs: 20
+
+inputs:
+  specz:
+    # List of redshift catalogs to combine. Each entry contains:
+    # - path: full path to the file
+    # - internal_name: unique label used internally
+    # - columns: mapping from standard keys to column names in the file
+
+    - path: "test_data/2dfgrs_final_release_random_sample.parquet"
+      internal_name: "001_2dfgrs_final_release"
+      columns:
+        id: "name"
+        ra: "ra_j2000_deg"
+        dec: "dec_j2000_deg"
+        z: "z"
+        z_flag: "quality"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/2dflens_final_release_random_sample.parquet"
+      internal_name: "002_2dflens_final_release"
+      columns:
+        id: "unique_id"
+        ra: "RA"
+        dec: "Dec"
+        z: "z"
+        z_flag: "qual"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/2mrs_v240_random_sample.parquet"
+      internal_name: "003_2mrs_v240"
+      columns:
+        id: "TMID"
+        ra: "RA"
+        dec: "DEC"
+        z: "redshift"
+        z_flag: null
+        z_err: "redshift_err"
+        survey: "survey_name"
+
+    - path: "test_data/3dhst_v4.1.5_random_sample.parquet"
+      internal_name: "004_3dhst_v4.1.5"
+      columns:
+        id: "phot_id"
+        ra: "ra"
+        dec: "dec"
+        z: "z_best"
+        z_flag: null
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/6dfgs_dr3_random_sample.parquet"
+      internal_name: "005_6dfgs_dr3"
+      columns:
+        id: "SPECID"
+        ra: "RA_deg"
+        dec: "DEC_deg"
+        z: "Z"
+        z_flag: "QUALITY"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/astrodeep_jwst_random_sample.parquet"
+      internal_name: "006_astrodeep_jwst"
+      columns:
+        id: "ID"
+        ra: "RA"
+        dec: "DEC"
+        z: "redshift"
+        z_flag: "flag"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/astrodeep-gs43_random_sample.parquet"
+      internal_name: "007_astrodeep"
+      columns:
+        id: "ID"
+        ra: "RA"
+        dec: "DEC"
+        z: "z_best"
+        z_flag: null
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/desi_dr1_in_lsst_dp1_fields_random_sample.parquet"
+      internal_name: "008_desi_dr1"
+      columns:
+        id: "TARGETID"
+        ra: "TARGET_RA"
+        dec: "TARGET_DEC"
+        z: "Z"
+        z_flag: "ZWARN"
+        z_err: "ZERR"
+        survey: "survey_name"
+
+    - path: "test_data/jades_dr3_random_sample.parquet"
+      internal_name: "009_jades_dr3"
+      columns:
+        id: "unique_id"
+        ra: "RA_TARG"
+        dec: "Dec_TARG"
+        z: "z_Spec"
+        z_flag: "z_Spec_flag"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/mosdef_final_release_random_sample.parquet"
+      internal_name: "010_mosdef_final_release"
+      columns:
+        id: "ID"
+        ra: "RA"
+        dec: "DEC"
+        z: "Z_MOSFIRE"
+        z_flag: "Z_QUAL"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/ozdes_dr2_random_sample.parquet"
+      internal_name: "011_ozdes_dr2"
+      columns:
+        id: "OzDES_ID"
+        ra: "Alpha_J2000"
+        dec: "Delta_J2000"
+        z: "z"
+        z_flag: "qop"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/primus_dr1_random_sample.parquet"
+      internal_name: "012_primus_dr1"
+      columns:
+        id: "OBJNAME"
+        ra: "RA"
+        dec: "DEC"
+        z: "Z"
+        z_flag: "ZQUALITY"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/vandels_dr4_random_sample.parquet"
+      internal_name: "013_vandels_dr4"
+      columns:
+        id: "id"
+        ra: "alpha"
+        dec: "delta"
+        z: "zspec"
+        z_flag: "zflg"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/vlt_vimos_v2.0.1_random_sample.parquet"
+      internal_name: "014_vlt_vimos_v2.0.1"
+      columns:
+        id: "ID_VIMOS"
+        ra: "RAJ2000_WFI"
+        dec: "DEJ2000_WFI"
+        z: "SPEC_Z"
+        z_flag: "campaign_qf"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/vuds_dr1_random_sample.parquet"
+      internal_name: "015_vuds_dr1"
+      columns:
+        id: "vuds_ident"
+        ra: "alpha"
+        dec: "delta"
+        z: "z_spec"
+        z_flag: "zflags"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/vvds_final_release_random_sample.parquet"
+      internal_name: "016_vvds_final_release"
+      columns:
+        id: "NUM"
+        ra: "ALPHA"
+        dec: "DELTA"
+        z: "Z"
+        z_flag: "ZFLAGS"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/z_cat_CANDELS_clean_sitcomtn-154_random_sample.parquet"
+      internal_name: "017_candels_sitcomtn"
+      columns:
+        id: null
+        ra: "RA"
+        dec: "DEC"
+        z: "redshift"
+        z_flag: "quality"
+        z_err: null
+        survey: "source"
+
+    - path: "test_data/z_cat_NED_clean_sitcomtn-154_random_sample.parquet"
+      internal_name: "018_ned_sitcomtn"
+      columns:
+        id: null
+        ra: "RA"
+        dec: "DEC"
+        z: "redshift"
+        z_flag: "quality"
+        z_err: null
+        survey: "source"
+
+    - path: "test_data/pipeline_generated_sample.parquet"
+      internal_name: "019_pipeline_sample"
+      columns:
+        id: "CRD_ID"
+        ra: "ra"
+        dec: "dec"
+        z: "z"
+        z_flag: "z_flag_homogenized"
+        z_err: "z_err"
+        survey: "survey"
+
+output_root_dir: "storage"
+output_dir: "outputs" # Relative directory for final outputs
+output_name: "crd" # Name prefix for the final output files
+output_format: "parquet" # Output format: csv, parquet, hdf5, or fits
+
+param:
+  combine_type: "concatenate_and_mark_duplicates" # Options: "concatenate", "concatenate_and_mark_duplicates", or "concatenate_and_remove_duplicates"
+  z_flag_homogenized_value_to_cut: 0.0 # Value to cut in the homogenized z_flag (cut >= value). 0.0 or null means keep all.
+  flags_translation_file: flags_translation.yaml # File with homogenization rules for z_flag and type

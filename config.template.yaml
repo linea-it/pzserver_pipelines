@@ -1,0 +1,77 @@
+##################################################################
+# Parameters file. Should follow the syntax defined in:
+# http://docs.ansible.com/ansible/latest/YAMLSyntax.html
+# More general reference: http://www.yaml.org/spec/1.2/spec.html
+
+executor:
+  name: "local"
+  args:
+    n_workers: 3
+    threads_per_worker: 2
+    memory_limit: "6GB"
+
+#executor:
+#  name: "slurm" # Name of the job scheduler
+#  args:
+#    instance:
+#      cores: 25 # Number of cores per job
+#      processes: 1 # Number of processes per job
+#      memory: "50GB" # Memory allocated per job
+#      queue: "cpu" # Queue name
+#      account: "hpc-bpglsst"
+#      job_extra_directives: # Extra directives for Slurm
+#        - "--propagate"
+#        - "--time=2:00:00"
+#    scale:
+#      minimum_jobs: 10
+#      maximum_jobs: 20
+
+inputs:
+  specz:
+    # List of redshift catalogs to combine. Each entry contains:
+    # - path: full path to the file
+    # - internal_name: unique label used internally
+    # - columns: mapping from standard keys to column names in the file
+
+    - path: "test_data/2dfgrs_final_release_random_sample.parquet"
+      internal_name: "001_2dfgrs_final_release"
+      columns:
+        id: "name"
+        ra: "ra_j2000_deg"
+        dec: "dec_j2000_deg"
+        z: "z"
+        z_flag: "quality"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/2dflens_final_release_random_sample.parquet"
+      internal_name: "002_2dflens_final_release"
+      columns:
+        id: "unique_id"
+        ra: "RA"
+        dec: "Dec"
+        z: "z"
+        z_flag: "qual"
+        z_err: null
+        survey: "survey_name"
+
+    - path: "test_data/2mrs_v240_random_sample.parquet"
+      internal_name: "003_2mrs_v240"
+      columns:
+        id: "TMID"
+        ra: "RA"
+        dec: "DEC"
+        z: "redshift"
+        z_flag: null
+        z_err: "redshift_err"
+        survey: "survey_name"
+
+output_root_dir: "process001"
+output_dir: "outputs" # Relative directory for final outputs
+output_name: "crd" # Name prefix for the final output files
+output_format: "parquet" # Output format: csv, parquet, hdf5, or fits
+
+param:
+  combine_type: "concatenate_and_mark_duplicates" # Options: "concatenate", "concatenate_and_mark_duplicates", or "concatenate_and_remove_duplicates"
+  z_flag_homogenized_value_to_cut: 0.0 # Value to cut in the homogenized z_flag (cut >= value). 0.0 or null means keep all.
+  flags_translation_file: flags_translation.yaml # File with homogenization rules for z_flag and type
