@@ -110,7 +110,7 @@ trap '{
   err "Context:"
   err "  CONFIG_PATH='${CONFIG_PATH-}'"
   err "  BASE_DIR_OVERRIDE='${BASE_DIR_OVERRIDE-}'"
-  err "  PIPELINES_DIR='${PIPELINES_DIR-}'"
+  err "  PIPELINE_DIR='${PIPELINE_DIR-}'"
   err "  INSTALL_PIPE='${INSTALL_PIPE-}'"
   err "  CRC_LOG_COLLECTOR='${CRC_LOG_COLLECTOR-}'"
 
@@ -136,13 +136,11 @@ fi
 CONFIG_PATH="$1"
 BASE_DIR_OVERRIDE="${2:-}"
 
-if [ -z "${PIPELINES_DIR:-}" ] || [ ! -d "${PIPELINES_DIR:-/nonexistent}" ]; then
-  err "Error: PIPELINES_DIR not defined or not a directory."
-  exit 1
-fi
+SCRIPT_PATH=$(readlink -f "$0")
+PIPELINE_DIR=$(dirname "$SCRIPT_PATH")
 
-INSTALL_PIPE="$PIPELINES_DIR/combine_redshift_dedup/install.sh"
-PIPE_BASE="$PIPELINES_DIR/combine_redshift_dedup"
+INSTALL_PIPE="$PIPELINE_DIR/install.sh"
+PIPE_BASE=$PIPELINE_DIR
 
 if [ ! -f "$INSTALL_PIPE" ]; then
   err "Error: Installation script not found at: $INSTALL_PIPE"
@@ -215,7 +213,6 @@ log "PYTHONWARNINGS=${PYTHONWARNINGS}"
 export CRC_LAUNCH_DIR="$PWD"
 
 _enable_xtrace
-PYTHONPATH="$PIPELINES_DIR:${PYTHONPATH:-}" \
 CRC_LOG_COLLECTOR="$CRC_LOG_COLLECTOR" \
 python "$PIPE_BASE/scripts/crd-run.py" "$CONFIG_PATH" --base_dir "$BASE_DIR_OVERRIDE"
 _disable_xtrace

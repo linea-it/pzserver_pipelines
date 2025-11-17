@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+
 """
 Combine Redshift Catalogs – catalog preparation.
 
@@ -44,9 +45,9 @@ os.environ.setdefault("DASK_DISTRIBUTED__SHUFFLE__METHOD", "tasks")
 # -----------------------
 import hats  # noqa: F401
 import lsdb
-from combine_redshift_dedup.packages.product_handle import ProductHandle
-from combine_redshift_dedup.packages.utils import ensure_crc_logger
-from combine_redshift_dedup.packages.specz_homogenization import (
+from product_handle import ProductHandle
+from utils import ensure_crc_logger
+from specz_homogenization import (
     JADES_LETTER_TO_SCORE,
     VIMOS_FLAG_TO_SCORE,
     _honor_user_homogenized_mapping,
@@ -67,17 +68,17 @@ import pyarrow.parquet as pq
 USE_ARROW_TYPES = True
 
 if USE_ARROW_TYPES:
-    DTYPE_STR   = pd.ArrowDtype(pa.string())
+    DTYPE_STR = pd.ArrowDtype(pa.string())
     DTYPE_FLOAT = pd.ArrowDtype(pa.float64())
-    DTYPE_INT   = pd.ArrowDtype(pa.int64())
-    DTYPE_BOOL  = pd.ArrowDtype(pa.bool_())
-    DTYPE_INT8  = pd.ArrowDtype(pa.int8())
+    DTYPE_INT = pd.ArrowDtype(pa.int64())
+    DTYPE_BOOL = pd.ArrowDtype(pa.bool_())
+    DTYPE_INT8 = pd.ArrowDtype(pa.int8())
 else:
-    DTYPE_STR   = "string"
+    DTYPE_STR = "string"
     DTYPE_FLOAT = "Float64"
-    DTYPE_INT   = "Int64"
-    DTYPE_BOOL  = "boolean"
-    DTYPE_INT8  = "Int8"
+    DTYPE_INT = "Int64"
+    DTYPE_BOOL = "boolean"
+    DTYPE_INT8 = "Int8"
 
 # -----------------------
 # Module exports & constants
@@ -87,14 +88,15 @@ __all__ = ["prepare_catalog"]
 LOGGER_NAME = "crc.specz"
 
 DP1_REGIONS = [
-    (6.02, -72.08, 2.5),   # 47 Tuc
-    (37.86, 6.98, 2.5),    # Rubin SV 38 7
+    (6.02, -72.08, 2.5),  # 47 Tuc
+    (37.86, 6.98, 2.5),  # Rubin SV 38 7
     (40.00, -34.45, 2.5),  # Fornax dSph
     (53.13, -28.10, 2.5),  # ECDFS
     (59.10, -48.73, 2.5),  # EDFS
     (95.00, -25.00, 2.5),  # Rubin SV 95 -25
-    (106.23, -10.51, 2.5), # Seagull
+    (106.23, -10.51, 2.5),  # Seagull
 ]
+
 
 # -----------------------
 # Centralized logging
@@ -107,7 +109,9 @@ def _get_logger() -> logging.Logger:
     return logger
 
 
-def _phase_logger(base_logger: logging.Logger, phase: str, product: str | None = None) -> logging.LoggerAdapter:
+def _phase_logger(
+    base_logger: logging.Logger, phase: str, product: str | None = None
+) -> logging.LoggerAdapter:
     """Return a LoggerAdapter injecting phase (and product if provided)."""
     extra = {"phase": phase}
     if product:
@@ -118,7 +122,9 @@ def _phase_logger(base_logger: logging.Logger, phase: str, product: str | None =
 # -----------------------
 # YAML mapping validation
 # -----------------------
-def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) -> dd.DataFrame:
+def _validate_and_rename(
+    df: dd.DataFrame, entry: dict, logger: logging.Logger
+) -> dd.DataFrame:
     """Validate YAML column mapping and apply conflict-safe renames.
 
     Verifies existence of non-null source columns, suggests close matches,
@@ -136,13 +142,18 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
         ValueError: If required source columns are missing.
     """
     product_name = entry["internal_name"]
-    columns_cfg = (entry.get("columns") or {})
-    non_null_map = {std: src for std, src in columns_cfg.items() if src not in (None, "", "null")}
+    columns_cfg = entry.get("columns") or {}
+    non_null_map = {
+        std: src for std, src in columns_cfg.items() if src not in (None, "", "null")
+    }
     input_cols = list(map(str, df.columns))
 
     missing_sources = [src for src in non_null_map.values() if src not in input_cols]
     if missing_sources:
-        suggestions = {src: difflib.get_close_matches(src, input_cols, n=3, cutoff=0.6) for src in missing_sources}
+        suggestions = {
+            src: difflib.get_close_matches(src, input_cols, n=3, cutoff=0.6)
+            for src in missing_sources
+        }
         raise ValueError(
             f"[{product_name}] Missing mapped source columns in input parquet: {missing_sources}\n"
             f"Configured (non-null) mapping: {non_null_map}\n"
@@ -169,7 +180,9 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
 
     col_map = {src: std for std, src in non_null_map.items()}
     if col_map:
-        logger.info(f"{product_name} Rename map (sample up to 6): {list(col_map.items())[:6]}")
+        logger.info(
+            f"{product_name} Rename map (sample up to 6): {list(col_map.items())[:6]}"
+        )
         df = df.rename(columns=col_map)
     else:
         logger.info(f"{product_name} No non-null column mappings; skipping rename.")
@@ -193,7 +206,9 @@ def _validate_and_rename(df: dd.DataFrame, entry: dict, logger: logging.Logger) 
     return df
 
 
-def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger) -> dd.DataFrame:
+def _rename_duplicate_columns_dd(
+    df: dd.DataFrame, logger: logging.Logger
+) -> dd.DataFrame:
     """Make column names unique across partitions by appending __dupN.
 
     Args:
@@ -203,6 +218,7 @@ def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger) -> dd
     Returns:
         dd.DataFrame: DataFrame with unique column names.
     """
+
     def _renamer(pdf: pd.DataFrame) -> pd.DataFrame:
         cols = list(map(str, pdf.columns))
         seen: dict[str, int] = {}
@@ -238,7 +254,9 @@ def _rename_duplicate_columns_dd(df: dd.DataFrame, logger: logging.Logger) -> dd
     return df.map_partitions(_renamer, meta=meta_fixed)
 
 
-def _rename_duplicate_columns_pd(pdf: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
+def _rename_duplicate_columns_pd(
+    pdf: pd.DataFrame, logger: logging.Logger
+) -> pd.DataFrame:
     """Make pandas columns unique by appending __dupN.
 
     Args:
@@ -299,7 +317,9 @@ def _next_available_prev_name(existing: list[str], base: str) -> str:
     return f"{base}{i}"
 
 
-def _stash_previous_results(df: dd.DataFrame, entry: dict, logger: logging.Logger) -> dd.DataFrame:
+def _stash_previous_results(
+    df: dd.DataFrame, entry: dict, logger: logging.Logger
+) -> dd.DataFrame:
     """Stash previous-run results into CRD_ID_prev*/compared_to_prev*/group_id_prev*.
 
     Args:
@@ -311,9 +331,12 @@ def _stash_previous_results(df: dd.DataFrame, entry: dict, logger: logging.Logge
         dd.DataFrame: Frame with stashed previous columns when applicable.
     """
     cols = list(map(str, df.columns))
-    columns_cfg = (entry.get("columns") or {})
-    non_null_map = {str(std): str(src) for std, src in columns_cfg.items()
-                    if src not in (None, "", "null")}
+    columns_cfg = entry.get("columns") or {}
+    non_null_map = {
+        str(std): str(src)
+        for std, src in columns_cfg.items()
+        if src not in (None, "", "null")
+    }
 
     mapped_id_from_crd = str(non_null_map.get("id", "")).strip().lower() == "crd_id"
 
@@ -445,7 +468,9 @@ def _normalize_schema_hints(hints: dict | None) -> dict:
     return norm
 
 
-def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger) -> tuple[dd.DataFrame, bool]:
+def _normalize_types(
+    df: dd.DataFrame, product_name: str, logger: logging.Logger
+) -> tuple[dd.DataFrame, bool]:
     """Normalize core dtypes and clean values.
 
     Args:
@@ -457,7 +482,13 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
         Tuple[dd.DataFrame, bool]: (normalized frame, whether 'type' normalized).
     """
     # 1) Normalize string-like
-    string_like = ["id", "instrument_type", "survey", "instrument_type_homogenized", "source"]
+    string_like = [
+        "id",
+        "instrument_type",
+        "survey",
+        "instrument_type_homogenized",
+        "source",
+    ]
     for col in string_like:
         if col in df.columns:
             df[col] = df[col].map_partitions(
@@ -471,13 +502,19 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
     type_cast_ok = False
     if "type" in df.columns:
         try:
-            df["type"] = df["type"].map_partitions(
-                _normalize_string_series_to_na,
-                meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
-            ).str.lower()
+            df["type"] = (
+                df["type"]
+                .map_partitions(
+                    _normalize_string_series_to_na,
+                    meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
+                )
+                .str.lower()
+            )
             type_cast_ok = True
         except Exception as e:
-            logger.warning(f"{product_name} Failed to normalize 'type' to lower-case: {e}")
+            logger.warning(
+                f"{product_name} Failed to normalize 'type' to lower-case: {e}"
+            )
             type_cast_ok = False
 
     # 3) JADES/VIMOS z_flag mapping if needed
@@ -545,7 +582,9 @@ def _normalize_types(df: dd.DataFrame, product_name: str, logger: logging.Logger
 # -----------------------
 # CRD_ID generation
 # -----------------------
-def _generate_crd_ids(df: dd.DataFrame, product_name: str, temp_dir: str) -> dd.DataFrame:
+def _generate_crd_ids(
+    df: dd.DataFrame, product_name: str, temp_dir: str
+) -> dd.DataFrame:
     """Assign stable, catalog-scoped CRD_IDs.
 
     Args:
@@ -561,7 +600,9 @@ def _generate_crd_ids(df: dd.DataFrame, product_name: str, temp_dir: str) -> dd.
     """
     m = re.match(r"(\d+)_", product_name)
     if not m:
-        raise ValueError(f"Could not extract numeric prefix from internal_name '{product_name}'")
+        raise ValueError(
+            f"Could not extract numeric prefix from internal_name '{product_name}'"
+        )
     catalog_prefix = m.group(1)
 
     sizes = df.map_partitions(len).compute().tolist()
@@ -577,8 +618,9 @@ def _generate_crd_ids(df: dd.DataFrame, product_name: str, temp_dir: str) -> dd.
 
     parts = [
         df.get_partition(i).map_partitions(
-            _add_crd, offset,
-            meta=df._meta.assign(CRD_ID=pd.Series(pd.array([], dtype=DTYPE_STR)))
+            _add_crd,
+            offset,
+            meta=df._meta.assign(CRD_ID=pd.Series(pd.array([], dtype=DTYPE_STR))),
         )
         for i, offset in enumerate(offsets)
     ]
@@ -599,37 +641,57 @@ def _validate_ra_dec_or_fail(df: dd.DataFrame, product_name: str) -> None:
     Raises:
         ValueError: If invalid RA/DEC entries are detected.
     """
+
     def _isfinite_series(s: pd.Series) -> pd.Series:
         arr = s.astype("float64")
         return pd.Series(np.isfinite(arr), index=s.index)
 
-    isfinite_ra  = df["ra"].map_partitions(_isfinite_series,  meta=("ra", "bool"))
+    isfinite_ra = df["ra"].map_partitions(_isfinite_series, meta=("ra", "bool"))
     isfinite_dec = df["dec"].map_partitions(_isfinite_series, meta=("dec", "bool"))
 
-    ra64  = df["ra"].astype("float64")
+    ra64 = df["ra"].astype("float64")
     dec64 = df["dec"].astype("float64")
 
-    in_range = (
-        (ra64 >= 0.0) & (ra64 < 360.0) &
-        (dec64 >= -90.0) & (dec64 <= 90.0)
-    )
+    in_range = (ra64 >= 0.0) & (ra64 < 360.0) & (dec64 >= -90.0) & (dec64 <= 90.0)
     invalid_mask = ~(isfinite_ra & isfinite_dec & in_range)
 
     na_ra, na_dec = df["ra"].isna().sum(), df["dec"].isna().sum()
     nonfinite_ra, nonfinite_dec = (~isfinite_ra).sum(), (~isfinite_dec).sum()
-    oor_ra_low,  oor_ra_high  = (ra64 < 0.0).sum(), (ra64 >= 360.0).sum()
+    oor_ra_low, oor_ra_high = (ra64 < 0.0).sum(), (ra64 >= 360.0).sum()
     oor_dec_low, oor_dec_high = (dec64 < -90.0).sum(), (dec64 > 90.0).sum()
     invalid_total = invalid_mask.sum()
 
-    (na_ra, na_dec, nonfinite_ra, nonfinite_dec,
-     oor_ra_low, oor_ra_high, oor_dec_low, oor_dec_high, invalid_total) = dask.compute(
-        na_ra, na_dec, nonfinite_ra, nonfinite_dec,
-        oor_ra_low, oor_ra_high, oor_dec_low, oor_dec_high, invalid_total
+    (
+        na_ra,
+        na_dec,
+        nonfinite_ra,
+        nonfinite_dec,
+        oor_ra_low,
+        oor_ra_high,
+        oor_dec_low,
+        oor_dec_high,
+        invalid_total,
+    ) = dask.compute(
+        na_ra,
+        na_dec,
+        nonfinite_ra,
+        nonfinite_dec,
+        oor_ra_low,
+        oor_ra_high,
+        oor_dec_low,
+        oor_dec_high,
+        invalid_total,
     )
 
     if invalid_total > 0:
-        cols = [c for c in ["CRD_ID", "id", "source", "survey", "ra", "dec"] if c in df.columns]
-        sample_records = df[invalid_mask][cols].head(5, compute=True).to_dict(orient="records")
+        cols = [
+            c
+            for c in ["CRD_ID", "id", "source", "survey", "ra", "dec"]
+            if c in df.columns
+        ]
+        sample_records = (
+            df[invalid_mask][cols].head(5, compute=True).to_dict(orient="records")
+        )
         raise ValueError(
             f"[{product_name}] Invalid RA/DEC rows: {invalid_total}\n"
             f"  RA NaN={na_ra}, DEC NaN={na_dec}\n"
@@ -652,20 +714,21 @@ def _flag_dp1(df: dd.DataFrame) -> dd.DataFrame:
     Returns:
         dd.DataFrame: Adds 'is_in_DP1_fields' (nullable int).
     """
-    ra_centers  = np.deg2rad([r[0] for r in DP1_REGIONS])
+    ra_centers = np.deg2rad([r[0] for r in DP1_REGIONS])
     dec_centers = np.deg2rad([r[1] for r in DP1_REGIONS])
-    radii       = [r[2] for r in DP1_REGIONS]
+    radii = [r[2] for r in DP1_REGIONS]
 
     def _compute(part: pd.DataFrame) -> pd.DataFrame:
         p = part.copy()
-        ra_rad  = np.deg2rad(p["ra"].to_numpy(dtype=float, copy=False))
+        ra_rad = np.deg2rad(p["ra"].to_numpy(dtype=float, copy=False))
         dec_rad = np.deg2rad(p["dec"].to_numpy(dtype=float, copy=False))
         in_any = np.zeros(len(p), dtype=bool)
         for ra_c, dec_c, rdeg in zip(ra_centers, dec_centers, radii):
-            cos_ang = (np.sin(dec_c) * np.sin(dec_rad) +
-                       np.cos(dec_c) * np.cos(dec_rad) * np.cos(ra_rad - ra_c))
+            cos_ang = np.sin(dec_c) * np.sin(dec_rad) + np.cos(dec_c) * np.cos(
+                dec_rad
+            ) * np.cos(ra_rad - ra_c)
             ang_deg = np.rad2deg(np.arccos(np.clip(cos_ang, -1.0, 1.0)))
-            in_any |= (ang_deg <= rdeg)
+            in_any |= ang_deg <= rdeg
         p["is_in_DP1_fields"] = pd.Series(in_any, index=p.index, dtype=DTYPE_INT)
         return p
 
@@ -693,6 +756,7 @@ def _extract_variables_from_expr(expr: str) -> set[str]:
     class _Visitor(_ast.NodeVisitor):
         def __init__(self):
             self.vars = set()
+
         def visit_Name(self, node: _ast.Name) -> None:  # type: ignore[override]
             self.vars.add(node.id)
             self.generic_visit(node)
@@ -725,9 +789,19 @@ def _select_output_columns(
     """
     # Base schema (only columns that exist will be kept at the end).
     final_cols = [
-        "CRD_ID", "id", "ra", "dec", "z", "z_flag", "z_err",
-        "instrument_type", "survey", "source", "tie_result",
-        "is_in_DP1_fields", "compared_to",
+        "CRD_ID",
+        "id",
+        "ra",
+        "dec",
+        "z",
+        "z_flag",
+        "z_err",
+        "instrument_type",
+        "survey",
+        "source",
+        "tie_result",
+        "is_in_DP1_fields",
+        "compared_to",
         # New optional current component label (will only be kept if present)
         "group_id",
     ]
@@ -849,7 +923,9 @@ def _save_parquet(df: dd.DataFrame, temp_dir: str, product_name: str) -> str:
 
 
 # ---- Arrow schema builder ----
-def _build_arrow_schema_for_catalog(df: pd.DataFrame, schema_hints: dict | None = None) -> pa.Schema:
+def _build_arrow_schema_for_catalog(
+    df: pd.DataFrame, schema_hints: dict | None = None
+) -> pa.Schema:
     """Build a robust Arrow schema for lsdb.from_dataframe.
 
     Args:
@@ -904,7 +980,9 @@ def _build_arrow_schema_for_catalog(df: pd.DataFrame, schema_hints: dict | None 
             continue
 
         if name in schema_hints:
-            fields.append(pa.field(name, _hint_to_pa(schema_hints[name]), nullable=True))
+            fields.append(
+                pa.field(name, _hint_to_pa(schema_hints[name]), nullable=True)
+            )
             continue
 
         dt = df[name].dtype
@@ -916,7 +994,9 @@ def _build_arrow_schema_for_catalog(df: pd.DataFrame, schema_hints: dict | None 
         if s.startswith("Float") or s == "float64":
             fields.append(pa.field(name, pa.float64(), nullable=True))
         elif s.startswith("Int") or s in {"int64", "int32", "int16", "int8"}:
-            fields.append(pa.field(name, pa.int64() if "8" not in s else pa.int8(), nullable=True))
+            fields.append(
+                pa.field(name, pa.int64() if "8" not in s else pa.int8(), nullable=True)
+            )
         elif s in {"boolean", "bool"}:
             fields.append(pa.field(name, pa.bool_(), nullable=True))
         else:
@@ -956,8 +1036,11 @@ def _write_schema_file_for_collection(
         ValueError: If no Parquet files are found.
     """
     base_path = os.path.join(parquet_path, "base")
-    pattern = os.path.join(base_path, "*.parquet") if os.path.exists(base_path) \
+    pattern = (
+        os.path.join(base_path, "*.parquet")
+        if os.path.exists(base_path)
         else os.path.join(parquet_path, "*.parquet")
+    )
     files = glob.glob(pattern)
     files.sort()
     if not files:
@@ -1013,8 +1096,11 @@ def _build_collection_with_retry(
     collection_path = os.path.join(parent_dir, output_artifact_name)
 
     base_path = os.path.join(parquet_path, "base")
-    pattern = os.path.join(base_path, "*.parquet") if os.path.exists(base_path) \
+    pattern = (
+        os.path.join(base_path, "*.parquet")
+        if os.path.exists(base_path)
         else os.path.join(parquet_path, "*.parquet")
+    )
     in_file_paths = glob.glob(pattern)
     in_file_paths.sort()
     if not in_file_paths:
@@ -1028,9 +1114,15 @@ def _build_collection_with_retry(
     # FAST PATH
     if total_size_mb <= size_threshold_mb:
         try:
-            logger.info(f"Small catalog ({total_size_mb:.1f} MB). Building collection via fast path → {collection_path}")
+            logger.info(
+                f"Small catalog ({total_size_mb:.1f} MB). Building collection via fast path → {collection_path}"
+            )
             pdf_list = [pd.read_parquet(p) for p in in_file_paths]
-            dfp = pd.concat(pdf_list, ignore_index=True) if len(pdf_list) > 1 else pdf_list[0]
+            dfp = (
+                pd.concat(pdf_list, ignore_index=True)
+                if len(pdf_list) > 1
+                else pdf_list[0]
+            )
             dfp = _rename_duplicate_columns_pd(dfp, logger)
 
             for col, pd_dtype in [
@@ -1063,7 +1155,9 @@ def _build_collection_with_retry(
                     except Exception:
                         pass
 
-            schema = _build_arrow_schema_for_catalog(dfp, schema_hints=_normalize_schema_hints(schema_hints or {}))
+            schema = _build_arrow_schema_for_catalog(
+                dfp, schema_hints=_normalize_schema_hints(schema_hints or {})
+            )
 
             catalog = lsdb.from_dataframe(
                 dfp,
@@ -1079,7 +1173,9 @@ def _build_collection_with_retry(
             return collection_path
 
         except Exception as e:
-            logger.warning(f"Collection fast-path failed for {output_artifact_name} ({type(e).__name__}: {e}). Falling back to hats_import.")
+            logger.warning(
+                f"Collection fast-path failed for {output_artifact_name} ({type(e).__name__}: {e}). Falling back to hats_import."
+            )
 
     # FALLBACK
     def _clean_partial():
@@ -1098,7 +1194,9 @@ def _build_collection_with_retry(
             schema_hints=_normalize_schema_hints(schema_hints or {}),
         )
     except Exception as e:
-        logger.warning(f"Could not build schema file for fallback import ({type(e).__name__}: {e}). Proceeding without it.")
+        logger.warning(
+            f"Could not build schema file for fallback import ({type(e).__name__}: {e}). Proceeding without it."
+        )
         schema_file = None
 
     def _make_args(with_margin: bool):
@@ -1110,18 +1208,20 @@ def _build_collection_with_retry(
         )
         if schema_file:
             kw["use_schema_file"] = schema_file
-        args = (CollectionArguments(
+        args = CollectionArguments(
             output_artifact_name=output_artifact_name,
             output_path=parent_dir,
             resume=False,
-        ).catalog(**kw))
+        ).catalog(**kw)
         if with_margin:
             args = args.add_margin(margin_threshold=5.0, is_default=True)
         return args
 
     if try_margin:
         try:
-            logger.info(f"Building collection WITH margin (import pipeline): {output_artifact_name}")
+            logger.info(
+                f"Building collection WITH margin (import pipeline): {output_artifact_name}"
+            )
             run_collection_import(_make_args(with_margin=True), client)
             return collection_path
         except Exception as e:
@@ -1129,7 +1229,9 @@ def _build_collection_with_retry(
             _clean_partial()
 
     try:
-        logger.info(f"Building collection WITHOUT margin (import pipeline): {output_artifact_name}")
+        logger.info(
+            f"Building collection WITHOUT margin (import pipeline): {output_artifact_name}"
+        )
         run_collection_import(_make_args(with_margin=False), client)
         return collection_path
     except Exception as e:
@@ -1237,22 +1339,31 @@ def prepare_catalog(
         df,
         used_type_fastpath,
         tiebreaking_priority,
-        instrument_type_priority,   # noqa: F841
+        instrument_type_priority,  # noqa: F841
         translation_rules_uc,
     ) = _homogenize(df, translation_config, product_name, lg, type_cast_ok=type_cast_ok)
 
     # 7) Apply cut based on z_flag_homogenized if requested
-    z_flag_homogenized_value_to_cut = param_config.get("z_flag_homogenized_value_to_cut", None)
-    if z_flag_homogenized_value_to_cut is not None and "z_flag_homogenized" in df.columns:
+    z_flag_homogenized_value_to_cut = param_config.get(
+        "z_flag_homogenized_value_to_cut", None
+    )
+    if (
+        z_flag_homogenized_value_to_cut is not None
+        and "z_flag_homogenized" in df.columns
+    ):
         try:
             cut_val = float(z_flag_homogenized_value_to_cut)
             if 0.0 < cut_val <= 4.0:
                 initial_count = df.shape[0].compute()
                 df = df[df["z_flag_homogenized"] >= cut_val]
                 final_count = df.shape[0].compute()
-                lg.info(f"Applied z_flag_homogenized cut >= {cut_val}: {initial_count} → {final_count} rows")
+                lg.info(
+                    f"Applied z_flag_homogenized cut >= {cut_val}: {initial_count} → {final_count} rows"
+                )
             else:
-                lg.warning(f"Invalid z_flag_homogenized_value_to_cut={z_flag_homogenized_value_to_cut}; skipping cut.")
+                lg.warning(
+                    f"Invalid z_flag_homogenized_value_to_cut={z_flag_homogenized_value_to_cut}; skipping cut."
+                )
         except Exception as e:
             lg.warning(f"Could not apply z_flag_homogenized cut ({e}); skipping cut.")
 
@@ -1264,7 +1375,9 @@ def prepare_catalog(
             wait(df)
         with dask.config.set({"dataframe.shuffle.method": "tasks"}):
             df = df.repartition(partition_size=part_size)
-        lg.info(f"Persisted and repartitioned: partition_size={part_size} npartitions={df.npartitions}")
+        lg.info(
+            f"Persisted and repartitioned: partition_size={part_size} npartitions={df.npartitions}"
+        )
     except Exception as e:
         lg.warning(f"Persist/repartition skipped or failed: {e}")
 
@@ -1289,7 +1402,9 @@ def prepare_catalog(
         tiebreaking_priority,
         used_type_fastpath,
         save_expr_columns=translation_config.get("save_expr_columns", False),
-        schema_hints=_normalize_schema_hints(translation_config.get("expr_column_schema")),
+        schema_hints=_normalize_schema_hints(
+            translation_config.get("expr_column_schema")
+        ),
     )
 
     # Coalesce partitions for write
@@ -1304,9 +1419,13 @@ def prepare_catalog(
     try:
         with dask.config.set({"dataframe.shuffle.method": "tasks"}):
             df_to_write = df.repartition(npartitions=target_out_parts)
-        lg.info(f"Output repartitioned for write: npartitions={df_to_write.npartitions}")
+        lg.info(
+            f"Output repartitioned for write: npartitions={df_to_write.npartitions}"
+        )
     except Exception as e:
-        lg.warning(f"Output repartition failed; writing current npartitions. Reason: {e}")
+        lg.warning(
+            f"Output repartition failed; writing current npartitions. Reason: {e}"
+        )
         df_to_write = df
 
     # 13) Write prepared parquet

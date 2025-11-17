@@ -237,13 +237,8 @@ ver_satisfies() {
   esac
 }
 
-# ----------------------------
-# Preconditions
-# ----------------------------
-if [ ! -d "${PIPELINES_DIR:-}" ]; then
-  echo "Error: PIPELINES_DIR not defined."
-  exit 1
-fi
+SCRIPT_PATH=$(readlink -f "$0")
+PIPE_BASE=$(dirname "$SCRIPT_PATH")
 
 # --- Accept Anaconda TOS when supported by this conda; otherwise skip ---
 conda_has_cmd() {
@@ -258,7 +253,6 @@ else
   log "conda 'tos' not available → skipping ToS acceptance (not needed on this setup)."
 fi
 
-PIPE_BASE="$PIPELINES_DIR/combine_redshift_dedup"
 ENV_YAML="${PIPE_BASE}/environment.yaml"
 ENV_NAME="pipe_crd"
 
@@ -336,9 +330,9 @@ export PATH="$PATH:${PIPE_BASE}/scripts/"
 
 # Ensure Python sees local CRC packages and, if it exists, the monorepo src
 if [ -n "${PYTHONPATH:-}" ]; then
-  export PYTHONPATH="${PYTHONPATH}:${PIPELINES_DIR}/src:${PIPE_BASE}/packages/"
+  export PYTHONPATH="${PYTHONPATH}:${PIPE_BASE}/packages/"
 else
-  export PYTHONPATH="${PIPELINES_DIR}/src:${PIPE_BASE}/packages/"
+  export PYTHONPATH="${PIPE_BASE}/packages/"
 fi
 
 echo "Conda Environment: $CONDA_DEFAULT_ENV"

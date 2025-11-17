@@ -25,7 +25,9 @@ from datetime import datetime
 # Logging
 # =====================
 import logging
-from logging.handlers import RotatingFileHandler  # noqa: F401  (kept for back-compat imports)
+from logging.handlers import (
+    RotatingFileHandler,
+)  # noqa: F401  (kept for back-compat imports)
 
 # =====================
 # Third-party
@@ -39,20 +41,20 @@ import lsdb
 # =====================
 # Project
 # =====================
-from combine_redshift_dedup.packages.crossmatch_auto import crossmatch_auto
-from combine_redshift_dedup.packages.crossmatch_cross import crossmatch_tiebreak_safe
-from combine_redshift_dedup.packages.deduplication import (
+from crossmatch_auto import crossmatch_auto
+from crossmatch_cross import crossmatch_tiebreak_safe
+from deduplication import (
     deduplicate_pandas,
     run_dedup_with_lsdb_map_partitions,
 )
-from combine_redshift_dedup.packages.executor import get_executor
-from combine_redshift_dedup.packages.product_handle import save_dataframe
-from combine_redshift_dedup.packages.specz import (
+from executor import get_executor
+from product_handle import save_dataframe
+from specz import (
     prepare_catalog,
     USE_ARROW_TYPES,
     DTYPE_STR,
 )
-from combine_redshift_dedup.packages.utils import (
+from utils import (
     configure_exception_hook,
     configure_warning_handler,
     dump_yml,
@@ -64,6 +66,7 @@ from combine_redshift_dedup.packages.utils import (
     start_crc_log_collector,
 )
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -74,16 +77,25 @@ def _log_remote_future_exception(
     Logs the remote (worker-side) traceback carried by a Dask Future.
     """
     import traceback as _tb
+
     try:
         err = fut.exception()
         tb = fut.traceback()  # remote TB; can be None
         if tb is not None:
-            lg.error("%s: %r", msg_prefix, err, exc_info=(type(err), err, tb), extra=extra)
+            lg.error(
+                "%s: %r", msg_prefix, err, exc_info=(type(err), err, tb), extra=extra
+            )
         else:
             # Fallback: driver-side traceback (should still exist)
             lg.error("%s: %r\n%s", msg_prefix, err, _tb.format_exc(), extra=extra)
     except Exception:
-        lg.error("%s (and failed to render remote traceback)\n%s", msg_prefix, _tb.format_exc(), extra=extra)
+        lg.error(
+            "%s (and failed to render remote traceback)\n%s",
+            msg_prefix,
+            _tb.format_exc(),
+            extra=extra,
+        )
+
 
 def _phase_logger(base_logger: logging.Logger, phase: str) -> logging.LoggerAdapter:
     """Return a LoggerAdapter that injects the phase into records."""
@@ -100,12 +112,20 @@ def _filesize_mb(path: str) -> float:
 
 def _is_collection_root(path: str) -> bool:
     """Return True if path contains collection.properties (HATS root)."""
-    return bool(path) and os.path.isdir(path) and os.path.exists(os.path.join(path, "collection.properties"))
+    return (
+        bool(path)
+        and os.path.isdir(path)
+        and os.path.exists(os.path.join(path, "collection.properties"))
+    )
 
 
 def _is_hats_subcatalog(path: str) -> bool:
     """Return True if path contains hats.properties (HATS subcatalog)."""
-    return bool(path) and os.path.isdir(path) and os.path.exists(os.path.join(path, "hats.properties"))
+    return (
+        bool(path)
+        and os.path.isdir(path)
+        and os.path.exists(os.path.join(path, "hats.properties"))
+    )
 
 
 def _is_hats_collection(path: str) -> bool:
@@ -146,7 +166,9 @@ def _guess_collection_for_step(temp_dir: str, step: int) -> str | None:
             if cand_root and _is_collection_root(cand_root):
                 return cand_root
 
-    for props in glob.glob(os.path.join(temp_dir, "**", "collection.properties"), recursive=True):
+    for props in glob.glob(
+        os.path.join(temp_dir, "**", "collection.properties"), recursive=True
+    ):
         root = os.path.dirname(props)
         if f"step{step}" in root and _is_collection_root(root):
             return root
@@ -154,7 +176,9 @@ def _guess_collection_for_step(temp_dir: str, step: int) -> str | None:
     return None
 
 
-def _resume_set(resume_log_path: str, key: str, value: str, lg: logging.LoggerAdapter) -> None:
+def _resume_set(
+    resume_log_path: str, key: str, value: str, lg: logging.LoggerAdapter
+) -> None:
     """Append a key/value checkpoint entry into the resume log."""
     try:
         data = {}
@@ -195,7 +219,7 @@ def _cleanup_previous_step(
     step_index: int,
     prepared_info: list[dict[str, Any]],
     temp_dir: str,
-    lg: logging.LoggerAdapter
+    lg: logging.LoggerAdapter,
 ) -> None:
     """Delete artifacts from *all* previous steps to save disk space.
 
@@ -270,6 +294,7 @@ def _cleanup_previous_step(
 # Worker task for auto self-crossmatch
 # ---------------------------------------------------------------------------
 
+
 def _auto_cross_worker(info: dict, logs_dir: str, translation_config: dict):
     """Run self-crossmatch from prepared_*_hats and write prepared_*_hats_auto."""
     ensure_crc_logger(logs_dir)
@@ -284,6 +309,7 @@ def _auto_cross_worker(info: dict, logs_dir: str, translation_config: dict):
         translation_config=translation_config,
     )
     return out_auto
+
 
 # ---------------------------------------------------------------------------
 # Parallel crossmatch worker
@@ -319,6 +345,7 @@ def _xmatch_worker(
         do_import=True,
     )
 
+
 # ---------------------------------------------------------------------------
 # Cleanup for crossmatch tournment
 # ---------------------------------------------------------------------------
@@ -331,6 +358,7 @@ def _cleanup_inputs_of_merge(
     Remove only the two input collections that were just merged.
     Accepts either a collection root or a subcatalog and normalizes to root.
     """
+
     def _to_root(p: str) -> str:
         n = _normalize_collection_root(p) or p
         return n
@@ -353,6 +381,7 @@ def _cleanup_inputs_of_merge(
         if _is_collection_root(rroot):
             _rm_root(rroot)
 
+
 # ---------------------------------------------------------------------------
 # Publish / copy helpers
 # ---------------------------------------------------------------------------
@@ -371,6 +400,7 @@ def _copy_file(src: str, dst: str, lg: logging.LoggerAdapter) -> None:
         shutil.copy2(abs_src, abs_dst)
         lg.info("Copied: %s -> %s", abs_src, abs_dst)
 
+
 def _copy_tree(src_dir: str, dst_dir: str, lg: logging.LoggerAdapter) -> None:
     """Copia recursivamente src_dir → dst_dir, sobrescrevendo se existir."""
     if not os.path.isdir(src_dir):
@@ -384,7 +414,10 @@ def _copy_tree(src_dir: str, dst_dir: str, lg: logging.LoggerAdapter) -> None:
         for f in files:
             _copy_file(os.path.join(root, f), os.path.join(tgt_root, f), lg)
 
-def _snapshot_shell_logs(src_dir: str, dst_dir: str, lg: logging.LoggerAdapter, max_size_mb: int = 100) -> None:
+
+def _snapshot_shell_logs(
+    src_dir: str, dst_dir: str, lg: logging.LoggerAdapter, max_size_mb: int = 100
+) -> None:
     """Copy *.log/*.err/*.out (and *.N rotations) from src_dir to dst_dir."""
     os.makedirs(dst_dir, exist_ok=True)
     patterns = ["*.log", "*.log.*", "*.err", "*.err.*", "*.out", "*.out.*"]
@@ -402,11 +435,15 @@ def _snapshot_shell_logs(src_dir: str, dst_dir: str, lg: logging.LoggerAdapter, 
                 pass
             _copy_file(path, os.path.join(dst_dir, os.path.basename(path)), lg)
 
+
 # ---------------------------------------------------------------------------
 # Core pipeline
 # ---------------------------------------------------------------------------
 
-def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None) -> None:
+
+def main(
+    config_path: str, cwd: str = ".", base_dir_override: str | None = None
+) -> None:
     """Run the CRC pipeline end-to-end."""
     delete_temp_files = True  # set True to aggressively clean intermediates
 
@@ -459,7 +496,9 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         dump_yml(process_info_path, {})
     process_info = load_yml(process_info_path) or {}
     update_process_info(process_info, process_info_path, "status", "Failed")
-    update_process_info(process_info, process_info_path, "start_time", str(pd.Timestamp.now()))
+    update_process_info(
+        process_info, process_info_path, "start_time", str(pd.Timestamp.now())
+    )
 
     # --- Logger & warnings (driver) ---
     base_logger = ensure_crc_logger(logs_dir)
@@ -475,7 +514,9 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             start_crc_log_collector(host=bind_host, port=port)
             log_init.info("CRC log collector listening on udp://%s:%d", bind_host, port)
         except Exception as e:
-            log_init.warning("Failed to start CRC log collector from '%s': %s", collector_env, e)
+            log_init.warning(
+                "Failed to start CRC log collector from '%s': %s", collector_env, e
+            )
 
     log_init.info("START init: pipeline bootstrap")
     configure_warning_handler(base_logger)
@@ -490,7 +531,10 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     # --- Quick config sanity logs (minimal, non-invasive) ---
     try:
         n_inputs = len((config.get("inputs") or {}).get("specz") or [])
-        sample_names = [e.get("internal_name") for e in (config["inputs"]["specz"][:3] if n_inputs else [])]
+        sample_names = [
+            e.get("internal_name")
+            for e in (config["inputs"]["specz"][:3] if n_inputs else [])
+        ]
         log_init.info(
             "Config sanity: output_root_dir=%s, output_dir=%s, output_name=%s, output_format=%s, specz_inputs=%d (sample=%s)",
             config.get("output_root_dir"),
@@ -522,7 +566,9 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         size_kb,
     )
     if not exists:
-        raise FileNotFoundError(f"flags_translation_file not found: {path_to_translation_file}")
+        raise FileNotFoundError(
+            f"flags_translation_file not found: {path_to_translation_file}"
+        )
     try:
         translation_config = load_yml(path_to_translation_file)
     except Exception as e:
@@ -531,11 +577,16 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     # Minimal summary of loaded translation (no heavy dumping)
     try:
         tb = translation_config.get("tiebreaking_priority")
-        log_init.info("Loaded translation_config keys: %s", ", ".join(sorted(list(translation_config.keys()))[:8]))
+        log_init.info(
+            "Loaded translation_config keys: %s",
+            ", ".join(sorted(list(translation_config.keys()))[:8]),
+        )
         if tb is not None:
             log_init.info("tiebreaking_priority=%s", tb)
         if "delta_z_threshold" in translation_config:
-            log_init.info("delta_z_threshold=%s", translation_config.get("delta_z_threshold"))
+            log_init.info(
+                "delta_z_threshold=%s", translation_config.get("delta_z_threshold")
+            )
     except Exception:
         log_init.debug("Could not log translation_config summary.", exc_info=True)
 
@@ -544,9 +595,13 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     catalogs = sorted(catalogs_unsorted, key=lambda e: _filesize_mb(e["path"]))
     log_init.info("Catalogs sorted by disk size:")
     for entry in catalogs:
-        log_init.info(" - %s: %.1f MB", entry["internal_name"], _filesize_mb(entry["path"]))
+        log_init.info(
+            " - %s: %.1f MB", entry["internal_name"], _filesize_mb(entry["path"])
+        )
 
-    combine_mode = param_config.get("combine_type", "concatenate_and_mark_duplicates").lower()
+    combine_mode = param_config.get(
+        "combine_type", "concatenate_and_mark_duplicates"
+    ).lower()
     completed = read_completed_steps(os.path.join(temp_dir, "process_resume.log"))
 
     # --- Dask cluster/client ---
@@ -563,7 +618,9 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     min_workers = 0 if min_jobs is None else int(min_jobs) * procs
 
     if min_workers > 0:
-        log_init.info("Waiting up to 10s for minimum_workers=%d to start...", min_workers)
+        log_init.info(
+            "Waiting up to 10s for minimum_workers=%d to start...", min_workers
+        )
         try:
             client.wait_for_workers(min_workers, timeout=10)
         except Exception:
@@ -598,7 +655,10 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         # 1) PREPARATION
         # ---------------------------------------------------------------
         log_prep = _phase_logger(base_logger, "preparation")
-        log_prep.info("START preparation: reading inputs and building prepared collections (temp=%s)", temp_dir)
+        log_prep.info(
+            "START preparation: reading inputs and building prepared collections (temp=%s)",
+            temp_dir,
+        )
 
         max_inflight = int(param_config.get("prepare_max_inflight", 5))
 
@@ -612,7 +672,9 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 return (hats_auto, "ra", "dec", entry["internal_name"], "")
             log_prep.warning(
                 "Prepared collection not found for %s. Expected %s or %s",
-                entry["internal_name"], hats, hats_auto
+                entry["internal_name"],
+                hats,
+                hats_auto,
             )
             return (hats, "ra", "dec", entry["internal_name"], "")
 
@@ -640,7 +702,9 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
         log_prep.info(
             "Concurrency for prepare: max_inflight=%d, to_prepare=%d, already_prepared=%d",
-            max_inflight, len(queue), len(results),
+            max_inflight,
+            len(queue),
+            len(results),
         )
 
         ac = as_completed()
@@ -659,9 +723,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             except Exception:
                 # Logs remote worker traceback and repropagates
                 _log_remote_future_exception(
-                    log_prep,
-                    fut,
-                    msg_prefix="PREPARE FAILED (remote worker traceback)"
+                    log_prep, fut, msg_prefix="PREPARE FAILED (remote worker traceback)"
                 )
                 raise
             results.append(out)
@@ -670,14 +732,16 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 fut2 = _submit_prepare(queue.pop(0))
                 ac.add(fut2)
                 inflight.append(fut2)
-        
+
         log_prep.info(
             "Prepared %d new catalogs; total results now %d / %d",
-            prepared_count, len(results), len(catalogs),
+            prepared_count,
+            len(results),
+            len(catalogs),
         )
         if len(results) != len(catalogs):
             raise RuntimeError("Internal error: prepared results count mismatch.")
-        
+
         prepared_info = [
             {
                 "collection_path": r[0],
@@ -711,12 +775,14 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         resume_log = os.path.join(temp_dir, "process_resume.log")
 
         def _recover_final_collection_path() -> str | None:
-            #1) Try to take from the resume of the last step
-            resumed = _resume_get(resume_log, f"crossmatch_step{final_step}.collection_path")
+            # 1) Try to take from the resume of the last step
+            resumed = _resume_get(
+                resume_log, f"crossmatch_step{final_step}.collection_path"
+            )
             resumed = _normalize_collection_root(resumed)
             if resumed and _is_collection_root(resumed):
                 return resumed
-            #2) Try to guess on the disk
+            # 2) Try to guess on the disk
             guessed = _guess_collection_for_step(temp_dir, final_step)
             if guessed and _is_collection_root(guessed):
                 return guessed
@@ -724,18 +790,22 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
         merged_final_path = os.path.join(temp_dir, f"merged_step{final_step}")
         crossmatch_already_done = (
-            (f"crossmatch_step{final_step}" in completed) or
-            os.path.isdir(merged_final_path)
-        )
+            f"crossmatch_step{final_step}" in completed
+        ) or os.path.isdir(merged_final_path)
 
         # If you have already finished crossmatching, retrieve the collection root (if it exists) for distributed dedup.
-        final_collection_path = _recover_final_collection_path() if crossmatch_already_done else None
+        final_collection_path = (
+            _recover_final_collection_path() if crossmatch_already_done else None
+        )
 
         # ---------------------------------------------------------------
         # 2) AUTO MATCH (self crossmatch over each prepared)
         # ---------------------------------------------------------------
         log_auto = _phase_logger(base_logger, "automatch")
-        if combine_mode in ("concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"):
+        if combine_mode in (
+            "concatenate_and_mark_duplicates",
+            "concatenate_and_remove_duplicates",
+        ):
 
             if crossmatch_already_done:
                 # No auto needed: merges already completed and merged_step{final} present
@@ -744,7 +814,9 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     final_step,
                 )
             else:
-                log_auto.info("START automatch: generating *_hats_auto from prepared collections")
+                log_auto.info(
+                    "START automatch: generating *_hats_auto from prepared collections"
+                )
 
                 queue_auto: list[dict] = []
                 already_done = 0
@@ -759,7 +831,9 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 max_inflight_auto = int(param_config.get("auto_cross_max_inflight", 5))
                 log_auto.info(
                     "Concurrency for auto-cross: max_inflight=%d, to_run=%d, already_done=%d",
-                    max_inflight_auto, len(queue_auto), already_done,
+                    max_inflight_auto,
+                    len(queue_auto),
+                    already_done,
                 )
 
                 if queue_auto:
@@ -768,7 +842,13 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     fut2info: dict[Any, dict] = {}
 
                     def _submit_auto(i: dict):
-                        return client.submit(_auto_cross_worker, i, logs_dir, translation_config, pure=False)
+                        return client.submit(
+                            _auto_cross_worker,
+                            i,
+                            logs_dir,
+                            translation_config,
+                            pure=False,
+                        )
 
                     for _ in range(min(max_inflight_auto, len(queue_auto))):
                         info = queue_auto.pop(0)
@@ -787,7 +867,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                             _log_remote_future_exception(
                                 log_auto,
                                 fut,
-                                msg_prefix=f"AUTO-CROSS FAILED for {info_err['internal_name']} (remote worker traceback)"
+                                msg_prefix=f"AUTO-CROSS FAILED for {info_err['internal_name']} (remote worker traceback)",
                             )
                             raise
 
@@ -802,9 +882,14 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                             inflight2.append(fut2)
                             fut2info[fut2] = nxt
 
-                    log_auto.info("Auto crossmatch completed for %d catalogs (re/computed)", auto_done_now)
+                    log_auto.info(
+                        "Auto crossmatch completed for %d catalogs (re/computed)",
+                        auto_done_now,
+                    )
                 else:
-                    log_auto.info("No auto-crossmatch needed (all *_hats_auto present).")
+                    log_auto.info(
+                        "No auto-crossmatch needed (all *_hats_auto present)."
+                    )
 
                 current_workers = len(client.scheduler_info().get("workers", {}))
                 log_auto.info(
@@ -832,27 +917,41 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                         + ". Check disk/permissions/logs."
                     )
 
-
         # ---------------------------------------------------------------
         # 3) CROSSMATCH (parallel tournament; no per-step resume)
         # ---------------------------------------------------------------
         log_cross = _phase_logger(base_logger, "crossmatch")
-        log_cross.info("START crossmatch (parallel tournament) over prepared *_hats_auto")
+        log_cross.info(
+            "START crossmatch (parallel tournament) over prepared *_hats_auto"
+        )
 
         if combine_mode == "concatenate":
             # Simple concat mode still passes through consolidation phase later.
             log_cross.info("Concatenate mode selected (no crossmatch).")
             try:
-                log_cross.info("Concatenating %d prepared catalogs.", len(prepared_info))
+                log_cross.info(
+                    "Concatenating %d prepared catalogs.", len(prepared_info)
+                )
                 for _pi in prepared_info[:5]:
-                    log_cross.debug("Prepared path candidate: %s", _pi.get("prepared_path"))
-                df_final = dd.concat([dd.read_parquet(i["prepared_path"]) for i in prepared_info])
+                    log_cross.debug(
+                        "Prepared path candidate: %s", _pi.get("prepared_path")
+                    )
+                df_final = dd.concat(
+                    [dd.read_parquet(i["prepared_path"]) for i in prepared_info]
+                )
                 _ = df_final.head(1, compute=True)  # small schema sanity
                 df_final = df_final.compute()
-                log_cross.info("Concatenate compute finished: shape=%s", tuple(df_final.shape))
+                log_cross.info(
+                    "Concatenate compute finished: shape=%s", tuple(df_final.shape)
+                )
             except Exception as e:
                 import traceback as _tb
-                log_cross.error("FAILED while concatenating prepared catalogs: %s\n%s", repr(e), _tb.format_exc())
+
+                log_cross.error(
+                    "FAILED while concatenating prepared catalogs: %s\n%s",
+                    repr(e),
+                    _tb.format_exc(),
+                )
                 raise
 
             try:
@@ -864,7 +963,10 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             log_cross.info("END crossmatch: concatenate mode (no crossmatch performed)")
             start_consolidate = True
 
-        elif combine_mode in ("concatenate_and_mark_duplicates", "concatenate_and_remove_duplicates"):
+        elif combine_mode in (
+            "concatenate_and_mark_duplicates",
+            "concatenate_and_remove_duplicates",
+        ):
 
             if crossmatch_already_done:
                 # Crossmatch chain already finished previously (by merged_step{final} presence)
@@ -885,26 +987,41 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                         if os.path.isdir(hats_auto):
                             info["collection_path"] = hats_auto
                         else:
-                            raise FileNotFoundError(f"Missing *_hats_auto for: {info['internal_name']}")
+                            raise FileNotFoundError(
+                                f"Missing *_hats_auto for: {info['internal_name']}"
+                            )
 
                     max_inflight_pairs = int(param_config.get("cross_max_inflight", 5))
-                    log_cross.info("Max inflight crossmatch pairs: %d", max_inflight_pairs)
+                    log_cross.info(
+                        "Max inflight crossmatch pairs: %d", max_inflight_pairs
+                    )
 
                     # Build initial queue of nodes (label, root_path)
                     from collections import deque
+
                     nodes = deque()
                     for info in prepared_info:
-                        root = _normalize_collection_root(info["collection_path"]) or info["collection_path"]
+                        root = (
+                            _normalize_collection_root(info["collection_path"])
+                            or info["collection_path"]
+                        )
                         if not _is_hats_collection(root):
                             raise RuntimeError(f"Not a HATS collection: {root}")
-                        root = _normalize_collection_root(root) or root  # normalize to root if subcatalog
+                        root = (
+                            _normalize_collection_root(root) or root
+                        )  # normalize to root if subcatalog
                         nodes.append((info["internal_name"], root))
 
                     # Edge case: only one catalog
                     if len(nodes) == 1:
                         final_collection_path = nodes[0][1]
-                        _resume_set(resume_log, "phase.crossmatch", "completed", log_cross)
-                        log_cross.info("Only one prepared collection; skipping crossmatch. final=%s", final_collection_path)
+                        _resume_set(
+                            resume_log, "phase.crossmatch", "completed", log_cross
+                        )
+                        log_cross.info(
+                            "Only one prepared collection; skipping crossmatch. final=%s",
+                            final_collection_path,
+                        )
                         start_consolidate = False
                     else:
                         # Futures pipeline
@@ -912,7 +1029,9 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                         carry: tuple[str, str] | None = None
 
                         # Use future.key (string) to avoid identity KeyError
-                        inflight_meta: dict[str, tuple] = {}  # fut.key -> (l_lab, l_path, r_lab, r_path, step_id)
+                        inflight_meta: dict[str, tuple] = (
+                            {}
+                        )  # fut.key -> (l_lab, l_path, r_lab, r_path, step_id)
                         step_id = 1  # diagnostic numbering only
 
                         # as_completed instance where we add futures as we submit them
@@ -936,9 +1055,20 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                                 translation_config,
                                 pure=False,
                             )
-                            inflight_meta[fut.key] = (l_lab, l_path, r_lab, r_path, step_id)
+                            inflight_meta[fut.key] = (
+                                l_lab,
+                                l_path,
+                                r_lab,
+                                r_path,
+                                step_id,
+                            )
                             ac3.add(fut)  # add immediately to as_completed
-                            log_cross.info("Submitted crossmatch pair: step=%d | %s VS %s", step_id, l_lab, r_lab)
+                            log_cross.info(
+                                "Submitted crossmatch pair: step=%d | %s VS %s",
+                                step_id,
+                                l_lab,
+                                r_lab,
+                            )
                             step_id += 1
                             return True
 
@@ -956,8 +1086,9 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                                 if meta is None:
                                     # Received a completion for an unknown/detached future; log and continue.
                                     _log_remote_future_exception(
-                                        log_cross, fut,
-                                        "Received completion for an unknown Future"
+                                        log_cross,
+                                        fut,
+                                        "Received completion for an unknown Future",
                                     )
                                     continue
 
@@ -966,21 +1097,34 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                                     raw_out = fut.result()
                                 except Exception:
                                     _log_remote_future_exception(
-                                        log_cross, fut,
-                                        f"Crossmatch failed (step {sid}: {l_lab} vs {r_lab})"
+                                        log_cross,
+                                        fut,
+                                        f"Crossmatch failed (step {sid}: {l_lab} vs {r_lab})",
                                     )
                                     raise
 
-                                out_root = _normalize_collection_root(raw_out) or raw_out
+                                out_root = (
+                                    _normalize_collection_root(raw_out) or raw_out
+                                )
                                 if not _is_hats_collection(out_root):
-                                    log_cross.warning("crossmatch returned a non-HATS path (step %d): %s", sid, raw_out)
+                                    log_cross.warning(
+                                        "crossmatch returned a non-HATS path (step %d): %s",
+                                        sid,
+                                        raw_out,
+                                    )
 
                                 # Delicate cleanup — delete only the two inputs consumed by this merge
                                 if delete_temp_files:
                                     try:
-                                        _cleanup_inputs_of_merge(l_path, r_path, log_cross)
+                                        _cleanup_inputs_of_merge(
+                                            l_path, r_path, log_cross
+                                        )
                                     except Exception as e:
-                                        log_cross.warning("Cleanup of inputs for step %d failed (non-fatal): %s", sid, e)
+                                        log_cross.warning(
+                                            "Cleanup of inputs for step %d failed (non-fatal): %s",
+                                            sid,
+                                            e,
+                                        )
 
                                 # Winner goes back into the queue
                                 ready.append((f"merged_step{sid}", out_root))
@@ -998,7 +1142,11 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                                     pass
 
                             # If odd and nothing inflight, stash one as carry
-                            if not inflight_meta and len(ready) > 1 and (len(ready) % 2 == 1):
+                            if (
+                                not inflight_meta
+                                and len(ready) > 1
+                                and (len(ready) % 2 == 1)
+                            ):
                                 carry = ready.pop()
 
                         # Finalization
@@ -1008,17 +1156,29 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                             elif carry:
                                 final_collection_path = carry[1]
 
-                        final_collection_path = _normalize_collection_root(final_collection_path) or final_collection_path
+                        final_collection_path = (
+                            _normalize_collection_root(final_collection_path)
+                            or final_collection_path
+                        )
                         if not _is_collection_root(final_collection_path):
-                            raise RuntimeError(f"Final path is not a HATS collection root: {final_collection_path}")
+                            raise RuntimeError(
+                                f"Final path is not a HATS collection root: {final_collection_path}"
+                            )
 
-                        _resume_set(resume_log, "phase.crossmatch", "completed", log_cross)
-                        log_cross.info("END crossmatch: parallel tournament done; final root: %s", final_collection_path)
+                        _resume_set(
+                            resume_log, "phase.crossmatch", "completed", log_cross
+                        )
+                        log_cross.info(
+                            "END crossmatch: parallel tournament done; final root: %s",
+                            final_collection_path,
+                        )
                         start_consolidate = False
 
                 except Exception:
                     # Catch ANY driver-side error in the tournament
-                    log_cross.exception("Crossmatch tournament FAILED with an unhandled error")
+                    log_cross.exception(
+                        "Crossmatch tournament FAILED with an unhandled error"
+                    )
                     try:
                         _resume_set(resume_log, "phase.crossmatch", "failed", log_cross)
                     except Exception:
@@ -1026,11 +1186,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     raise
 
         else:
-            base_logger.error("Unknown combine_mode: %s", combine_mode, extra={"phase": "crossmatch"})
+            base_logger.error(
+                "Unknown combine_mode: %s", combine_mode, extra={"phase": "crossmatch"}
+            )
             client.close()
             cluster.close()
             return
-
 
         # -----------------------------------------------------------
         # 4) DEDUPLICATION
@@ -1039,42 +1200,67 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
         # In "concatenate" mode there is no LSDB collection root; skip dedup entirely.
         if combine_mode == "concatenate":
-            log_dedup.info("Skip deduplication: combine_mode='concatenate' (no LSDB collection root).")
+            log_dedup.info(
+                "Skip deduplication: combine_mode='concatenate' (no LSDB collection root)."
+            )
             # Next phase runs below:
             start_consolidate = True
 
         else:
-            log_dedup.info("START deduplication: LSDB graph labeling and tie consolidation")
+            log_dedup.info(
+                "START deduplication: LSDB graph labeling and tie consolidation"
+            )
 
             # Ensure final collection root for dedup
             if not final_collection_path:
-                resumed = _resume_get(resume_log, f"crossmatch_step{final_step}.collection_path")
+                resumed = _resume_get(
+                    resume_log, f"crossmatch_step{final_step}.collection_path"
+                )
                 resumed = _normalize_collection_root(resumed)
                 if resumed and _is_collection_root(resumed):
                     final_collection_path = resumed
-                    log_dedup.info("Recovered final collection root from resume: %s", final_collection_path)
+                    log_dedup.info(
+                        "Recovered final collection root from resume: %s",
+                        final_collection_path,
+                    )
                 else:
                     guessed = _guess_collection_for_step(temp_dir, final_step)
                     if guessed:
                         final_collection_path = guessed
-                        log_dedup.info("Guessed final collection root from disk: %s", final_collection_path)
+                        log_dedup.info(
+                            "Guessed final collection root from disk: %s",
+                            final_collection_path,
+                        )
 
-            use_distributed = final_collection_path is not None and _is_collection_root(final_collection_path)
+            use_distributed = final_collection_path is not None and _is_collection_root(
+                final_collection_path
+            )
 
             # --- Safe config parsing ---
             tiebreaking_priority_cfg = translation_config.get("tiebreaking_priority")
             if isinstance(tiebreaking_priority_cfg, (str, bytes)):
                 tiebreaking_priority_cfg = [str(tiebreaking_priority_cfg)]
-            if not isinstance(tiebreaking_priority_cfg, (list, tuple)) or not tiebreaking_priority_cfg:
-                raise TypeError("tiebreaking_priority must be a non-empty list of column names.")
+            if (
+                not isinstance(tiebreaking_priority_cfg, (list, tuple))
+                or not tiebreaking_priority_cfg
+            ):
+                raise TypeError(
+                    "tiebreaking_priority must be a non-empty list of column names."
+                )
 
-            instrument_type_priority_cfg = translation_config.get("instrument_type_priority")
-            if "instrument_type_homogenized" in set(tiebreaking_priority_cfg) and not isinstance(instrument_type_priority_cfg, dict):
+            instrument_type_priority_cfg = translation_config.get(
+                "instrument_type_priority"
+            )
+            if "instrument_type_homogenized" in set(
+                tiebreaking_priority_cfg
+            ) and not isinstance(instrument_type_priority_cfg, dict):
                 raise TypeError(
                     "instrument_type_priority must be a mapping when "
                     "'instrument_type_homogenized' is present in tiebreaking_priority."
                 )
-            delta_z_threshold_cfg = float(translation_config.get("delta_z_threshold", 0.0))
+            delta_z_threshold_cfg = float(
+                translation_config.get("delta_z_threshold", 0.0)
+            )
 
             #######################################################################
             # Diagnostics / outputs
@@ -1085,26 +1271,38 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             #######################################################################
 
             if use_distributed:
-                log_dedup.info("Running graph-based dedup on final merged collection (Dask merge with catalog ._ddf)")
-                final_collection_path = _normalize_collection_root(final_collection_path)
+                log_dedup.info(
+                    "Running graph-based dedup on final merged collection (Dask merge with catalog ._ddf)"
+                )
+                final_collection_path = _normalize_collection_root(
+                    final_collection_path
+                )
                 log_dedup.info("final_collection_root: %s", final_collection_path)
 
                 if not _is_collection_root(final_collection_path):
-                    raise RuntimeError(f"Expected collection root at: {final_collection_path}")
+                    raise RuntimeError(
+                        f"Expected collection root at: {final_collection_path}"
+                    )
 
                 # Open the LSDB collection directly (no subcatalog hunting, no margins here)
                 try:
                     final_cat = lsdb.open_catalog(final_collection_path)
                     log_dedup.info("Opened LSDB collection at root path.")
                 except Exception as e:
-                    raise RuntimeError(f"Could not open LSDB collection at: {final_collection_path}") from e
+                    raise RuntimeError(
+                        f"Could not open LSDB collection at: {final_collection_path}"
+                    ) from e
 
                 # Build labels lazily over the catalog
                 try:
                     labels_dd = run_dedup_with_lsdb_map_partitions(
                         final_cat,
                         tiebreaking_priority=tiebreaking_priority_cfg,
-                        instrument_type_priority=(instrument_type_priority_cfg if isinstance(instrument_type_priority_cfg, dict) else None),
+                        instrument_type_priority=(
+                            instrument_type_priority_cfg
+                            if isinstance(instrument_type_priority_cfg, dict)
+                            else None
+                        ),
                         delta_z_threshold=delta_z_threshold_cfg,
                         crd_col="CRD_ID",
                         compared_col="compared_to",
@@ -1113,10 +1311,17 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                         edge_log=edge_log,
                         group_col=group_col,
                     )
-                    log_dedup.info("Labels graph built (lazy). Preparing RHS for Dask merge...")
+                    log_dedup.info(
+                        "Labels graph built (lazy). Preparing RHS for Dask merge..."
+                    )
                 except Exception as e:
                     import traceback as _tb
-                    log_dedup.error("FAILED while building labels graph: %s\n%s", repr(e), _tb.format_exc())
+
+                    log_dedup.error(
+                        "FAILED while building labels graph: %s\n%s",
+                        repr(e),
+                        _tb.format_exc(),
+                    )
                     raise
 
                 # Prepare RHS minimal schema (Dask DataFrame)
@@ -1129,7 +1334,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     log_dedup.info("Prepared RHS columns: %s", keep_cols)
                 except Exception as e:
                     import traceback as _tb
-                    log_dedup.error("FAILED while preparing RHS labels: %s\n%s", repr(e), _tb.format_exc())
+
+                    log_dedup.error(
+                        "FAILED while preparing RHS labels: %s\n%s",
+                        repr(e),
+                        _tb.format_exc(),
+                    )
                     raise
 
                 # Base Dask DataFrame from the LSDB collection
@@ -1137,15 +1347,24 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     df_all = final_cat._ddf
                     # Align join key dtype defensively
                     try:
-                        df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]"))
-                        rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string[pyarrow]"))
+                        df_all = df_all.assign(
+                            CRD_ID=df_all["CRD_ID"].astype("string[pyarrow]")
+                        )
+                        rhs_dd = rhs_dd.assign(
+                            CRD_ID=rhs_dd["CRD_ID"].astype("string[pyarrow]")
+                        )
                     except Exception:
                         df_all = df_all.assign(CRD_ID=df_all["CRD_ID"].astype("string"))
                         rhs_dd = rhs_dd.assign(CRD_ID=rhs_dd["CRD_ID"].astype("string"))
                     log_dedup.info("Aligned CRD_ID dtype on both sides.")
                 except Exception as e:
                     import traceback as _tb
-                    log_dedup.error("FAILED while preparing base from catalog: %s\n%s", repr(e), _tb.format_exc())
+
+                    log_dedup.error(
+                        "FAILED while preparing base from catalog: %s\n%s",
+                        repr(e),
+                        _tb.format_exc(),
+                    )
                     raise
 
                 # Clear divisions and perform the distributed merge
@@ -1163,13 +1382,18 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     log_dedup.info("Dask merge graph built (lazy).")
                 except Exception as e:
                     import traceback as _tb
-                    log_dedup.error("FAILED during Dask merge: %s\n%s", repr(e), _tb.format_exc())
+
+                    log_dedup.error(
+                        "FAILED during Dask merge: %s\n%s", repr(e), _tb.format_exc()
+                    )
                     raise
 
                 # Coalesce tie_result in Dask (still lazy)
                 try:
                     if "tie_result" in merged.columns:
-                        merged["tie_result"] = merged["tie_result_new"].fillna(merged["tie_result"])
+                        merged["tie_result"] = merged["tie_result_new"].fillna(
+                            merged["tie_result"]
+                        )
                     else:
                         merged = merged.assign(tie_result=merged["tie_result_new"])
                     if "tie_result_new" in merged.columns:
@@ -1177,7 +1401,12 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     log_dedup.info("Coalesced tie_result (lazy).")
                 except Exception as e:
                     import traceback as _tb
-                    log_dedup.error("FAILED while coalescing tie_result: %s\n%s", repr(e), _tb.format_exc())
+
+                    log_dedup.error(
+                        "FAILED while coalescing tie_result: %s\n%s",
+                        repr(e),
+                        _tb.format_exc(),
+                    )
                     raise
 
                 # Final materialization: compute only once, at the very end
@@ -1189,42 +1418,63 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     if "group_id" in df_final.columns:
                         dup = df_final["group_id"].value_counts(dropna=True)
                         n_big = int((dup > 1).sum())
-                        log_dedup.info("Sanity group_id: uniques=%d, ids_with_>1_occurrences=%d", int(dup.size), n_big)
+                        log_dedup.info(
+                            "Sanity group_id: uniques=%d, ids_with_>1_occurrences=%d",
+                            int(dup.size),
+                            n_big,
+                        )
                     else:
-                        log_dedup.info("No group_id column present after dedup; skipping sanity counts.")
+                        log_dedup.info(
+                            "No group_id column present after dedup; skipping sanity counts."
+                        )
 
                     current_workers = len(client.scheduler_info().get("workers", {}))
                     log_dedup.info("WORKERS STILL RUNNING=%d.", current_workers)
-                    log_dedup.info("END deduplication: labels merged back into final dataframe (Dask)")
+                    log_dedup.info(
+                        "END deduplication: labels merged back into final dataframe (Dask)"
+                    )
                 except Exception as e:
                     import traceback as _tb
-                    log_dedup.error("FAILED while computing final dataframe: %s\n%s", repr(e), _tb.format_exc())
+
+                    log_dedup.error(
+                        "FAILED while computing final dataframe: %s\n%s",
+                        repr(e),
+                        _tb.format_exc(),
+                    )
                     raise
 
             else:
                 # We require a valid LSDB collection root; Parquet fallback is no longer supported.
-                raise RuntimeError("Cannot run dedup: missing or invalid LSDB collection root; Parquet fallback removed.")
+                raise RuntimeError(
+                    "Cannot run dedup: missing or invalid LSDB collection root; Parquet fallback removed."
+                )
 
             # Next phase runs below:
             start_consolidate = True
-
 
     # ---------------------------------------------------------------
     # 5) CONSOLIDATION / EXPORT
     # ---------------------------------------------------------------
     log_cons = _phase_logger(base_logger, "consolidation")
-    log_cons.info("START consolidation: staging artifacts into process dir (base_dir=%s)", base_dir)
+    log_cons.info(
+        "START consolidation: staging artifacts into process dir (base_dir=%s)",
+        base_dir,
+    )
 
     # Snapshot about df_final to aid debugging
     try:
         log_cons.info("df_final shape: %s", tuple(df_final.shape))
         try:
             mem_bytes = int(df_final.memory_usage(deep=True).sum())
-            log_cons.info("df_final memory footprint: %.2f MB", mem_bytes / (1024 * 1024))
+            log_cons.info(
+                "df_final memory footprint: %.2f MB", mem_bytes / (1024 * 1024)
+            )
         except Exception as e_mem:
             log_cons.debug("Could not compute memory footprint: %s", e_mem)
         try:
-            dtypes_preview = {str(k): str(v) for k, v in list(df_final.dtypes.items())[:20]}
+            dtypes_preview = {
+                str(k): str(v) for k, v in list(df_final.dtypes.items())[:20]
+            }
             log_cons.info("df_final dtypes (first 20): %s", dtypes_preview)
         except Exception as e_dt:
             log_cons.debug("Could not collect dtype preview: %s", e_dt)
@@ -1237,7 +1487,6 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     except Exception as e:
         log_cons.warning("Could not compute len(df_final): %s", e)
 
-
     if combine_mode == "concatenate" and "tie_result" in df_final.columns:
         log_cons.info("Dropping 'tie_result' (concatenate mode)")
         try:
@@ -1248,22 +1497,36 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
     if combine_mode == "concatenate_and_remove_duplicates":
         if "tie_result" not in df_final.columns:
-            log_cons.warning("Expected 'tie_result' column for removal mode, but it is missing; skipping row filter.")
+            log_cons.warning(
+                "Expected 'tie_result' column for removal mode, but it is missing; skipping row filter."
+            )
         else:
-            log_cons.info("Filtering winners by tie_result == 1 (remove-duplicates mode)")
+            log_cons.info(
+                "Filtering winners by tie_result == 1 (remove-duplicates mode)"
+            )
             try:
-                tie_num = pd.to_numeric(df_final["tie_result"], errors="coerce").fillna(0).astype("int8")
+                tie_num = (
+                    pd.to_numeric(df_final["tie_result"], errors="coerce")
+                    .fillna(0)
+                    .astype("int8")
+                )
                 keep_mask = tie_num.eq(1)
                 kept = int(keep_mask.sum())
                 dropped = int(len(df_final) - kept)
                 df_final = df_final.loc[keep_mask].copy()
-                log_cons.info("Removed duplicates by tie_result==1: kept=%d rows, dropped=%d rows.", kept, dropped)
+                log_cons.info(
+                    "Removed duplicates by tie_result==1: kept=%d rows, dropped=%d rows.",
+                    kept,
+                    dropped,
+                )
             except Exception as e:
                 log_cons.error("FAILED while filtering by tie_result==1: %s", e)
                 raise
 
     if USE_ARROW_TYPES:
-        log_cons.info("Converting dtypes with dtype_backend='pyarrow' (USE_ARROW_TYPES=True)")
+        log_cons.info(
+            "Converting dtypes with dtype_backend='pyarrow' (USE_ARROW_TYPES=True)"
+        )
         try:
             df_final = df_final.convert_dtypes(dtype_backend="pyarrow")
             for c in df_final.columns:
@@ -1271,9 +1534,13 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                     if pd.api.types.is_string_dtype(df_final[c].dtype):
                         df_final[c] = df_final[c].astype(DTYPE_STR)
                 except Exception as e_cast:
-                    log_cons.debug("Could not cast column '%s' to Arrow string: %s", c, e_cast)
+                    log_cons.debug(
+                        "Could not cast column '%s' to Arrow string: %s", c, e_cast
+                    )
         except Exception as e:
-            log_cons.error("FAILED during convert_dtypes(dtype_backend='pyarrow'): %s", e)
+            log_cons.error(
+                "FAILED during convert_dtypes(dtype_backend='pyarrow'): %s", e
+            )
             raise
 
     # Drop all-empty columns
@@ -1283,15 +1550,24 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
             dt = df_final[col].dtype
             try:
                 if str(dt) == "string[pyarrow]" or str(dt) == "object":
-                    all_missing = df_final[col].apply(lambda x: (pd.isna(x) or str(x).strip() == ""))
+                    all_missing = df_final[col].apply(
+                        lambda x: (pd.isna(x) or str(x).strip() == "")
+                    )
                 else:
                     all_missing = df_final[col].isna()
                 if bool(all_missing.all()):
                     to_drop.append(col)
             except Exception as e_col:
-                log_cons.debug("Skip emptiness check for column '%s' (dtype=%s): %s", col, dt, e_col)
+                log_cons.debug(
+                    "Skip emptiness check for column '%s' (dtype=%s): %s",
+                    col,
+                    dt,
+                    e_col,
+                )
         if to_drop:
-            log_cons.info("Dropping all-missing columns: %s", ", ".join(sorted(map(str, to_drop))))
+            log_cons.info(
+                "Dropping all-missing columns: %s", ", ".join(sorted(map(str, to_drop)))
+            )
             df_final = df_final.drop(columns=to_drop)
         else:
             log_cons.info("No all-missing columns to drop.")
@@ -1301,7 +1577,11 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
 
     # Stage final output with your save_dataframe
     staged_output_base = os.path.join(base_dir, output_name)
-    log_cons.info("About to call save_dataframe(base=%s, format=%s)", staged_output_base, output_format)
+    log_cons.info(
+        "About to call save_dataframe(base=%s, format=%s)",
+        staged_output_base,
+        output_format,
+    )
     try:
         try:
             log_cons.debug("df_final head(3):\n%s", df_final.head(3))
@@ -1312,6 +1592,7 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         log_cons.info("Staged final output at %s.%s", staged_output_base, output_format)
     except Exception as e:
         import traceback as _tb
+
         log_cons.error("FAILED in save_dataframe: %s\n%s", repr(e), _tb.format_exc())
         raise
 
@@ -1362,21 +1643,31 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
                 }
             ],
         )
-        update_process_info(process_info, process_info_path, "end_time", str(pd.Timestamp.now()))
+        update_process_info(
+            process_info, process_info_path, "end_time", str(pd.Timestamp.now())
+        )
         update_process_info(process_info, process_info_path, "status", "Successful")
         log_cons.info("Process info updated with output: %s", relative_path)
     except Exception as e:
         import traceback as _tb
+
         log_cons.error("FAILED to update process_info: %s\n%s", e, _tb.format_exc())
         raise
 
     # ----------------- PUBLISH STEP -----------------
     publish_logger = _phase_logger(base_logger, "register")
-    publish_logger.info("START publish: copying staged artifacts from process dir to out_root_and_dir (%s)", out_root_and_dir)
+    publish_logger.info(
+        "START publish: copying staged artifacts from process dir to out_root_and_dir (%s)",
+        out_root_and_dir,
+    )
 
     try:
-        _snapshot_shell_logs(str(launch_dir), launch_snap_dir, publish_logger, max_size_mb=100)
-        publish_logger.info("Snapshotted shell logs from %s into %s", launch_dir, launch_snap_dir)
+        _snapshot_shell_logs(
+            str(launch_dir), launch_snap_dir, publish_logger, max_size_mb=100
+        )
+        publish_logger.info(
+            "Snapshotted shell logs from %s into %s", launch_dir, launch_snap_dir
+        )
     except Exception as e:
         publish_logger.warning("Snapshot of shell logs failed: %s", e)
 
@@ -1385,21 +1676,35 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
         os.makedirs(out_root_and_dir, exist_ok=True)
         publish_logger.info("Ensured publish dir exists: %s", out_root_and_dir)
     except Exception as e:
-        publish_logger.error("FAILED to create publish dir '%s': %s", out_root_and_dir, e)
+        publish_logger.error(
+            "FAILED to create publish dir '%s': %s", out_root_and_dir, e
+        )
         raise
 
     # 1) process_info/
     try:
-        _copy_tree(os.path.join(base_dir, "process_info"), os.path.join(out_root_and_dir, "process_info"), publish_logger)
+        _copy_tree(
+            os.path.join(base_dir, "process_info"),
+            os.path.join(out_root_and_dir, "process_info"),
+            publish_logger,
+        )
     except Exception as e:
         publish_logger.error("FAILED to copy process_info/: %s", e)
         raise
 
     # 2) process.yml and process.yaml
     try:
-        _copy_file(os.path.join(base_dir, "process.yml"),  os.path.join(out_root_and_dir, "process.yml"),  publish_logger)
+        _copy_file(
+            os.path.join(base_dir, "process.yml"),
+            os.path.join(out_root_and_dir, "process.yml"),
+            publish_logger,
+        )
         if os.path.exists(os.path.join(base_dir, "process.yaml")):
-            _copy_file(os.path.join(base_dir, "process.yaml"), os.path.join(out_root_and_dir, "process.yaml"), publish_logger)
+            _copy_file(
+                os.path.join(base_dir, "process.yaml"),
+                os.path.join(out_root_and_dir, "process.yaml"),
+                publish_logger,
+            )
     except Exception as e:
         publish_logger.error("FAILED to copy process.yml/.yaml: %s", e)
         raise
@@ -1407,7 +1712,11 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     # 3) config.yaml
     try:
         if os.path.exists(os.path.join(base_dir, "config.yaml")):
-            _copy_file(os.path.join(base_dir, "config.yaml"), os.path.join(out_root_and_dir, "config.yaml"), publish_logger)
+            _copy_file(
+                os.path.join(base_dir, "config.yaml"),
+                os.path.join(out_root_and_dir, "config.yaml"),
+                publish_logger,
+            )
     except Exception as e:
         publish_logger.error("FAILED to copy config.yaml: %s", e)
         raise
@@ -1427,7 +1736,10 @@ def main(config_path: str, cwd: str = ".", base_dir_override: str | None = None)
     if delete_temp_files:
         try:
             shutil.rmtree(temp_dir)
-            log_cons.info("Deleted entire temp_dir after successful pipeline completion: %s", temp_dir)
+            log_cons.info(
+                "Deleted entire temp_dir after successful pipeline completion: %s",
+                temp_dir,
+            )
         except Exception as e:
             log_cons.warning("Could not delete temp_dir %s: %s", temp_dir, e)
 
@@ -1449,6 +1761,7 @@ def _pick_next_process_dir(root: str) -> str:
             return path
         i += 1
 
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1457,11 +1770,13 @@ if __name__ == "__main__":
         description="Combine redshift catalogs via preparation, crossmatch (no tie-breaking), and graph-based deduplication."
     )
     parser.add_argument("config_path", help="Path to YAML config file.")
-    parser.add_argument("--cwd", default=os.getcwd(), help="Working directory (default: current dir).")
+    parser.add_argument(
+        "--cwd", default=os.getcwd(), help="Working directory (default: current dir)."
+    )
     parser.add_argument(
         "--base_dir",
         default=None,
-        help="Base directory for outputs and logs. If omitted, picks processNNN under --cwd."
+        help="Base directory for outputs and logs. If omitted, picks processNNN under --cwd.",
     )
     args = parser.parse_args()
 

@@ -1,5 +1,6 @@
 # deduplication.py
 from __future__ import annotations
+
 """Deduplication for Combine Redshift Catalogs (CRC).
 
 Builds a graph from ``CRD_ID <-> compared_to`` and resolves duplicates with
@@ -28,7 +29,7 @@ import numpy as np
 import pandas as pd
 import dask.dataframe as dd
 
-from combine_redshift_dedup.packages.utils import get_phase_logger, log_phase
+from utils import get_phase_logger, log_phase
 
 # ==============================
 # Logger (child of 'crc')
@@ -56,6 +57,7 @@ __all__ = [
     "deduplicate_pandas",
     "run_dedup_with_lsdb_map_partitions",
 ]
+
 
 # ==============================
 # Small helpers: string/parse/score
@@ -85,7 +87,9 @@ def _parse_compared_to_cell(val) -> List[str]:
     return [t for t in (tok.strip() for tok in s.split(",")) if t]
 
 
-def _score_instrument_type(series: pd.Series, priority_map: Mapping[str, int]) -> pd.Series:
+def _score_instrument_type(
+    series: pd.Series, priority_map: Mapping[str, int]
+) -> pd.Series:
     """Score instrument types using a priority map."""
     norm_map = {str(k).strip().lower(): int(v) for k, v in priority_map.items()}
 
@@ -149,7 +153,9 @@ def _build_edges_fast(
         star_ids = set(
             _canon_id_series(
                 df.loc[pd.to_numeric(zf_series, errors="coerce").eq(6), crd_col]
-            ).dropna().unique()
+            )
+            .dropna()
+            .unique()
         )
     else:
         star_ids = None  # skip expensive star-neighbor counting
@@ -192,23 +198,28 @@ def _build_edges_fast(
         return pd.Index([], dtype="object"), np.empty((0, 2), dtype=np.int32), diag
 
     # unique undirected edges (u < v)
-    nodes_edge = pd.Index(pd.unique(pd.concat([edges_raw["u"], edges_raw["v"]], ignore_index=True)))
+    nodes_edge = pd.Index(
+        pd.unique(pd.concat([edges_raw["u"], edges_raw["v"]], ignore_index=True))
+    )
 
     # --- EXTRA LOG (edge_log): sanity-check that no star IDs leaked into edge nodes
     if edge_log and (zf_series is not None) and len(nodes_edge):
         star_ids_fast = set(
             _canon_id_series(
                 df.loc[pd.to_numeric(zf_series, errors="coerce").eq(6), crd_col]
-            ).dropna().unique()
+            )
+            .dropna()
+            .unique()
         )
         leaked = [cid for cid in nodes_edge.astype("string") if cid in star_ids_fast]
         if leaked:
             _phase_logger().error(
                 "Star IDs leaked into fast-path edge nodes (logic violation): "
                 "count=%d sample=%s",
-                len(leaked), leaked[:5],
+                len(leaked),
+                leaked[:5],
             )
-            
+
     id2ix = {cid: i for i, cid in enumerate(nodes_edge)}
     u = edges_raw["u"].map(id2ix).to_numpy(dtype=np.int32, copy=False)
     v = edges_raw["v"].map(id2ix).to_numpy(dtype=np.int32, copy=False)
@@ -264,8 +275,9 @@ def _connected_components_scipy(n_nodes: int, edges_uv: np.ndarray) -> np.ndarra
 def _build_edges_pdf(df: pd.DataFrame, crd_col: str, compared_col: str) -> pd.DataFrame:
     """Build undirected edges (u, v) from `compared_to` (fallback)."""
     if df.empty:
-        return pd.DataFrame({"u": pd.Series([], dtype="string"),
-                             "v": pd.Series([], dtype="string")})
+        return pd.DataFrame(
+            {"u": pd.Series([], dtype="string"), "v": pd.Series([], dtype="string")}
+        )
 
     present_ids = set(df[crd_col].astype(str))
     a = df[crd_col].astype(str)
@@ -276,8 +288,9 @@ def _build_edges_pdf(df: pd.DataFrame, crd_col: str, compared_col: str) -> pd.Da
         .dropna(subset=["v"])
     )
     if edges.empty:
-        return pd.DataFrame({"u": pd.Series([], dtype="string"),
-                             "v": pd.Series([], dtype="string")})
+        return pd.DataFrame(
+            {"u": pd.Series([], dtype="string"), "v": pd.Series([], dtype="string")}
+        )
 
     edges["v"] = edges["v"].astype(str)
     edges = edges[edges["v"].isin(present_ids)]
@@ -287,14 +300,16 @@ def _build_edges_pdf(df: pd.DataFrame, crd_col: str, compared_col: str) -> pd.Da
     hi = np.maximum(u.values, v.values)
     mask = lo != hi
     if not mask.any():
-        return pd.DataFrame({"u": pd.Series([], dtype="string"),
-                             "v": pd.Series([], dtype="string")})
+        return pd.DataFrame(
+            {"u": pd.Series([], dtype="string"), "v": pd.Series([], dtype="string")}
+        )
 
-    out = (
-        pd.DataFrame({"u": pd.Series(lo[mask], dtype="string"),
-                      "v": pd.Series(hi[mask], dtype="string")})
-        .drop_duplicates(ignore_index=True)
-    )
+    out = pd.DataFrame(
+        {
+            "u": pd.Series(lo[mask], dtype="string"),
+            "v": pd.Series(hi[mask], dtype="string"),
+        }
+    ).drop_duplicates(ignore_index=True)
     return out
 
 
@@ -321,7 +336,9 @@ def _collapse_within_dz(
     pos_all = np.arange(n, dtype=np.int64)
     pos = pos_all[m]
 
-    gid_arr = pd.Index(gid).to_numpy() if isinstance(gid, pd.Series) else np.asarray(gid)
+    gid_arr = (
+        pd.Index(gid).to_numpy() if isinstance(gid, pd.Series) else np.asarray(gid)
+    )
     z_arr = pd.to_numeric(zvals, errors="coerce").to_numpy()
     crd_arr = crd_s.astype(str).to_numpy()
 
@@ -339,7 +356,7 @@ def _collapse_within_dz(
     new_gid = np.empty(k, dtype=bool)
     new_gid[0] = True
     if k > 1:
-        new_gid[1:] = (g_sorted[1:] != g_sorted[:-1])
+        new_gid[1:] = g_sorted[1:] != g_sorted[:-1]
 
     z_jump = np.empty(k, dtype=float)
     z_jump[0] = np.inf
@@ -349,10 +366,17 @@ def _collapse_within_dz(
     is_break = new_gid | (z_jump > thr)
     clus = np.cumsum(is_break)
 
-    sub = pd.DataFrame({"pos": pos_sorted, "gid": g_sorted, "clus": clus, "crd": crd_sorted})
+    sub = pd.DataFrame(
+        {"pos": pos_sorted, "gid": g_sorted, "clus": clus, "crd": crd_sorted}
+    )
     min_crd = sub.groupby(["gid", "clus"], sort=False)["crd"].transform("min")
-    keep_mask = (sub["crd"] == min_crd)
-    winners_pos = sub.loc[keep_mask].groupby(["gid", "clus"], sort=False).head(1)["pos"].to_numpy()
+    keep_mask = sub["crd"] == min_crd
+    winners_pos = (
+        sub.loc[keep_mask]
+        .groupby(["gid", "clus"], sort=False)
+        .head(1)["pos"]
+        .to_numpy()
+    )
 
     out_np = m.copy()
     out_np[pos_def] = False
@@ -466,13 +490,15 @@ def _apply_guard_restore_local(
     if zf_series is not None:
         is_star = pd.to_numeric(zf_series, errors="coerce").eq(6.0)
 
-    cmp_str   = df[compared_col].astype("string")
+    cmp_str = df[compared_col].astype("string")
     cmp_empty = cmp_str.isna() | cmp_str.str.strip().eq("")
 
     # conjunto local de IDs de estrelas nesta partição/view
     star_ids = set(df.loc[is_star, crd_col].astype("string"))
 
-    only_star_neighbors = (~cmp_empty) & _only_star_neighbors_series(df[compared_col], star_ids)
+    only_star_neighbors = (~cmp_empty) & _only_star_neighbors_series(
+        df[compared_col], star_ids
+    )
 
     # regra pedida:
     # - se objeto é estrela -> mantém tie=3 (não restaurar)
@@ -482,6 +508,7 @@ def _apply_guard_restore_local(
     # aplica restauração
     df.loc[restore_mask, tie_col] = df.loc[restore_mask, tie_col_orig]
     return df
+
 
 # ==============================
 # Per-group resolver
@@ -572,7 +599,7 @@ def deduplicate_pandas(
     edge_log: bool = False,
     partition_tag: str | None = None,
     logger: logging.LoggerAdapter | None = None,
-    group_col: str | None = None,   # <<< NOVO
+    group_col: str | None = None,  # <<< NOVO
 ) -> pd.DataFrame:
     """Graph-based deduplication with vectorized per-group resolution and Δz collapse."""
     required = {crd_col, compared_col, z_col}
@@ -653,48 +680,60 @@ def deduplicate_pandas(
         pos_na = np.flatnonzero(na_mask)
         cmp_str_all = out[compared_col].astype("string").str.strip()
         cmp_lists = cmp_str_all.iloc[pos_na].str.split(",")
-        sub = pd.DataFrame({"pos": pos_na, "nbr": cmp_lists}).explode("nbr", ignore_index=False)
+        sub = pd.DataFrame({"pos": pos_na, "nbr": cmp_lists}).explode(
+            "nbr", ignore_index=False
+        )
         sub["nbr"] = sub["nbr"].astype("string").str.strip()
         sub = sub[(sub["nbr"].notna()) & (sub["nbr"] != "")]
         if not sub.empty:
             sub["nbr_gid"] = sub["nbr"].map(s_map)
             sub = sub[sub["nbr_gid"].notna()]
             if not sub.empty:
-                bridged = sub.groupby("pos", sort=False)["nbr_gid"].min().astype("int64")
-                gids[bridged.index.to_numpy()] = bridged.to_numpy(dtype=np.int64, copy=False)
+                bridged = (
+                    sub.groupby("pos", sort=False)["nbr_gid"].min().astype("int64")
+                )
+                gids[bridged.index.to_numpy()] = bridged.to_numpy(
+                    dtype=np.int64, copy=False
+                )
                 na_mask[bridged.index.to_numpy()] = False
 
     # --- Fallback for rows still without group id (avoid mixing stars in graph) ---
     if na_mask.any():
         pos_na = np.flatnonzero(na_mask)
-    
+
         # estrelas dentro dos NA
         if zf_series is not None:
-            is_star_na = np.asarray(zf_series.iloc[pos_na].eq(6).fillna(False), dtype=bool)
+            is_star_na = np.asarray(
+                zf_series.iloc[pos_na].eq(6).fillna(False), dtype=bool
+            )
         else:
             is_star_na = np.zeros(pos_na.size, dtype=bool)
-    
+
         pos_na_nonstar = pos_na[~is_star_na]
-    
+
         # Próximo ID livre, compatível com rótulos do fast-path
         next_gid = int(labels_edge.max()) + 1 if labels_edge.size else 0
-    
+
         # ===== NA não-estrela =====
         if pos_na_nonstar.size:
             crd_arr_all = crd_norm.to_numpy()
             cmp_arr_all = out[compared_col].astype("string").str.strip().to_numpy()
-    
+
             crd_arr = crd_arr_all[pos_na_nonstar]
             cmp_arr = cmp_arr_all[pos_na_nonstar]
-    
+
             sub_df = pd.DataFrame({crd_col: crd_arr, compared_col: cmp_arr})
-            edges_na = _build_edges_pdf(sub_df, crd_col=crd_col, compared_col=compared_col)
+            edges_na = _build_edges_pdf(
+                sub_df, crd_col=crd_col, compared_col=compared_col
+            )
             nodes_na = list(pd.Index(sub_df[crd_col]).astype("string").unique())
-    
+
             if nodes_na:
                 if edges_na.empty:
                     # Sem arestas: cada linha vira singleton, sem colidir.
-                    gids[pos_na_nonstar] = np.arange(next_gid, next_gid + len(pos_na_nonstar), dtype=np.int64)
+                    gids[pos_na_nonstar] = np.arange(
+                        next_gid, next_gid + len(pos_na_nonstar), dtype=np.int64
+                    )
                     next_gid += len(pos_na_nonstar)
                 else:
                     # Com arestas: componentes de verdade
@@ -704,19 +743,23 @@ def deduplicate_pandas(
                         dtype=np.int64,
                         count=len(crd_arr),
                     )
-                    next_gid += (max(comp_map.values()) + 1 if comp_map else 0)
+                    next_gid += max(comp_map.values()) + 1 if comp_map else 0
             else:
                 # Sem nós: também singleton por linha
-                gids[pos_na_nonstar] = np.arange(next_gid, next_gid + len(pos_na_nonstar), dtype=np.int64)
+                gids[pos_na_nonstar] = np.arange(
+                    next_gid, next_gid + len(pos_na_nonstar), dtype=np.int64
+                )
                 next_gid += len(pos_na_nonstar)
-    
+
             # >>> IMPORTANTE: marque como mapeado para não colidir depois
             na_mask[pos_na_nonstar] = False
-    
+
         # ===== Estrelas (cada uma é singleton) =====
         if is_star_na.any():
             n_star = int(is_star_na.sum())
-            gids[pos_na[is_star_na]] = np.arange(next_gid, next_gid + n_star, dtype=np.int64)
+            gids[pos_na[is_star_na]] = np.arange(
+                next_gid, next_gid + n_star, dtype=np.int64
+            )
             na_mask[pos_na[is_star_na]] = False
             next_gid += n_star
 
@@ -739,12 +782,13 @@ def deduplicate_pandas(
     tr[is_star_np] = 3
     tr[is_singleton_np & ~is_star_np] = 1
 
-
     is_multi = ~is_singleton
     non_star = ~is_star
     survivors = (is_multi & non_star).copy()
 
-    zf_num = _to_numeric(out.get("z_flag_homogenized", pd.Series(np.nan, index=out.index))).astype("float64")
+    zf_num = _to_numeric(
+        out.get("z_flag_homogenized", pd.Series(np.nan, index=out.index))
+    ).astype("float64")
 
     if "instrument_type_homogenized" in priority_set:
         if instrument_type_priority is None:
@@ -752,7 +796,9 @@ def deduplicate_pandas(
                 "instrument_type_priority is required when "
                 "'instrument_type_homogenized' is used in tiebreaking_priority."
             )
-        it_scores = _score_instrument_type(out["instrument_type_homogenized"], instrument_type_priority).astype("float64")
+        it_scores = _score_instrument_type(
+            out["instrument_type_homogenized"], instrument_type_priority
+        ).astype("float64")
     else:
         it_scores = pd.Series(0.0, index=out.index, dtype="float64")
 
@@ -778,8 +824,8 @@ def deduplicate_pandas(
         survivors = _collapse_within_dz(survivors, gid, zvals, crd_s, thr)
 
     n_surv_final = survivors.groupby(gid).transform("sum")
-    one_winner = (survivors & n_surv_final.eq(1))
-    multi_winner = (survivors & n_surv_final.ge(2))
+    one_winner = survivors & n_surv_final.eq(1)
+    multi_winner = survivors & n_surv_final.ge(2)
 
     tr[one_winner.to_numpy(dtype=bool, na_value=False)] = 1
     tr[multi_winner.to_numpy(dtype=bool, na_value=False)] = 2
@@ -802,8 +848,13 @@ def deduplicate_pandas(
     z_num = _to_numeric(out[z_col]).astype("float64")
     f_num = zf_num.fillna(-np.inf)
     t_num = (
-        _score_instrument_type(out["instrument_type_homogenized"], instrument_type_priority).astype("float64")
-        if ("instrument_type_homogenized" in priority_set and instrument_type_priority is not None)
+        _score_instrument_type(
+            out["instrument_type_homogenized"], instrument_type_priority
+        ).astype("float64")
+        if (
+            "instrument_type_homogenized" in priority_set
+            and instrument_type_priority is not None
+        )
         else None
     )
     thr_local = float(delta_z_threshold or 0.0)
@@ -815,7 +866,7 @@ def deduplicate_pandas(
 
     if len(bad_gids) > 0:
         for gval in bad_gids:
-            mask = (gid.eq(gval) & pair_one)
+            mask = gid.eq(gval) & pair_one
             pos = np.flatnonzero(mask.to_numpy(dtype=bool, na_value=False))
             if pos.size != 2:
                 continue
@@ -823,35 +874,51 @@ def deduplicate_pandas(
 
             f1, f2 = float(f_num.iloc[p1]), float(f_num.iloc[p2])
             if f1 > f2:
-                out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array([1, 0], dtype=np.int8)
+                out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array(
+                    [1, 0], dtype=np.int8
+                )
                 continue
             if f2 > f1:
-                out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array([0, 1], dtype=np.int8)
+                out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array(
+                    [0, 1], dtype=np.int8
+                )
                 continue
 
             if t_num is not None:
                 t1, t2 = float(t_num.iloc[p1]), float(t_num.iloc[p2])
                 if t1 > t2:
-                    out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array([1, 0], dtype=np.int8)
+                    out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array(
+                        [1, 0], dtype=np.int8
+                    )
                     continue
                 if t2 > t1:
-                    out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array([0, 1], dtype=np.int8)
+                    out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array(
+                        [0, 1], dtype=np.int8
+                    )
                     continue
 
             z1, z2 = z_num.iloc[p1], z_num.iloc[p2]
             if thr_local <= 0.0 or pd.isna(z1) or pd.isna(z2):
-                out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array([2, 2], dtype=np.int8)
+                out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array(
+                    [2, 2], dtype=np.int8
+                )
                 continue
 
             dz = abs(float(z1) - float(z2))
             if dz > thr_local:
-                out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array([2, 2], dtype=np.int8)
+                out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array(
+                    [2, 2], dtype=np.int8
+                )
             else:
                 c1, c2 = str(crd_s.iloc[p1]), str(crd_s.iloc[p2])
                 if c1 <= c2:
-                    out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array([1, 0], dtype=np.int8)
+                    out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array(
+                        [1, 0], dtype=np.int8
+                    )
                 else:
-                    out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array([0, 1], dtype=np.int8)
+                    out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array(
+                        [0, 1], dtype=np.int8
+                    )
 
     pair_zero = out[tie_col].eq(0) & is_pair
     both_zero = pair_zero.groupby(gid).transform("sum").eq(2)
@@ -859,7 +926,7 @@ def deduplicate_pandas(
 
     if len(bad_gids0) > 0:
         for gval in bad_gids0:
-            mask = (gid.eq(gval) & pair_zero)
+            mask = gid.eq(gval) & pair_zero
             pos = np.flatnonzero(mask.to_numpy(dtype=bool, na_value=False))
             if pos.size != 2:
                 continue
@@ -898,9 +965,13 @@ def deduplicate_pandas(
                         out.iloc[p1, out.columns.get_loc(tie_col)] = np.int8(0)
                         out.iloc[p2, out.columns.get_loc(tie_col)] = np.int8(1)
                 else:
-                    out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array([2, 2], dtype=np.int8)
+                    out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array(
+                        [2, 2], dtype=np.int8
+                    )
             else:
-                out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array([2, 2], dtype=np.int8)
+                out.iloc[[p1, p2], out.columns.get_loc(tie_col)] = np.array(
+                    [2, 2], dtype=np.int8
+                )
 
     out = _apply_guard_restore_local(
         out,
@@ -914,34 +985,39 @@ def deduplicate_pandas(
     drop_cols = []
     if tie_col_orig in out.columns:
         drop_cols.append(tie_col_orig)
-    
+
     if group_col:
         out[group_col] = pd.Series(out["__group__"], index=out.index).astype("Int64")
     else:
         drop_cols.append("__group__")
-    
+
     out.drop(columns=drop_cols, inplace=True, errors="ignore")
-    
+
     # >>> PATCH: namespace por partição
     if group_col and partition_tag:
         try:
             import zlib
-            base = np.int64(zlib.crc32(str(partition_tag).encode("utf-8"))) << np.int64(32)
+
+            base = np.int64(zlib.crc32(str(partition_tag).encode("utf-8"))) << np.int64(
+                32
+            )
             m = out[group_col].notna()
-            out.loc[m, group_col] = (base + out.loc[m, group_col].astype("int64")).astype("Int64")
+            out.loc[m, group_col] = (
+                base + out.loc[m, group_col].astype("int64")
+            ).astype("Int64")
         except Exception:
             pass
-    
+
     if zf_series is not None:
         out.loc[zf_series.eq(6).fillna(False), tie_col] = np.int8(3)
-    
-    return out
 
+    return out
 
 
 # ==============================
 # LSDB per-partition dedup (with or without margin)
 # ==============================
+
 
 def _ensure_string_pyarrow(s: pd.Series) -> pd.Series:
     """Cast to Arrow-backed string if available, else pandas string."""
@@ -1188,6 +1264,7 @@ def _columns_set(ddf) -> set:
     """Return the set of column names from a Dask DataFrame's _meta (cheap)."""
     return set(map(str, getattr(getattr(ddf, "_meta", None), "columns", [])))
 
+
 def _assert_required(ddf, required: set[str], where: str):
     """Raise KeyError if required columns are missing from ddf."""
     have = _columns_set(ddf)
@@ -1195,12 +1272,14 @@ def _assert_required(ddf, required: set[str], where: str):
     if missing:
         raise KeyError(f"Missing required columns in {where}: {missing}")
 
+
 def _assert_priorities(ddf, priorities: list[str], where: str):
     """Raise KeyError if any tiebreaking_priority column is missing from ddf."""
     have = _columns_set(ddf)
     missing = sorted([c for c in priorities if c not in have])
     if missing:
         raise KeyError(f"Missing priority columns in {where}: {missing}")
+
 
 def run_dedup_with_lsdb_map_partitions(
     cat,
@@ -1213,35 +1292,46 @@ def run_dedup_with_lsdb_map_partitions(
     z_col: str = "z",
     tie_col: str = "tie_result",
     edge_log: bool = False,
-    group_col: str | None = None,   # <<< NOVO
+    group_col: str | None = None,  # <<< NOVO
 ) -> dd.DataFrame:
     """Compute dedup labels per partition via LSDB; align divisions if margin exists."""
     logger = _phase_logger()
-    with log_phase("deduplication", "run_dedup_with_lsdb_map_partitions", _base_logger()) as log:
+    with log_phase(
+        "deduplication", "run_dedup_with_lsdb_map_partitions", _base_logger()
+    ) as log:
         # --- Early validations ---
         if not hasattr(cat, "_ddf"):
             raise AttributeError("Catalog does not expose _ddf.")
-        if not isinstance(tiebreaking_priority, (list, tuple)) or len(tiebreaking_priority) == 0:
+        if (
+            not isinstance(tiebreaking_priority, (list, tuple))
+            or len(tiebreaking_priority) == 0
+        ):
             raise TypeError("tiebreaking_priority must be a non-empty sequence.")
         if float(delta_z_threshold) < 0.0:
             raise ValueError("delta_z_threshold must be non-negative.")
 
         main_ddf = cat._ddf
         has_margin = bool(getattr(cat, "margin", None) and hasattr(cat.margin, "_ddf"))
-        log.info("Inputs: has_margin=%s, npartitions(main)=%s", has_margin, main_ddf.npartitions)
+        log.info(
+            "Inputs: has_margin=%s, npartitions(main)=%s",
+            has_margin,
+            main_ddf.npartitions,
+        )
 
         # Strict schema checks: required base + all tiebreaking priority columns
         required_base = {crd_col, compared_col, z_col}
         _assert_required(main_ddf, required_base, "main")
         _assert_priorities(main_ddf, list(tiebreaking_priority), "main")
-        
+
         if has_margin:
             margin_ddf = cat.margin._ddf
             _assert_required(margin_ddf, required_base, "margin")
             _assert_priorities(margin_ddf, list(tiebreaking_priority), "margin")
-        
+
         # Enforce instrument_type mapping only if requested in priorities
-        if ("instrument_type_homogenized" in set(tiebreaking_priority)) and (instrument_type_priority is None):
+        if ("instrument_type_homogenized" in set(tiebreaking_priority)) and (
+            instrument_type_priority is None
+        ):
             raise ValueError(
                 "instrument_type_priority is required when "
                 "'instrument_type_homogenized' is used in tiebreaking_priority."
@@ -1269,7 +1359,7 @@ def run_dedup_with_lsdb_map_partitions(
                 z_col=z_col,
                 tie_col=tie_col,
                 edge_log=edge_log,
-                group_col=group_col
+                group_col=group_col,
             )
         else:
             margin_ddf = cat.margin._ddf
@@ -1284,14 +1374,18 @@ def run_dedup_with_lsdb_map_partitions(
             # Margin must also have known divisions; if not, set a sorted index equal to main's index.
             idx_name = main_ddf._meta.index.name
             if idx_name is None:
-                raise RuntimeError("Main catalog index name is None; cannot align divisions.")
+                raise RuntimeError(
+                    "Main catalog index name is None; cannot align divisions."
+                )
             if getattr(margin_ddf, "divisions", None) is None:
                 with log_phase("deduplication", "margin_set_index", _base_logger()):
                     margin_ddf = margin_ddf.set_index(idx_name, sorted=True, drop=False)
 
             marg_div = margin_ddf.divisions
             if marg_div is None:
-                raise RuntimeError("Margin still has unknown divisions after set_index.")
+                raise RuntimeError(
+                    "Margin still has unknown divisions after set_index."
+                )
 
             # Make division dtypes compatible if needed.
             t_main = type(main_div[0]) if len(main_div) else None
@@ -1299,6 +1393,7 @@ def run_dedup_with_lsdb_map_partitions(
             if t_main is not None and t_marg is not None and t_main != t_marg:
                 try:
                     import numpy as _np
+
                     main_div = tuple(_np.asarray(main_div, dtype=object).tolist())
                     marg_div = tuple(_np.asarray(marg_div, dtype=object).tolist())
                 except Exception as e:
@@ -1310,16 +1405,25 @@ def run_dedup_with_lsdb_map_partitions(
             try:
                 merged_divisions = tuple(sorted(set(main_div + marg_div)))
                 if len(merged_divisions) < 2:
-                    raise RuntimeError("Merged divisions must have at least two boundaries.")
+                    raise RuntimeError(
+                        "Merged divisions must have at least two boundaries."
+                    )
             except Exception as e:
                 raise RuntimeError(f"Could not build merged divisions: {e}") from e
 
             # Repartition both sides to the merged divisions.
             from dask import config as _dask_config
-            with log_phase("deduplication", "repartition_to_merged_divisions", _base_logger()) as l2:
+
+            with log_phase(
+                "deduplication", "repartition_to_merged_divisions", _base_logger()
+            ) as l2:
                 with _dask_config.set({"dataframe.shuffle.method": "tasks"}):
-                    main_ddf_aligned = main_ddf.repartition(divisions=merged_divisions, force=True)
-                    margin_ddf_aligned = margin_ddf.repartition(divisions=merged_divisions, force=True)
+                    main_ddf_aligned = main_ddf.repartition(
+                        divisions=merged_divisions, force=True
+                    )
+                    margin_ddf_aligned = margin_ddf.repartition(
+                        divisions=merged_divisions, force=True
+                    )
                 l2.info(
                     "Aligned: nparts(main)=%d nparts(margin)=%d",
                     main_ddf_aligned.npartitions,
@@ -1340,7 +1444,9 @@ def run_dedup_with_lsdb_map_partitions(
                 )
 
             # 1:1 zip between aligned partitions.
-            with log_phase("deduplication", "map_partitions_with_margin", _base_logger()):
+            with log_phase(
+                "deduplication", "map_partitions_with_margin", _base_logger()
+            ):
                 labels_dd = main_ddf_aligned.map_partitions(
                     _dedup_local_with_margin,
                     margin_ddf_aligned,
@@ -1354,7 +1460,7 @@ def run_dedup_with_lsdb_map_partitions(
                     z_col=z_col,
                     tie_col=tie_col,
                     edge_log=edge_log,
-                    group_col=group_col
+                    group_col=group_col,
                 )
 
         # Stable dtypes for downstream merges.

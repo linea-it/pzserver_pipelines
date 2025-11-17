@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """
 Self-crossmatch and `compared_to` updater for CRC.
 
@@ -28,8 +29,8 @@ import lsdb  # LSDB Catalog type / open_catalog
 # =======================
 # Project
 # =======================
-from combine_redshift_dedup.packages.specz import DTYPE_STR  # Arrow-backed string dtype
-from combine_redshift_dedup.packages.utils import get_phase_logger
+from specz import DTYPE_STR  # Arrow-backed string dtype
+from utils import get_phase_logger
 
 __all__ = ["crossmatch_auto"]
 
@@ -50,7 +51,9 @@ def _get_logger() -> logging.LoggerAdapter:
 # =======================
 # Internal helpers
 # =======================
-def _adjacency_from_pairs(left_ids: pd.Series, right_ids: pd.Series) -> Dict[str, Set[str]]:
+def _adjacency_from_pairs(
+    left_ids: pd.Series, right_ids: pd.Series
+) -> Dict[str, Set[str]]:
     """Build an undirected adjacency from left-right crossmatch pairs.
 
     Args:
@@ -162,7 +165,7 @@ def _self_xmatch_pairs(
         Mapping CRD_ID -> set of neighbor CRD_IDs.
     """
     logger.info(
-        "Running self-crossmatch: radius=%.3f\" n_neighbors=%d",
+        'Running self-crossmatch: radius=%.3f" n_neighbors=%d',
         radius_arcsec,
         n_neighbors,
     )
@@ -178,11 +181,15 @@ def _self_xmatch_pairs(
         logger.info("Self-crossmatch: no pairs found; `compared_to` remains unchanged.")
         return {}
     pairs_df = pairs_df.astype({"CRD_IDleft": "string", "CRD_IDright": "string"})
-    pairs_df = pairs_df[pairs_df["CRD_IDleft"] != pairs_df["CRD_IDright"]].drop_duplicates()
+    pairs_df = pairs_df[
+        pairs_df["CRD_IDleft"] != pairs_df["CRD_IDright"]
+    ].drop_duplicates()
 
     adj = _adjacency_from_pairs(pairs_df["CRD_IDleft"], pairs_df["CRD_IDright"])
     total_links = sum(len(v) for v in adj.values())
-    logger.info("Self-crossmatch: %d unique pairs across %d nodes", total_links, len(adj))
+    logger.info(
+        "Self-crossmatch: %d unique pairs across %d nodes", total_links, len(adj)
+    )
     return adj
 
 
@@ -204,7 +211,9 @@ def _update_compared_to(
         meta_pdf = meta_pdf.assign(compared_to=pd.Series(pd.array([], dtype=DTYPE_STR)))
     else:
         meta_pdf["compared_to"] = pd.Series(pd.array([], dtype=DTYPE_STR))
-    return catalog.map_partitions(_merge_compared_to_partition, pairs_adj, meta=meta_pdf)
+    return catalog.map_partitions(
+        _merge_compared_to_partition, pairs_adj, meta=meta_pdf
+    )
 
 
 # =======================
@@ -246,7 +255,7 @@ def crossmatch_auto(
     # START (per-catalog)
     t0 = time.time()
     logger.info(
-        "START automatch: artifact=%s radius=%.3f\" n_neighbors=%d src=%s dst=%s",
+        'START automatch: artifact=%s radius=%.3f" n_neighbors=%d src=%s dst=%s',
         artifact,
         radius,
         k,
@@ -263,7 +272,9 @@ def crossmatch_auto(
     n_nodes = len(pairs_adj)
 
     # 3) Persist as a NEW collection in the parent directory
-    logger.info("Writing collection: base_dir=%s catalog_name=%s", parent_dir, artifact_auto)
+    logger.info(
+        "Writing collection: base_dir=%s catalog_name=%s", parent_dir, artifact_auto
+    )
     updated.to_hats(
         collection_path_auto,
         as_collection=True,

@@ -25,14 +25,8 @@ source env.sh
 
 To install all pipelines at once:
 
-```
-./install_pipeline.sh
-```
-
-Alternatively, to install a single one:
-
-```
-./combine_redshift_dedup/install.sh
+```bash
+./install.sh
 ```
 
 The `setup.sh` will suggest a directory where the pipelines and datasets are installed, type 'yes' to confirm or 'no' to configure the desired path in each case with the respective environment variables and then run again `setup.sh`.
@@ -46,7 +40,6 @@ To execute, simply:
 
 ```bash
 # execute combine redshift catalogs
-cd $PIPELINES_DIR/combine_redshift_dedup
 ./run.sh config.yaml process001
 ```
 

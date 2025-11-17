@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """
 Crossmatch and `compared_to` updater for CRC.
 
@@ -47,12 +48,16 @@ import lsdb
 # -----------------------
 # Project
 # -----------------------
-from combine_redshift_dedup.packages.utils import get_phase_logger
-from combine_redshift_dedup.packages.specz import (
+from utils import get_phase_logger
+from specz import (
     _build_collection_with_retry,
     _normalize_string_series_to_na,
     _add_missing_with_dtype,
-    DTYPE_STR, DTYPE_FLOAT, DTYPE_INT, DTYPE_BOOL, DTYPE_INT8,
+    DTYPE_STR,
+    DTYPE_FLOAT,
+    DTYPE_INT,
+    DTYPE_BOOL,
+    DTYPE_INT8,
 )
 
 __all__ = ["crossmatch_tiebreak", "crossmatch_tiebreak_safe"]
@@ -74,7 +79,9 @@ def _get_logger() -> logging.LoggerAdapter:
 # -----------------------
 # Utilities
 # -----------------------
-def _adjacency_from_pairs(left_ids: pd.Series, right_ids: pd.Series) -> Dict[str, Set[str]]:
+def _adjacency_from_pairs(
+    left_ids: pd.Series, right_ids: pd.Series
+) -> Dict[str, Set[str]]:
     """Build an undirected adjacency from left-right crossmatch pairs."""
     adj: Dict[str, Set[str]] = {}
     L = left_ids.astype(str).to_numpy(dtype=object, copy=False)
@@ -102,7 +109,9 @@ def _merge_compared_to_partition(
     p = part.copy()
 
     if "compared_to" not in p.columns:
-        p["compared_to"] = pd.Series(pd.array([pd.NA] * len(p), dtype=DTYPE_STR), index=p.index)
+        p["compared_to"] = pd.Series(
+            pd.array([pd.NA] * len(p), dtype=DTYPE_STR), index=p.index
+        )
 
     crd_list: List[str] = p["CRD_ID"].astype(str).tolist()
 
@@ -183,15 +192,25 @@ def _cast_partition_expected(
         if col not in df.columns:
             # Create missing column with target dtype
             if dtype is DTYPE_STR:
-                df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_STR), index=df.index)
+                df[col] = pd.Series(
+                    pd.array([pd.NA] * len(df), dtype=DTYPE_STR), index=df.index
+                )
             elif dtype is DTYPE_FLOAT:
-                df[col] = pd.Series(pd.array([np.nan] * len(df), dtype=DTYPE_FLOAT), index=df.index)
+                df[col] = pd.Series(
+                    pd.array([np.nan] * len(df), dtype=DTYPE_FLOAT), index=df.index
+                )
             elif dtype is DTYPE_INT8:
-                df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_INT8), index=df.index)
+                df[col] = pd.Series(
+                    pd.array([pd.NA] * len(df), dtype=DTYPE_INT8), index=df.index
+                )
             elif dtype is DTYPE_INT:
-                df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_INT), index=df.index)
+                df[col] = pd.Series(
+                    pd.array([pd.NA] * len(df), dtype=DTYPE_INT), index=df.index
+                )
             elif dtype is DTYPE_BOOL:
-                df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_BOOL), index=df.index)
+                df[col] = pd.Series(
+                    pd.array([pd.NA] * len(df), dtype=DTYPE_BOOL), index=df.index
+                )
             continue
 
         # Cast existing column
@@ -234,13 +253,21 @@ def _cast_partition_expected(
             # Create missing column with target dtype
             try:
                 if k == "str":
-                    df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_STR), index=df.index)
+                    df[col] = pd.Series(
+                        pd.array([pd.NA] * len(df), dtype=DTYPE_STR), index=df.index
+                    )
                 elif k == "float":
-                    df[col] = pd.Series(pd.array([np.nan] * len(df), dtype=DTYPE_FLOAT), index=df.index)
+                    df[col] = pd.Series(
+                        pd.array([np.nan] * len(df), dtype=DTYPE_FLOAT), index=df.index
+                    )
                 elif k == "int":
-                    df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_INT), index=df.index)
+                    df[col] = pd.Series(
+                        pd.array([pd.NA] * len(df), dtype=DTYPE_INT), index=df.index
+                    )
                 elif k == "bool":
-                    df[col] = pd.Series(pd.array([pd.NA] * len(df), dtype=DTYPE_BOOL), index=df.index)
+                    df[col] = pd.Series(
+                        pd.array([pd.NA] * len(df), dtype=DTYPE_BOOL), index=df.index
+                    )
             except Exception:
                 pass
             continue
@@ -264,12 +291,18 @@ def _cast_partition_expected(
 def _normalize_catalog_dtypes(cat, translation_config: dict | None):
     """Return a new catalog with normalized dtypes (lazy, via map_partitions)."""
     cfg = translation_config or {}
-    schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
+    schema_hints_local = (
+        {}
+        if (cfg.get("save_expr_columns") is False)
+        else (cfg.get("expr_column_schema", {}) or {})
+    )
 
     # Build meta by running the caster on the meta dataframe
     meta_in = cat._ddf._meta
     meta_out = _cast_partition_expected(meta_in, _EXPECTED_TYPES, schema_hints_local)
-    return cat.map_partitions(_cast_partition_expected, _EXPECTED_TYPES, schema_hints_local, meta=meta_out)
+    return cat.map_partitions(
+        _cast_partition_expected, _EXPECTED_TYPES, schema_hints_local, meta=meta_out
+    )
 
 
 # -----------------------
@@ -343,7 +376,9 @@ def _coerce_optional_columns_for_import(
     return df
 
 
-def _normalize_ddf_expected_types(merged: dd.DataFrame, translation_config: dict | None) -> dd.DataFrame:
+def _normalize_ddf_expected_types(
+    merged: dd.DataFrame, translation_config: dict | None
+) -> dd.DataFrame:
     """Normalize expected/core columns on a merged Dask DataFrame prior to import."""
     expected_types = dict(_EXPECTED_TYPES)
 
@@ -358,17 +393,23 @@ def _normalize_ddf_expected_types(merged: dd.DataFrame, translation_config: dict
                     meta=pd.Series(pd.array([], dtype=DTYPE_STR)),
                 )
             elif dtype is DTYPE_FLOAT:
-                merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
+                merged[col] = dd.to_numeric(
+                    merged[col], errors="coerce"
+                ).map_partitions(
                     lambda s: s.astype(DTYPE_FLOAT),
                     meta=pd.Series(pd.array([], dtype=DTYPE_FLOAT)),
                 )
             elif dtype is DTYPE_INT8:
-                merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
+                merged[col] = dd.to_numeric(
+                    merged[col], errors="coerce"
+                ).map_partitions(
                     lambda s: s.astype(DTYPE_INT8),
                     meta=pd.Series(pd.array([], dtype=DTYPE_INT8)),
                 )
             elif dtype is DTYPE_INT:
-                merged[col] = dd.to_numeric(merged[col], errors="coerce").map_partitions(
+                merged[col] = dd.to_numeric(
+                    merged[col], errors="coerce"
+                ).map_partitions(
                     lambda s: s.astype(DTYPE_INT),
                     meta=pd.Series(pd.array([], dtype=DTYPE_INT)),
                 )
@@ -383,7 +424,11 @@ def _normalize_ddf_expected_types(merged: dd.DataFrame, translation_config: dict
 
     # 2) Prev/expr columns
     cfg = translation_config or {}
-    schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
+    schema_hints_local = (
+        {}
+        if (cfg.get("save_expr_columns") is False)
+        else (cfg.get("expr_column_schema", {}) or {})
+    )
     merged = _coerce_optional_columns_for_import(merged, schema_hints_local)
 
     return merged
@@ -431,7 +476,7 @@ def crossmatch_tiebreak(
     k = int((translation_config or {}).get("crossmatch_n_neighbors", 10))
 
     logger.info(
-        "START crossmatch_update_compared_to: step=%s radius=%.3f\" n_neighbors=%d backend=%s",
+        'START crossmatch_update_compared_to: step=%s radius=%.3f" n_neighbors=%d backend=%s',
         step,
         radius,
         k,
@@ -457,8 +502,12 @@ def crossmatch_tiebreak(
         logger.info("No pairs found; `compared_to` remains unchanged.")
     else:
         pairs_df = pairs_df.astype({"CRD_IDleft": "string", "CRD_IDright": "string"})
-        pairs_df = pairs_df[pairs_df["CRD_IDleft"] != pairs_df["CRD_IDright"]].drop_duplicates()
-        pairs_adj = _adjacency_from_pairs(pairs_df["CRD_IDleft"], pairs_df["CRD_IDright"])
+        pairs_df = pairs_df[
+            pairs_df["CRD_IDleft"] != pairs_df["CRD_IDright"]
+        ].drop_duplicates()
+        pairs_adj = _adjacency_from_pairs(
+            pairs_df["CRD_IDleft"], pairs_df["CRD_IDright"]
+        )
     total_links = sum(len(v) for v in pairs_adj.values())
     logger.info(
         "Adjacency built: links=%d nodes=%d (%.2fs)",
@@ -481,8 +530,12 @@ def crossmatch_tiebreak(
     left_meta = _ensure_meta(left_cat._ddf._meta)
     right_meta = _ensure_meta(right_cat._ddf._meta)
 
-    left_updated = left_cat.map_partitions(_merge_compared_to_partition, pairs_adj, meta=left_meta)
-    right_updated = right_cat.map_partitions(_merge_compared_to_partition, pairs_adj, meta=right_meta)
+    left_updated = left_cat.map_partitions(
+        _merge_compared_to_partition, pairs_adj, meta=left_meta
+    )
+    right_updated = right_cat.map_partitions(
+        _merge_compared_to_partition, pairs_adj, meta=right_meta
+    )
     logger.info("Compared_to updated on partitions (%.2fs)", time.time() - t0)
 
     # 4) Export path A: LSDB concat + to_hats
@@ -491,7 +544,9 @@ def crossmatch_tiebreak(
         t0 = time.time()
         left_fixed = _normalize_catalog_dtypes(left_updated, translation_config)
         right_fixed = _normalize_catalog_dtypes(right_updated, translation_config)
-        logger.info("Per-catalog type normalization attached (lazy) (%.2fs)", time.time() - t0)
+        logger.info(
+            "Per-catalog type normalization attached (lazy) (%.2fs)", time.time() - t0
+        )
 
         # Concatenate at the LSDB catalog level
         t0 = time.time()
@@ -538,7 +593,11 @@ def crossmatch_tiebreak(
     # Import as Collection (margin-first, with optional schema hints)
     t0 = time.time()
     cfg = translation_config or {}
-    schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
+    schema_hints_local = (
+        {}
+        if (cfg.get("save_expr_columns") is False)
+        else (cfg.get("expr_column_schema", {}) or {})
+    )
     schema_hints = schema_hints_local if schema_hints_local else None
 
     logger.info("START import_collection: step=%s parquet=%s", step, merged_path)
@@ -550,7 +609,12 @@ def crossmatch_tiebreak(
         try_margin=True,
         schema_hints=schema_hints,
     )
-    logger.info("END import_collection: step=%s path=%s (%.2fs)", step, collection_path, time.time() - t0)
+    logger.info(
+        "END import_collection: step=%s path=%s (%.2fs)",
+        step,
+        collection_path,
+        time.time() - t0,
+    )
     logger.info(
         "END crossmatch_update_compared_to: step=%s links=%d nodes=%d output=%s (%.2fs)",
         step,
@@ -598,7 +662,12 @@ def crossmatch_tiebreak_safe(
             translation_config=translation_config,
             do_import=do_import,  # ignored internally
         )
-        logger.info("END xmatch_update_compared_to_safe: step=%s output=%s (%.2fs)", step, out, time.time() - t0_safe)
+        logger.info(
+            "END xmatch_update_compared_to_safe: step=%s output=%s (%.2fs)",
+            step,
+            out,
+            time.time() - t0_safe,
+        )
         return out
 
     except RuntimeError as e:
@@ -611,7 +680,10 @@ def crossmatch_tiebreak_safe(
                 def _ensure_col(part: pd.DataFrame) -> pd.DataFrame:
                     if "compared_to" not in part.columns:
                         part = part.copy()
-                        part["compared_to"] = pd.Series(pd.array([pd.NA] * len(part), dtype=DTYPE_STR), index=part.index)
+                        part["compared_to"] = pd.Series(
+                            pd.array([pd.NA] * len(part), dtype=DTYPE_STR),
+                            index=part.index,
+                        )
                     return part
 
                 meta = cat._ddf._meta.copy()
@@ -653,7 +725,11 @@ def crossmatch_tiebreak_safe(
             _safe_to_parquet(merged, merged_path, write_index=False)
 
             cfg = translation_config or {}
-            schema_hints_local = {} if (cfg.get("save_expr_columns") is False) else (cfg.get("expr_column_schema", {}) or {})
+            schema_hints_local = (
+                {}
+                if (cfg.get("save_expr_columns") is False)
+                else (cfg.get("expr_column_schema", {}) or {})
+            )
             schema_hints = schema_hints_local if schema_hints_local else None
 
             collection_path = _build_collection_with_retry(

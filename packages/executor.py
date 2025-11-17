@@ -6,7 +6,7 @@ from typing import Dict, Optional, Any
 from dask.distributed import LocalCluster
 from dask_jobqueue import SLURMCluster
 
-from combine_redshift_dedup.packages.utils import get_phase_logger
+from utils import get_phase_logger
 
 LOGGER_NAME = "crc.executor"
 
@@ -67,10 +67,12 @@ def get_executor(executor_config: Dict[str, Any], logs_dir: Optional[str] = None
         # Add job log directives if requested
         if logs_dir:
             extra_directives = list(instance_cfg.get("job_extra_directives", []))
-            extra_directives.extend([
-                f"--output={logs_dir}/slurm-%j.out",
-                f"--error={logs_dir}/slurm-%j.err",
-            ])
+            extra_directives.extend(
+                [
+                    f"--output={logs_dir}/slurm-%j.out",
+                    f"--error={logs_dir}/slurm-%j.err",
+                ]
+            )
             instance_cfg["job_extra_directives"] = extra_directives
 
         processes = int(instance_cfg.get("processes", 1))
@@ -87,11 +89,16 @@ def get_executor(executor_config: Dict[str, Any], logs_dir: Optional[str] = None
 
         logger.info(
             "SLURM job template: cores=%s, processes=%s, memory=%s, queue=%s, account=%s",
-            cores, processes, memory, queue, account,
+            cores,
+            processes,
+            memory,
+            queue,
+            account,
         )
         logger.info(
             "Initial submit: minimum_jobs=%d → n_workers=%d (worker processes).",
-            min_jobs, n_workers_init,
+            min_jobs,
+            n_workers_init,
         )
 
         # Submit jobs immediately on construction
@@ -108,5 +115,7 @@ def get_executor(executor_config: Dict[str, Any], logs_dir: Optional[str] = None
     # -------------------------
     # Unknown -> minimal local
     # -------------------------
-    logger.warning("Unknown executor '%s'. Falling back to a minimal LocalCluster.", executor_name)
+    logger.warning(
+        "Unknown executor '%s'. Falling back to a minimal LocalCluster.", executor_name
+    )
     return LocalCluster(n_workers=1, threads_per_worker=1)
